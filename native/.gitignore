@@ -1,0 +1,12 @@
+# All CMake build output trees (see build.sh/build.bat) -- regenerated from
+# CMakeLists.txt, never source.
+build/
+build-linux/
+build-linux-compatible/
+build-windows/
+dist/
+
+# IDE/editor
+.vs/
+.vscode/
+*.user
