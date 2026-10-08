@@ -1,6 +1,6 @@
 # segyread
 
-A SEG-Y seismic data viewer.
+Fast SEG-Y reader with dedicated QC options.
 
 This repository currently tracks the native C++/Qt6 rewrite in
 [`native/`](native/README.md) — see that file for the full design writeup,
