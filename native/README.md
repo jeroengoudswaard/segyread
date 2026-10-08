@@ -1,17 +1,15 @@
 # SEG-Y native rewrite (Windows + Linux, C++)
 
-A from-scratch, performance-first rewrite of the SEG-Y reading/viewing core
-of this repo's Flutter app, as a standalone native application maintained
-for two targets: Windows and Linux, sharing **one Qt6-based GUI shell**
-(`viewer/qt/viewer_qt.cpp`) between them. Priorities, in order:
-**performance, correctness, maintainability, simplicity** — every design
-choice below picks in that order when two of them conflict.
+A from-scratch, performance-first SEG-Y reading/viewing application,
+standalone and maintained for two targets: Windows and Linux, sharing
+**one Qt6-based GUI shell** (`viewer/qt/viewer_qt.cpp`) between them.
+Priorities, in order: **performance, correctness, maintainability,
+simplicity** — every design choice below picks in that order when two of
+them conflict.
 
-This lives alongside the original Flutter app (`lib/`, unmodified) rather
-than replacing it: the Flutter app is cross-platform via the Flutter engine,
-and this rewrite trades that for direct platform API + mmap + AVX2 access,
-at the cost of a heavier GUI dependency (Qt6, dynamically linked) than a
-from-scratch Win32/Xlib shell would need.
+It trades cross-platform-engine portability for direct platform API + mmap
++ AVX2 access, at the cost of a heavier GUI dependency (Qt6, dynamically
+linked) than a from-scratch Win32/Xlib shell would need.
 
 **GUI toolkit history**: this project originally had *two* platform-specific
 shells — Win32/GDI on Windows, FLTK+raw-Xlib on Linux. That split was
@@ -26,16 +24,17 @@ class of bug — e.g. the progress-throttle data race — silently existed on
 Windows too, just never triggered), even though the code that had those
 bugs no longer exists.
 
-## Why C++, not Dart
+## Why C++
 
-Dart/Flutter has to go through typed-array bounds-checked accessors, a
-tracing GC, and isolate message-passing (copies) to move decoded samples off
-a worker isolate. None of that is necessary for this workload: it's pure
-numeric decode of a memory-mapped file, which is exactly what C++ with
+A managed-runtime language has to go through typed-array bounds-checked
+accessors, a tracing GC, and (if the decode work runs on a separate
+worker/thread with its own heap) message-passing copies to move decoded
+samples back to the UI. None of that is necessary for this workload: it's
+pure numeric decode of a memory-mapped file, which is exactly what C++ with
 direct pointer access, SIMD intrinsics, and OS-level memory mapping is for.
 "Standalone portable app" also pointed away from anything needing a bundled
-runtime (Flutter engine, .NET, a Python interpreter) — a native, statically-
-linked exe needs nothing but the OS.
+runtime (a managed-language VM, .NET, a Python interpreter) — a native,
+statically-linked exe needs nothing but the OS.
 
 ## Platform split: shared core + one Qt shell
 
@@ -220,11 +219,11 @@ to signed zero/infinity — this can't happen for real trace amplitudes but is
 handled explicitly rather than left as undefined bit-twiddling.
 
 Formats 2 (int32), 3 (int16), 5 (IEEE float32), 6 (float64), 7 (int24), 8
-(int8) are also implemented (the Flutter original only special-cased format
-1 and silently misinterpreted every other non-1 code as raw IEEE float32
-bytes — a correctness bug this rewrite fixes rather than reproduces).
-Unsupported/unrecognized format codes are rejected at load time
-(`isSampleFormatSupported`) instead of silently decoding garbage.
+(int8) are also implemented, each with its own correct decode rather than
+special-casing one format and silently misinterpreting every other code as
+raw IEEE float32 bytes. Unsupported/unrecognized format codes are rejected
+at load time (`isSampleFormatSupported`) instead of silently decoding
+garbage.
 
 ### The pyramid: single streaming pass, not a lazy tile cache
 
@@ -233,11 +232,11 @@ count per block, block size growing by `blockFactor=4` per axis per level)
 in one parallel pass at load time, so rendering at any zoom level is an O(1)
 array lookup per screen pixel instead of re-scanning raw data.
 
-This is a deliberate simplification versus the Flutter app's on-demand
-tile cache with LRU eviction: building the *whole* pyramid up front is
-simpler code and gives predictable, jank-free pan/zoom (no cache-miss
-stalls), at the cost of assuming the pyramid — not the raw file — fits in
-RAM. Because each level shrinks by `blockFactor²=16`, the total pyramid size
+This is a deliberate simplification versus an on-demand tile cache with LRU
+eviction: building the *whole* pyramid up front is simpler code and gives
+predictable, jank-free pan/zoom (no cache-miss stalls), at the cost of
+assuming the pyramid — not the raw file — fits in RAM. Because each level
+shrinks by `blockFactor²=16`, the total pyramid size
 is a small fraction of the raw file (geometric series, dominated by the
 finest level: for a 10 GB file that's on the order of tens of MB), so this
 is a safe trade for desktop-scale SEG-Y files. It would stop being safe for
@@ -2144,9 +2143,10 @@ specific thing not directly observed, not the feature logic behind it.
 
 ## Trade-offs and honest limitations
 
-- **No spectrum/FFT analysis, header-range filtering, or multi-dataset
-  comparison** — out of scope for this pass; the original Flutter app has
-  these (`segy_analyzer.dart`, `readFilteredSegy`, dataset slots).
+- **No header-range filtering** (selecting/loading only traces matching a
+  header-field predicate) — out of scope for this pass. Spectrum/FFT
+  analysis and multi-dataset combination (Calculator) are implemented; see
+  their own sections above.
 - **Whole-pyramid-in-RAM assumption** (see above) instead of an on-demand
   tile cache — simpler and jank-free, but doesn't scale to files whose
   pyramid alone exceeds available RAM.
