@@ -63,10 +63,20 @@ jobs:
           $dir = "segyread-$env:TAG-windows-x64"
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item build\Release\segyviewer.exe $dir
-          # Qt DLLs, the platform/style/SVG plugins and the MSVC runtime.
+          # Qt DLLs and the platform/style/SVG plugins.
           windeployqt --release --compiler-runtime --no-translations `
             --no-system-d3d-compiler --no-opengl-sw "$dir\segyviewer.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # windeployqt ships the MSVC runtime as vc_redist.x64.exe, which users
+          # would have to install first. Put the runtime DLLs next to the exe
+          # instead (app-local deployment), so unzip-and-run works everywhere.
+          Remove-Item "$dir\vc_redist.x64.exe" -ErrorAction SilentlyContinue
+          $crt = Get-ChildItem "$env:VCToolsRedistDir\x64" -Directory -Filter 'Microsoft.VC*.CRT' | Select-Object -First 1
+          if (-not $crt) { throw "MSVC runtime redist folder not found under $env:VCToolsRedistDir" }
+          Copy-Item "$($crt.FullName)\*.dll" $dir
+          foreach ($f in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
+            if (-not (Test-Path "$dir\$f")) { throw "$f missing" }
+          }
           Copy-Item native\packaging\README-windows.txt "$dir\README.txt"
           if (-not (Test-Path "$dir\platforms\qwindows.dll")) { throw "qwindows.dll missing" }
           Compress-Archive -Path $dir -DestinationPath segyread-windows-x64.zip
