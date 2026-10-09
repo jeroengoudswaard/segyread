@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,11 @@ class QTableWidget;
 class QLineEdit;
 class QListWidget;
 class QListWidgetItem;
+class QMenu;
+class QPainter;
+class QProgressBar;
+class QTimer;
+class QToolButton;
 
 namespace segyqt {
 
@@ -135,6 +141,30 @@ struct WigglePresentationSettings {
     double varMinimumSpacing = 1.0;
 };
 
+// Idents: small rows of trace-header values shown above/below the plot
+// (for visual trace-position orientation), one optional line-graph "ident
+// plot" above those, and up to two header fields drawn as colored lines
+// directly over the seismic (the field's raw value reinterpreted as a
+// time in ms) -- modeled on a reference seismic tool's own Idents
+// submenu. Scoped to the 7 fields segy::TraceHeader already decodes --
+// see native/README.md. Per-panel (AppState), read fresh every frame
+// like DisplaySettings, and deliberately NOT persisted (confirmed with
+// the user: idents reset to all-off every session, unlike Preferences
+// below).
+enum class IdentField { TraceSequenceLine, TraceSequenceFile, FieldRecord, TraceNumber, Cdp, X, Y };
+constexpr int kIdentFieldCount = 7;
+struct IdentSettings {
+    // Index = IdentField, in its declaration order -- fixed, so toggling
+    // one field on/off never reshuffles the other enabled rows' paint
+    // order. Max-4/max-2 is enforced where these are written (the
+    // Idents menu's handlers), not here.
+    bool topEnabled[kIdentFieldCount] = {};    // max 4 true
+    bool bottomEnabled[kIdentFieldCount] = {}; // max 2 true
+    int plotField = -1;        // IdentField index, or -1 = ident plot hidden
+    int overlayCyanField = -1; // -1 = no cyan line on the seismic
+    int overlayRedField = -1;  // -1 = no red line on the seismic
+};
+
 // App-wide (not per-panel/per-dataset) preferences -- persisted to
 // $HOME/.segyread_settings via QSettings (see MainWindow::loadPreferences/
 // savePreferences), unlike every other *Settings struct in this file,
@@ -159,6 +189,34 @@ struct Preferences {
     double uiScalePercent = 100.0;
 };
 
+// One loaded SEG-Y dataset's data -- kept alive independent of which
+// panel/slot currently references it (see native/README.md, "Dataset
+// pool: Foreground/Background"). Held via shared_ptr so switching a
+// panel's Foreground/Background to an already-loaded dataset is an O(1)
+// pointer swap, never a reload: MainWindow::datasetPool_ is the one place
+// that can hold the *last* reference (deletion drops it there), while any
+// number of panels' AppState::foreground/background may also point at it
+// meanwhile. Never mutate a Dataset's fields in place once constructed --
+// always build a new one and reassign the shared_ptr (see
+// SegyCanvas::startLoading) -- a dataset may be shared with the pool or
+// another panel's slot, and in-place mutation would corrupt it for them.
+struct Dataset {
+    std::string name; // display name -- filePath.stem(), shown in the Foreground/Background boxes and pool dialog
+    std::filesystem::path filePath;
+    segy::MappedFile file;
+    segy::BinaryHeader binHeader{};
+    int64_t traceCount = 0;
+    size_t traceStrideBytes = 0;
+    segy::Pyramid pyramid;
+    // Empty for a file opened directly via File > Open; populated when
+    // Calculator/Bandpass synthesize a new dataset (one entry per step
+    // that produced it, oldest first) -- see SegyCanvas::startLoading's
+    // `processingHistory` parameter. Save SEG-Y writes this straight into
+    // the output file's own EBCDIC text header, so a chain of derived
+    // datasets keeps a readable record of how each one was produced.
+    std::vector<std::string> processingHistory;
+};
+
 // Same fields as the removed shells' AppState -- one shared struct instead
 // of two divergent copies. Owned by MainWindow, referenced by SegyCanvas.
 struct AppState {
@@ -169,12 +227,18 @@ struct AppState {
     std::atomic<int64_t> progressDone{0};
     std::atomic<int64_t> progressTotal{1};
 
-    segy::MappedFile file;
-    std::filesystem::path filePath; // set once startLoading() succeeds; used for window titles
-    segy::BinaryHeader binHeader{};
-    int64_t traceCount = 0;
-    size_t traceStrideBytes = 0;
-    segy::Pyramid pyramid;
+    // Never null -- defaults to an empty, never-loaded Dataset rather than
+    // nullptr, so every existing call site that reads e.g.
+    // foreground->pyramid.globalMin without first checking `loaded` (there
+    // are several, relying on a loaded-or-default-zero value) stays safe.
+    // `loaded` is still its own independent bool (not derived from this),
+    // matching exactly the window during startLoading/a failed load where
+    // the old behavior already showed "nothing loaded" before/without
+    // necessarily touching this pointer.
+    std::shared_ptr<Dataset> foreground = std::make_shared<Dataset>();
+    // Phase 1: purely a held reference, shown in its own box -- nothing
+    // reads this for rendering/analysis yet (see native/README.md).
+    std::shared_ptr<Dataset> background = std::make_shared<Dataset>();
 
     segy::ViewRange view;
     double lastRenderMs = 0.0;
@@ -190,6 +254,7 @@ struct AppState {
     HistogramSettings histogram;
     SpectrumSettings spectrum;
     WigglePresentationSettings wigglePresentation;
+    IdentSettings idents;
 
     ToolMode tool = ToolMode::Arrow;
     // Any number of boxes can coexist (e.g. a large one left over from an
@@ -214,14 +279,6 @@ struct AppState {
     std::vector<segy::ViewRange> zoomHistory;
 
     std::vector<uint32_t> pixels;
-
-    // Empty for a file opened directly via File > Open; populated when
-    // Calculator/Bandpass synthesize a new dataset (one entry per step that
-    // produced it, oldest first) -- see SegyCanvas::startLoading's
-    // `processingHistory` parameter. Save SEG-Y writes this straight into
-    // the output file's own EBCDIC text header, so a chain of derived
-    // datasets keeps a readable record of how each one was produced.
-    std::vector<std::string> processingHistory;
 };
 
 class SegyCanvas;
@@ -507,6 +564,76 @@ private:
 // reads it and, when unchecked (the reference tool's own default),
 // resets gain to 0 dB so each newly opened file gets a fresh auto-scaled
 // clip instead of inheriting whatever gain the previous file was left at.
+// Opened from a Foreground/Background box's icon button (see
+// DatasetSlotWidget below) -- lists every dataset in MainWindow's shared
+// pool, lets the user pick one for that slot (OK) or drop one from memory
+// entirely (Delete), matching the reference tool's own "OK/Delete/Cancel"
+// picker. One instance is lazily created and reused for all four
+// Foreground/Background icons across both panels, reconfigured fresh via
+// setDatasets()/setCallbacks() right before each show() -- same
+// lazy-create/reconfigure-before-show pattern as every other on-demand
+// dialog in this file.
+class DatasetPickerDialog : public QDialog {
+public:
+    explicit DatasetPickerDialog(QWidget* parent = nullptr);
+
+    // `datasets` is the pool (MainWindow::datasetPool_); `current` is
+    // pre-selected if it's one of them. `allowNone` adds a synthetic
+    // "(None)" row at the top (Background only -- Foreground always needs
+    // something to render); picking it calls `onPicked` with a fresh empty
+    // Dataset rather than any pool entry. `isInUse` gates the Delete
+    // button per-row -- a dataset currently assigned to *any* panel's
+    // Foreground/Background (including the slot this dialog was opened
+    // for) can't be deleted out from under it.
+    void setDatasets(const std::vector<std::shared_ptr<Dataset>>& datasets, const std::shared_ptr<Dataset>& current,
+                      bool allowNone, std::function<bool(const std::shared_ptr<Dataset>&)> isInUse);
+    // `onPicked` fires once, on OK, with the selected row's dataset (or a
+    // fresh empty one for "(None)"). `onDeleted` fires once per Delete
+    // click (the dialog stays open afterward -- deleting doesn't imply a
+    // pick), with the removed dataset, so MainWindow can drop it from the
+    // pool.
+    void setCallbacks(std::function<void(std::shared_ptr<Dataset>)> onPicked,
+                       std::function<void(std::shared_ptr<Dataset>)> onDeleted);
+
+private:
+    QListWidget* list_ = nullptr;
+    QPushButton* okButton_ = nullptr;
+    QPushButton* deleteButton_ = nullptr;
+    // Row i's dataset is datasets_[i]; a null entry is the synthetic
+    // "(None)" row.
+    std::vector<std::shared_ptr<Dataset>> datasets_;
+    std::function<bool(const std::shared_ptr<Dataset>&)> isInUse_;
+    std::function<void(std::shared_ptr<Dataset>)> onPicked_;
+    std::function<void(std::shared_ptr<Dataset>)> onDeleted_;
+
+    void updateButtonsEnabled();
+};
+
+// One Foreground or Background box, overlaid on a panel's SegyCanvas (same
+// technique as AmplitudeScaleWidget) -- a name label plus a small icon
+// button that opens DatasetPickerDialog scoped to this slot. See
+// native/README.md, "Dataset pool: Foreground/Background" -- positioning
+// (top-left of this panel's own plot area, aligned with its left axis) is
+// handled by whoever owns this widget (SegyCanvas), not by the widget
+// itself.
+class DatasetSlotWidget : public QWidget {
+public:
+    // `label` is the fixed prefix ("Foreground 1", "Background 2", etc.)
+    DatasetSlotWidget(const QString& label, QWidget* parent = nullptr);
+    void setLabel(const QString& label);
+    void setDatasetName(const QString& name);
+    void setPickCallback(std::function<void()> callback);
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+
+private:
+    QString label_;
+    QString datasetName_;
+    QPushButton* pickButton_ = nullptr;
+    std::function<void()> onPick_;
+};
+
 class SegyOpenDialog : public QDialog {
 public:
     explicit SegyOpenDialog(QWidget* parent = nullptr);
@@ -782,10 +909,26 @@ class SegyCanvas : public QWidget {
 public:
     explicit SegyCanvas(AppState& app, QWidget* parent = nullptr);
 
-    // `processingHistory` is stashed on AppState once the load completes --
-    // empty for a normal File > Open, populated when Calculator/Bandpass
-    // load a dataset they just synthesized (see AppState::processingHistory).
+    // `processingHistory` is stashed on the new Dataset once the load
+    // completes -- empty for a normal File > Open, populated when
+    // Calculator/Bandpass load a dataset they just synthesized (see
+    // Dataset::processingHistory).
     void startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory = {});
+
+    // Fires once per successful load, right after the new Dataset becomes
+    // this panel's Foreground -- MainWindow uses it to register the
+    // dataset in the shared pool (see native/README.md, "Dataset pool").
+    void setDatasetLoadedCallback(std::function<void(std::shared_ptr<Dataset>)> callback);
+
+    // Makes `dataset` this panel's active Foreground/Background -- an O(1)
+    // pointer swap for a dataset already in memory (the Foreground/
+    // Background picker dialog's OK path), or the final step after a
+    // fresh startLoading() completes. Foreground resets the view/selection
+    // (a different dataset invalidates the old trace/sample space);
+    // Background (phase 1) is purely a held reference, nothing else reads
+    // it yet.
+    void setForegroundDataset(std::shared_ptr<Dataset> dataset);
+    void setBackgroundDataset(std::shared_ptr<Dataset> dataset);
 
     // MainWindow owns the status bar (and, via the callback, the Del
     // button's visibility); handed to the canvas as a plain pointer/
@@ -798,6 +941,14 @@ public:
     // Zoom/Mooz toolbar buttons).
     void refreshStatusBar();
 
+    // While a MainWindow-level background task (Calculator/Bandpass/Save
+    // SEG-Y/Octave Bands) is running, this panel's own hover/tool status
+    // text would otherwise fight with the task's progress message every
+    // time the mouse moves over the canvas -- MainWindow sets this true
+    // on both panels for the task's duration so updateStatusBar() backs
+    // off and leaves the status bar alone.
+    void setStatusOverrideActive(bool active);
+
     // Split view: fires on mousePressEvent so MainWindow knows which panel
     // was just clicked into and can route toolbar/menu actions to it.
     void setActivatedCallback(std::function<void()> callback);
@@ -806,11 +957,42 @@ public:
     // bar now (see native/README.md, "Dark Pro" relocation notes).
     void setHoverInfoCallback(std::function<void(const HoverInfo&)> callback);
 
+    // Fires whenever app_.view changes via direct mouse/keyboard
+    // interaction on *this* canvas (drag-pan, wheel-zoom, 'R' reset) --
+    // MainWindow uses it to mirror the new view into the other panel when
+    // Lock is on. Deliberately not fired from the toolbar's own Zoom/Mooz
+    // (those already go through MainWindow::targetPanels(), which sets
+    // both panels' views directly -- firing this there too would just
+    // copy an already-equal value back onto itself).
+    void setViewChangedCallback(std::function<void()> callback);
+
     // MainWindow computes the gain-adjusted clip value (it already owns
     // that math for the gain control); the canvas owns the overlay widget
     // itself since only it knows the plot's on-screen geometry to position
     // against.
     void setAmplitudeScale(float posClip, float negClip, bool visible, segy::ColorScale colorScale);
+
+    // "Foreground 1"/"Background 1" vs "...2" etc -- set once, right after
+    // construction, since only MainWindow knows which panel this is.
+    void setDatasetSlotLabels(const QString& foregroundLabel, const QString& backgroundLabel);
+    // `isForeground` tells MainWindow which of this panel's two slots the
+    // click was for (true = Foreground, false = Background); it owns the
+    // dataset pool and the picker dialog, this class only owns the boxes.
+    void setDatasetSlotPickCallback(std::function<void(bool isForeground)> callback);
+    // Re-reads app_.foreground/background's names into the two boxes --
+    // call after anything that could change either (a fresh load, a
+    // picker OK, or another panel's Delete removing the dataset this one
+    // is currently showing... though that case is blocked by
+    // isDatasetInUse, so it shouldn't actually happen).
+    void refreshDatasetSlotNames();
+    // Call after toggling anything in app_.idents from outside this class
+    // (the Idents toolbar menu, in MainWindow) -- repositionAmplitudeScale/
+    // repositionDatasetSlots are otherwise only reached from resizeEvent/
+    // paintEvent, so without this their on-screen position would go stale
+    // (not shift to account for the new top inset) until the next real
+    // resize, even though update() alone would repaint everything else
+    // correctly.
+    void refreshIdentLayout();
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -825,9 +1007,12 @@ protected:
 private:
     AppState& app_;
     QStatusBar* statusBar_ = nullptr;
+    bool statusOverrideActive_ = false;
     std::function<void()> notifyStateChanged_;
     std::function<void(const HoverInfo&)> notifyHoverChanged_;
+    std::function<void()> notifyViewChanged_;
     std::function<void()> notifyActivated_;
+    std::function<void(std::shared_ptr<Dataset>)> onDatasetLoaded_;
     AmplitudeScaleWidget* amplitudeScale_ = nullptr;
     // Lazily created from the legend's own right-click menu -- see this
     // class's constructor. Owns its lifetime like the other per-panel
@@ -835,6 +1020,15 @@ private:
     // correct panel forever (it's owned by that panel's own canvas), no
     // "bound to whichever was active at creation" caveat needed.
     ClipDialog* clipDialog_ = nullptr;
+    // Foreground/Background boxes (see native/README.md, "Dataset pool")
+    // -- overlaid on the canvas like amplitudeScale_, top-left of this
+    // panel's own plot area. MainWindow owns the pool/picker dialog and
+    // supplies isForeground's meaning via setDatasetSlotPickCallback;
+    // this class only owns the boxes' existence/position/displayed name.
+    DatasetSlotWidget* foregroundSlot_ = nullptr;
+    DatasetSlotWidget* backgroundSlot_ = nullptr;
+    std::function<void(bool isForeground)> onDatasetSlotPick_;
+    void repositionDatasetSlots();
     void repositionAmplitudeScale();
     // Inset width available to the plot itself -- width() minus the
     // margins minus the amplitude-scale column reserved whenever
@@ -843,6 +1037,17 @@ private:
     // wherever pixel<->data math needs the plot's *actual* width, not the
     // raw inset width.
     int plotAreaWidth() const;
+    // Extra top/bottom inset (beyond kCanvasMargin) reserved for idents --
+    // see native/README.md. Deliberately recomputed fresh every call
+    // rather than cached on the widget: it's cheap (a handful of bool
+    // reads), and caching it would open a stale-reinset window between an
+    // Idents-menu toggle and the next mouse/paint event reading it.
+    struct IdentInsets { int top = 0; int bottom = 0; };
+    IdentInsets identInsets() const;
+    void paintIdentText(QPainter& painter, const segy::ChromeLayout& chrome, int topInset, int bottomInset,
+                         int insetHeight) const;
+    void paintIdentOverlayLines(QPainter& painter, const segy::ChromeLayout& chrome, int topInset,
+                                 int insetHeight) const;
 
     bool hovering_ = false;
     int hoverPixelX_ = 0, hoverPixelY_ = 0; // canvas-local
@@ -875,6 +1080,12 @@ public:
     // For the argv[1]-as-initial-file convenience the removed shells had.
     void openInitialFile(const std::filesystem::path& path);
 
+protected:
+    // Recomputes toolbar overflow (see toolbarOverflowCandidates_ below)
+    // on every resize -- a short/narrow window is exactly when buttons
+    // start not fitting.
+    void resizeEvent(QResizeEvent* event) override;
+
 private:
     // Split view: two independent panels (each its own file/view/tool
     // state), side by side in a QSplitter. `app_`/`canvas_` always alias
@@ -892,6 +1103,12 @@ private:
     QSplitter* splitter_ = nullptr;
     QAction* splitViewAction_ = nullptr;
     std::vector<Panel*> targetPanels();
+    // Mirrors `source`'s view into the other panel when Lock is on --
+    // wired to both panels' SegyCanvas::setViewChangedCallback, fired on
+    // direct mouse/keyboard view changes (drag-pan, wheel-zoom, 'R'
+    // reset). The toolbar's own Zoom/Mooz already sync both panels via
+    // targetPanels() directly and don't go through this.
+    void syncLockedView(Panel* source);
     void setActivePanel(Panel* panel);
 
     QAction* zoomAction_ = nullptr;
@@ -908,6 +1125,11 @@ private:
     QAction* wiggleMenuAction_ = nullptr;
 
     QAction* flipHorizontalAction_ = nullptr;
+
+    // Opens a QMenu (built fresh from the active panel's app_->idents each
+    // time, like toolbarMoreMenu_) with Display at Top/Bottom, Ident Plot,
+    // and Display on Seismic submenus -- see native/README.md.
+    QAction* identsAction_ = nullptr;
 
     QAction* gainDetailAction_ = nullptr; // opens DisplayParametersDialog
     DisplayParametersDialog* displayParametersDialog_ = nullptr;
@@ -948,6 +1170,28 @@ private:
     QAction* octaveBandAction_ = nullptr;
     OctaveBandDialog* octaveBandDialog_ = nullptr;
 
+    // Dataset pool: every dataset either panel has ever loaded/computed,
+    // kept alive here independent of which panel's Foreground/Background
+    // currently points at it -- see native/README.md, "Dataset pool:
+    // Foreground/Background." Lazily created/reconfigured like every
+    // other on-demand dialog in this file.
+    std::vector<std::shared_ptr<Dataset>> datasetPool_;
+    DatasetPickerDialog* datasetPickerDialog_ = nullptr;
+
+    // Generic background-task runner -- Calculator/Bandpass/Save SEG-Y/
+    // Octave Bands all move their heavy per-trace work off the UI thread
+    // through this, with progress shown in the status bar (see
+    // native/README.md, "Background processing"). One task at a time;
+    // `runBackgroundTask` refuses (with a flashStatusMessage) while
+    // another is already running, same re-entrancy guard shape as
+    // SegyCanvas::startLoading's own `if (app_.loading) return;`.
+    bool backgroundTaskRunning_ = false;
+    QString backgroundTaskLabel_;
+    std::atomic<int64_t> backgroundTaskDone_{0};
+    std::atomic<int64_t> backgroundTaskTotal_{1};
+    QTimer* backgroundTaskTimer_ = nullptr;   // polls the two atomics above while a task runs
+    QProgressBar* backgroundProgressBar_ = nullptr; // status bar permanent widget, visible only while running
+
     // Read-only viewers -- re-populated from the active panel on every
     // click, no settings to keep sticky between opens (see
     // EbcdicHeaderWidget/BinaryHeaderWidget above).
@@ -984,6 +1228,41 @@ private:
     void savePreferences();
     void applyToolbarPosition(ToolbarPosition position);
     void applyDrawerPosition(DrawerPosition position);
+
+    // Toolbar overflow: when the window is too short (vertical toolbar,
+    // the normal case) or too narrow (horizontal) to fit every button,
+    // the ones that don't fit are hidden (QAction::setVisible(false), the
+    // one reliable way to actually collapse a toolbar button's space --
+    // see native/README.md) and this button reaches them via a popup
+    // menu instead of leaving them simply gone with no way back. It
+    // lives in the status bar, not the toolbar itself -- an earlier
+    // version added it to the toolbar the same way as every candidate,
+    // but predicting from sizeHint() sums whether N candidates fit was
+    // repeatedly wrong by a margin that tracked inter-item
+    // spacing/separators QToolBarLayout adds but sizeHint() doesn't
+    // report, so the last couple of "fitting" items (and this button,
+    // added right after them) sometimes got a plausible-looking cached
+    // geometry whose bottom edge was actually past the toolbar's own
+    // real height -- Qt just never painted them, no chevron, no error.
+    // Moving it to the status bar sidesteps that entirely, and "an icon
+    // at the bottom" is exactly how the user described it.
+    QToolButton* toolbarMoreButton_ = nullptr;
+    QMenu* toolbarMoreMenu_ = nullptr; // rebuilt fresh from whatever's currently hidden, each time it's about to show
+    // The expanding spacer that pushes the sidebar toggle to the toolbar's
+    // far end (see its own construction comment) -- hidden whenever
+    // overflow is active, since an Expanding QWidgetAction still claims a
+    // layout slot even at zero size and was found (via geometry-level
+    // debug logging) to leave the sidebar-toggle button after it without
+    // a valid laid-out position once the toolbar is genuinely out of room.
+    QAction* toolbarSpacerAction_ = nullptr;
+    // Fixed order, built once right after the toolbar is fully
+    // constructed. updateToolbarOverflow() measures fit empirically --
+    // show every candidate, let Qt actually lay the toolbar out, then
+    // hide whichever ones come back positioned past the toolbar's own
+    // real size -- rather than predicting it from cached sizeHint()
+    // sums (see toolbarMoreButton_'s comment for why that didn't work).
+    std::vector<QAction*> toolbarOverflowCandidates_;
+    void updateToolbarOverflow();
     // Forces splitter_ to an even 50/50 split along its current
     // orientation -- see splitViewAction_'s triggered handler and its
     // right-click menu.
@@ -1034,6 +1313,33 @@ private:
     void openBandpassDialog();
     void openSaveSegyDialog();
     void openOctaveBandDialog();
+
+    // Adds `dataset` to datasetPool_ (deduplicating its name against
+    // existing entries, e.g. "Line_100 (2)") and refreshes both panels'
+    // Foreground/Background boxes -- called once per successful load,
+    // via SegyCanvas::setDatasetLoadedCallback.
+    void registerDataset(std::shared_ptr<Dataset> dataset);
+    // True if `dataset` is any panel's current Foreground or Background --
+    // gates DatasetPickerDialog's Delete button (see native/README.md).
+    bool isDatasetInUse(const std::shared_ptr<Dataset>& dataset) const;
+    // Opens datasetPickerDialog_ (lazily created) scoped to `panel`'s
+    // Foreground (isForeground=true) or Background slot.
+    void openDatasetPicker(Panel* panel, bool isForeground);
+    void refreshAllDatasetSlotNames();
+
+    // Runs `backgroundWork` on a detached std::thread (not app_.pool --
+    // that's per-panel and sized for pyramid building, this is a single
+    // sequential job), showing `label` plus a progress bar in the status
+    // bar for its duration (driven by backgroundTaskTimer_ polling
+    // backgroundTaskDone_/backgroundTaskTotal_, which `backgroundWork`
+    // updates as it goes). `uiCompletion` then runs back on the UI
+    // thread. `backgroundWork` must not touch any QWidget/QObject --
+    // it's safe to read a Dataset's mmap'd `file` (read-only, same as
+    // the pyramid builder's own worker threads already do concurrently)
+    // and to call plain file I/O (segy::writeSegyFile), nothing more.
+    void runBackgroundTask(const QString& label, std::function<void()> backgroundWork,
+                            std::function<void()> uiCompletion);
+    void updateBackgroundTaskStatusBar();
 };
 
 } // namespace segyqt

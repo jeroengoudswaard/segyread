@@ -1,0 +1,13 @@
+<!--
+  Runtime window/taskbar icon, compiled into the binary rather than loaded
+  from a loose file at runtime, so it works identically regardless of where
+  the built executable ends up. See native/assets/icons/LEESMIJ.md and
+  QApplication::setWindowIcon() in viewer_qt.cpp's main(). Used on both
+  Windows and Linux; the Windows exe's own icon (Explorer, taskbar before
+  paint) is separate, embedded via app.rc.
+-->
+<RCC>
+  <qresource prefix="/">
+    <file alias="app_icon.png">../../assets/icons/png/segyread-256.png</file>
+  </qresource>
+</RCC>

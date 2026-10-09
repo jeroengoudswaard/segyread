@@ -1,0 +1,6 @@
+// Windows exe icon (Explorer, taskbar before the main window paints,
+// Alt+Tab fallback) -- see native/assets/icons/LEESMIJ.md. The runtime
+// window/taskbar icon (shown once the window exists, on both Windows and
+// Linux) is set separately via QApplication::setWindowIcon() in
+// viewer_qt.cpp's main(), from the Qt resource embedded by app_icon.qrc.
+IDI_ICON1 ICON "../../assets/icons/windows/segyread.ico"

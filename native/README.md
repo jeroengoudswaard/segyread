@@ -1008,6 +1008,20 @@ locked, still zoom **each target panel to its own** box/history, not a
 shared one — the two panels can hold entirely different trace/sample
 ranges, so copying one panel's zoom onto the other wouldn't make sense.
 
+**Lock also follows pan, not just zoom range**: `SegyCanvas` takes a
+`setViewChangedCallback`, fired after every mutation of `app_.view`
+(wheel-zoom, drag-pan, box-zoom/Mooz, `'R'` reset) — not just the
+tool-mode/gain/etc. handlers `targetPanels()` already covered, since pan
+happens via direct mouse-drag on one specific canvas, with no toolbar
+action in the loop to route through `targetPanels()`.
+`MainWindow::syncLockedView(Panel* source)` is the callback body: no-ops
+unless Lock is checked, then copies `source->app.view` onto the other
+panel wholesale (not just an offset/delta — simplest correct behavior
+when the two panels can hold different trace/sample ranges to begin
+with) and re-clamps it against the other panel's own `foreground`
+extent before redrawing. Both panels wire this the same way, so whichever
+one you actually drag drives the other, symmetrically.
+
 **Known, documented v1 simplifications** (all deliberate, not
 oversights):
 - The three parameters dialogs (Histogram/Spectrum/Display Parameters)
@@ -2141,6 +2155,260 @@ few lines of standard `QAction`/`QActionGroup` code with no exotic risk.
 Treat the final "click Wiggle in the open dropdown" step as the one
 specific thing not directly observed, not the feature logic behind it.
 
+### Dataset pool: Foreground/Background
+
+Until now each panel's `AppState` held exactly one loaded dataset's fields
+(`file`, `binHeader`, `pyramid`, etc.) directly, embedded. That assumption
+is gone: a new `Dataset` struct bundles those fields (plus a `name` and
+`processingHistory`, both moved here from `AppState`), and `AppState` now
+holds `foreground`/`background` as `std::shared_ptr<Dataset>` — never
+`nullptr` (defaults to a fresh empty `Dataset`, so every existing call site
+that read e.g. `pyramid.globalMin` without a `loaded` check first, relying
+on a zero default, stays safe unchanged). Switching a slot to an
+already-loaded dataset is an O(1) pointer swap, never a reload — the whole
+point of a pool.
+
+**Invariant: never mutate a `Dataset` in place once constructed.** It may
+be shared with the pool and/or another panel's other slot; always build a
+new one and reassign the `shared_ptr` (see `SegyCanvas::startLoading`'s
+completion handler). This was a real bug caught while writing the
+refactor, before it ever ran: the original code mutated
+`app_.foreground->file = std::move(...)` directly, which would have
+corrupted whichever pool entry/other slot still pointed at the *previous*
+dataset.
+
+Converting the ~120 call sites that read the moved fields (every render
+call, every analysis/Calculator/Bandpass/Save-SEGY/hover-info site) was
+done as a scripted, exactly-anchored rename (`app_.binHeader` →
+`app_.foreground->binHeader`, etc., one prefix+field pair at a time,
+excluding `ctx.`/`result.` which are different, unrelated structs with
+same-named fields) rather than by hand — the compiler then enforces
+completeness (any missed spot is a compile error, not a silent bug) — this
+is also why `AppState::loaded`/`loading` were deliberately left as
+independent plain `bool` fields rather than derived from `foreground !=
+nullptr`: the existing code already had a window (during/after a failed
+load) where `loaded` and "does `foreground` point at something real"
+weren't quite the same thing, and preserving that exact timing mattered
+more than the derivation being conceptually cleaner.
+
+**UI**: two small boxes per panel ("Foreground N"/"Background N"),
+overlaid on the canvas (same technique as `AmplitudeScaleWidget`) at the
+top, flush with that panel's own plot left axis (`lastPlotX_`) — so in
+split view, panel 2's boxes land near the screen's middle (where its own
+plot begins), not the window's actual left edge, and both panels' boxes
+stay at the top regardless of split orientation (each is simply
+positioned relative to its own panel). Each box's small list-icon button
+opens `DatasetPickerDialog` (OK/Delete/Cancel, matching the reference
+tool this was modeled on) scoped to that slot; `MainWindow::datasetPool_`
+is the shared list every load (File > Open, Calculator, Bandpass) adds to
+via `SegyCanvas::setDatasetLoadedCallback`. Delete is blocked (button
+disabled, not just refused on click) for any dataset currently assigned
+to *any* panel's Foreground or Background — including the slot the
+dialog was opened for itself, so you can't delete a dataset out from
+under the very box you're editing without first picking something else
+and confirming OK. Background only accepts a synthetic "(None)" entry in
+its own picker (Foreground always needs something to render).
+
+Verified with a real screenshot, not just compile+test: loaded a real
+file via the command line, confirmed the Foreground box showed its name
+and Background showed "—". That caught a real ordering bug the type
+system couldn't — `startLoading`'s completion handler called the
+pool-registration callback (which refreshes the boxes) *before* actually
+assigning the new dataset to `app_.foreground`, so the box kept reading
+the previous (empty) dataset's name and never updated. Fixed by swapping
+the order: `setForegroundDataset` first, pool registration after.
+
+**Phase 1 scope, confirmed explicitly before starting**: Background is
+purely a held reference right now — nothing reads `app_.background` for
+rendering or analysis. What it should actually *do* (overlay? ghost?
+difference display?) is an intentionally separate, later decision.
+
+### App icon, and why a console window used to pop up alongside the GUI
+
+The real app icon (`native/assets/icons/`) replaces the placeholder
+seismic-wave icon on both platforms: `app_icon.qrc` embeds
+`assets/icons/png/segyread-256.png` as a Qt resource (`:/app_icon.png`,
+`CMAKE_AUTORCC ON`), set via `app.setWindowIcon(...)` in `main()` — this
+covers the taskbar/window-switcher icon on both platforms. Windows also
+gets `app.rc` (`IDI_ICON1 ICON "...segyread.ico"`), a Windows-only
+resource compiled straight into the `.exe` itself, since Explorer/the
+taskbar read an exe's *own* icon resource before the process has even
+started painting a window — the Qt resource alone would leave a brief
+flash of the default icon.
+
+Separately: launching `segyviewer.exe` used to always pop a console
+window behind the GUI. Cause: `qt_add_executable`/`add_executable` had
+no `WIN32` flag, so the linker defaulted to the Console subsystem — a
+GUI app with an unwanted console, not a logging/debug feature. Fixed by
+adding `WIN32` to both executable-creation calls in `CMakeLists.txt`.
+Verified directly rather than just by eye: read the built `.exe`'s PE
+header subsystem field via `[System.BitConverter]` in PowerShell (2 =
+GUI, 3 = Console) before and after the fix.
+
+### Background tasks: Calculator/Bandpass/Save SEG-Y off the UI thread
+
+These (and every future heavy operation) now run on a background
+`std::thread`, with the status bar showing a label and a `QProgressBar`
+(`statusBar()->addPermanentWidget(...)`) — the same real estate the
+existing pyramid-build progress text already used, not a new piece of
+UI. `MainWindow::runBackgroundTask(label, backgroundWork, uiCompletion)`
+is the one entry point all of them share: it flips a `backgroundTaskRunning_`
+guard (a second heavy operation while one's already running just gets a
+flashed status message, not a crash or silent queue), starts a
+33ms-interval `QTimer` to repaint the progress bar from
+`std::atomic<int64_t>` done/total counters the background closure
+updates, runs `backgroundWork` on a detached thread, and — via
+`QMetaObject::invokeMethod(this, ..., Qt::QueuedConnection)` back onto
+the UI thread, same pattern `SegyCanvas::startLoading` already used for
+pyramid building — stops the timer and calls `uiCompletion` once done.
+
+**Thread-safety rule, easy to get wrong given the Dataset pool above**:
+every background closure captures `std::shared_ptr<Dataset>` snapshots
+taken *synchronously on the UI thread before the thread is spawned* —
+never reads through `app_.foreground`/`app_.background` from the
+background thread itself, since the user is free to switch a panel's
+dataset mid-task. The `shared_ptr`'s own refcounting then keeps that
+exact `Dataset` (mmap, pyramid, everything) alive for the task's
+duration even if the pool or every panel drops its reference to it
+while the task is still running.
+
+### Toolbar overflow: a More button, in the status bar
+
+When the window's too short (toolbar docked Left/Right) or too narrow
+(Top/Bottom) to show every toolbar button, the ones that don't fit are
+hidden and reachable instead through a small list-icon button in the
+status bar's permanent-widget area — "an icon at the bottom," matching
+how this was originally asked for. Clicking it rebuilds a `QMenu` from
+scratch each time from whatever's currently hidden: a fresh proxy
+`QAction` per hidden item (icon/text/checkable/checked copied from the
+real one, `triggered` forwarded to the real action via `connect(proxy,
+&QAction::triggered, action, &QAction::trigger)`) rather than reusing
+the real actions directly, since a `QWidgetAction`'s widget can only
+ever live in one place at a time and would just move into the menu.
+
+`MainWindow::updateToolbarOverflow()` runs after every resize
+(deferred via `QTimer::singleShot(0, ...)` — `height()`/`width()` queried
+synchronously inside `resizeEvent` itself can still reflect the
+*previous* layout pass) and after `applyToolbarPosition()`. It measures
+fit **empirically**, not by predicting it: show every candidate action,
+force a real layout pass (`toolbar_->layout()->activate()`), then read
+back each candidate's *actual resulting geometry* and hide whichever
+ones (and everything after them — position is monotonic along the
+toolbar's axis) come back positioned past the toolbar's own real
+height/width. `QAction::setVisible()` alone was found, by logging both,
+to leave the underlying `QToolButton`'s own `isVisible()` lagging behind
+the action's, so the hide/show helper sets both explicitly.
+
+That empirical approach replaced an earlier version that predicted fit
+by summing each candidate's cached `sizeHint()` — repeatedly wrong by a
+margin that tracked inter-item spacing and separator widgets
+`QToolBarLayout` adds but `sizeHint()` doesn't report anywhere queryable.
+The failure mode was quiet and easy to misdiagnose: Qt marked an action
+"visible" with a plausible, non-stale-looking cached geometry, and then
+just never painted it — no native overflow chevron, no error, no size
+mismatch visible from the outside except careful geometry-level logging.
+The expanding spacer that pushes the sidebar-toggle button to the
+toolbar's far end (see its own construction comment) is hidden outright
+whenever anything's overflowed, for the same reason: it still claims a
+layout slot at zero size, which was observed to leave the sidebar-toggle
+button after it without a valid laid-out position once the toolbar was
+genuinely out of room.
+
+### Idents: trace-header reference rows/plot/overlay lines
+
+Modeled on a reference seismic tool's own Idents submenu (two screenshots:
+small rows of trace-header values above/below the section, a line-graph
+"ident plot" at the top, and checkable Display at Top/Bottom/On Seismic
+lists) and scoped to this app's own decoded fields: `IdentField`
+(`viewer_qt.h`) covers exactly the 7 fields `segy::TraceHeader`/
+`parseTraceHeader` already decode (Trace Sequence Line/File, Field
+Record, Trace Number, CDP, X, Y) — no abstract numbered-slot indirection
+like the reference tool had, since nothing else is decoded for a slot to
+map onto. `IdentSettings` (per-panel, on `AppState::idents`, read fresh
+every frame like `DisplaySettings` — **not persisted**, confirmed with
+the user: idents reset to all-off every session) holds which fields show
+at top (max 4), bottom (max 2), as the one ident plot (top only — a
+bottom plot was in the reference tool but the user said it "can be
+regretted"), and as each of two colored overlay lines drawn directly on
+the seismic (cyan/red).
+
+**The toolbar's Idents button** (`identsAction_`, new `iconIdents()` in
+`viewer_qt_icons.*` — hand-drawn, not a Tabler icon, since nothing in
+that set covers this app-specific concept) opens a `QMenu` built fresh
+from the active panel's `app_->idents` every time, same "rebuild, don't
+keep in sync live" approach as `toolbarMoreMenu_`. Display at Top/Bottom
+are independent checkable actions per field; checking a 5th/3rd is
+refused (`flashStatusMessage`, action left unchanged) rather than
+evicting the oldest — simplest correct behavior given the whole `QMenu`
+is thrown away the instant it closes, so there's no stale state to
+revert. Ident Plot and each overlay line's field picker are
+single-select-or-none, via an `ExclusiveOptional QActionGroup` (the same
+policy already used for Pan/Box Select) — clicking the already-checked
+entry again clears it to `-1`.
+
+**Canvas margin: independent top/bottom insets.** The existing
+`kCanvasMargin` (16px, the "Dark Pro" dark surround) was applied
+symmetrically on all four sides everywhere in `SegyCanvas`. Idents need
+the top/bottom insets to grow independently as rows/the plot are toggled
+on, without touching the (unchanged) left/right margin — `identInsets()`
+counts the enabled fields/plot and returns the extra top/bottom pixels to
+reserve, recomputed fresh on every call (cheap: a handful of bool reads)
+rather than cached, so there's no stale-cache window between an
+Idents-menu toggle and the next mouse/paint event reading it. Every
+existing site that derived the *vertical* inset from `kCanvasMargin`
+alone now adds `identInsets().top`/`.bottom`: `paintEvent`'s image blit
+origin and inset height, the time-scale tick/title Y positions, the
+wiggle-mode `painter.translate`, the selection-box clip rect,
+`dataCoordAt`/`pixelForData` (hover/box-select/pan/zoom all route through
+these two), and the pan/wheel handlers' own inset-height math. This was
+the single riskiest part of the feature — every site was enumerated
+up front from a full-file read rather than discovered mid-implementation,
+and verified by screenshot afterward (see below) rather than trusted on
+inspection alone, since a silent off-by-`identInsets()` bug here would
+show up as "pan/zoom/hover don't track the mouse correctly," not a crash.
+The Foreground/Background dataset-slot boxes (`repositionDatasetSlots()`)
+move too — from a fixed `y=2` to `identInsets().top + 2`, which reduces
+to exactly the original position when no idents are enabled, and stays
+pinned the same 14px above the image's actual top edge as the inset
+grows. `SegyCanvas::refreshIdentLayout()` (public) is what the Idents
+menu's handlers call after writing into `app_.idents` — `update()` alone
+wouldn't reposition the amplitude-scale legend or the dataset-slot boxes,
+since `repositionAmplitudeScale()`/`repositionDatasetSlots()` are
+otherwise only reached from `resizeEvent`/conditionally from `paintEvent`.
+
+**Trace-axis tick positions** are a new, Qt-shell-only helper
+(`identTracePositions()`, independent of `chrome.h`'s Y-axis/time tick
+system, which is unrelated): `count` evenly-spaced trace indices across
+the visible view, clamped and adjacent-duplicates collapsed. Two
+densities are used deliberately: ~12 for the text rows (readable, matches
+the reference's sparse labels) and one per plot-width pixel column for
+the ident plot and the two overlay lines (smooth continuous line — text
+rows have no such smoothness need, so there was no reason to reuse the
+same sparse count for both).
+
+**Overlay lines**: a field's raw header value is reinterpreted as a time
+in ms (inverse of the formula `currentHoverInfo()` already uses for its
+own `timeMs`), converted to a Y pixel via `pixelForData()` — the exact
+function selection-box corners already use, no new coordinate math.
+Confirmed with the user: a sampled point whose reinterpreted time falls
+outside the visible sample range breaks the line into a gap (new
+`QPainterPath` subpath on the next in-range point) rather than clipping
+it flat at the plot's edge, so an out-of-range stretch reads as "no data
+here," not as a real flat value.
+
+Verified with a real screenshot (not just compile+test, given the margin
+threading above): loaded the fixture, turned on 3 top rows + the bottom
+row + the ident plot + a cyan overlay line via temporarily-hardcoded
+`IdentSettings` defaults (reverted before committing — the Idents menu
+itself wasn't click-tested interactively, see "Trade-offs"). Confirmed:
+rows/plot render with correct per-trace values at correct tick positions,
+the dataset-slot boxes visibly shifted down to track the new top inset,
+the cyan line drew as a clean diagonal precisely bounded within the
+image area (strong indirect evidence `pixelForData`'s inset math is
+correct, since any offset bug would have shown the line starting above
+or extending past the image), and toggling everything back off reverted
+the layout pixel-for-pixel to the pre-feature baseline.
+
 ## Trade-offs and honest limitations
 
 - **No header-range filtering** (selecting/loading only traces matching a
@@ -2198,10 +2466,6 @@ specific thing not directly observed, not the feature logic behind it.
   correctly sized at high DPI (the rounding-policy fix scales them along
   with everything else) but not as crisp as they'd be with an explicit
   high-resolution variant; a cosmetic follow-up, not a functional gap.
-- **Box select supports exactly one box at a time** — starting a new one
-  while a complete box exists isn't possible; the existing box must be
-  deleted (right-click + Del) first. A deliberate simplification, not a
-  bug: multi-box support wasn't asked for.
 - **View menu's Zoom In/Out/Reset View/Fit to Window items are still
   inert placeholders**, unaffected by the new toolbar — the toolbar's own
   Zoom/Mooz/Pan/Box Select are the real, working zoom controls now; wheel
@@ -2220,3 +2484,30 @@ specific thing not directly observed, not the feature logic behind it.
   against one real dataset; if a different dataset or display makes it
   read as over/under-corrected, the fix is one constant in `viewer_qt.cpp`,
   not a rearchitecture.
+- **Toolbar overflow order is fixed** (the toolbar's own button order,
+  least-recently-added hidden first) — not user-reorderable, and not
+  based on actual usage frequency. Matches every other fixed-order
+  toolbar in this app; a user-customizable toolbar is an explicitly
+  planned follow-up, not built yet.
+- **A second background task (Calculator/Bandpass/Save SEG-Y/Octave
+  Bands) while one's already running is refused with a flashed status
+  message**, not queued — simple and safe, but means starting a second
+  heavy operation means waiting for the first to finish first, with no
+  visible queue or cancel button for the one in progress.
+- **The Idents menu wasn't interactively click-tested** (QMenu/QAction
+  mechanics — checking a box, the max-4/max-2 refusal, the exclusive
+  pickers clearing on re-click) — the risky part (margin/inset math,
+  actual row/plot/overlay-line rendering) was verified by screenshot with
+  temporarily-hardcoded settings; the menu's own plumbing is standard,
+  low-risk Qt code already proven elsewhere in this file (`toolbarMoreMenu_`,
+  the amplitude-scale legend's menu), but not independently confirmed by
+  hand.
+- **Idents' overlay lines need a header field that actually holds a
+  time-like value to be useful** — none of the 7 decoded fields
+  (sequence numbers, CDP, X/Y) naturally are one; the feature reinterprets
+  whatever raw value is there as milliseconds, which only makes visual
+  sense for data where a field was deliberately repurposed to carry a
+  pick/marker time (a real legacy workflow this was modeled on, but not
+  something this app's own synthetic test fixture demonstrates).
+- **No bottom ident plot** (only top) — per the user's own call ("can be
+  regretted"), not an oversight.

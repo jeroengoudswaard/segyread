@@ -28,6 +28,8 @@ QIcon iconWiggleGlyph();
 QIcon iconVariableDensityGlyph();
 QIcon iconArrowsHorizontal();
 QIcon iconColumns3();
+QIcon iconList();
+QIcon iconIdents();
 
 // Box-select cursor: a plain arrow with a small rectangle badge, matching
 // "a pointer with a little rectangle."

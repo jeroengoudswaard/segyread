@@ -43,6 +43,7 @@
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QPolygon>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QResizeEvent>
@@ -55,6 +56,7 @@
 #include <QStatusBar>
 #include <QStringList>
 #include <QTableWidget>
+#include <QToolButton>
 #include <QTimer>
 #include <QtGlobal>
 #include <QToolBar>
@@ -83,6 +85,13 @@ constexpr int kCanvasMargin = 16; // dark surround around the inset plot
 // reserved space changes). 12px of that is breathing room between the
 // plot/chrome's own right axis and the legend, not the legend itself.
 constexpr int kAmplitudeScaleColumnWidth = 46 + 12;
+// Idents (see native/README.md): fixed pixel sizes rather than font-metric-
+// derived, so SegyCanvas::identInsets() stays callable from contexts with
+// no painter/font (wheelEvent, mouseMoveEvent) just as cheaply as it is
+// from paintEvent.
+constexpr int kIdentRowHeight = 18;  // one text-row ident
+constexpr int kIdentPlotHeight = 54; // ident line-plot + its min/max labels
+constexpr int kIdentRowGap = 2;      // gap between stacked ident elements
 // Wiggle traces read as visually weaker than the variable-density raster at
 // the same nominal gain (a wiggle line's "loudness" is judged by excursion
 // width, not color saturation) -- boosting wiggle's effective gain by a
@@ -140,7 +149,7 @@ struct AnalysisSource {
     QColor color;
 };
 AnalysisSource resolveAnalysisSource(const AppState& app, bool useSelection) {
-    AnalysisSource src{0, app.traceCount, 0, app.binHeader.samplesPerTrace, Qt::white};
+    AnalysisSource src{0, app.foreground->traceCount, 0, app.foreground->binHeader.samplesPerTrace, Qt::white};
     if (!useSelection) return src;
     const SelectionBox* box = activeBox(app);
     if (!box || !box->complete) return src;
@@ -199,13 +208,63 @@ void drawRotatedLabel(QPainter& painter, const QFont& font, int anchorX, int cen
     painter.restore();
 }
 
+// Idents (see native/README.md): short display label and raw-value
+// accessor for each of the 7 fields segy::TraceHeader already decodes --
+// kept together so a new IdentField enumerator is a compile error in both
+// places (a switch with no default) until handled, not a silent gap.
+const char* identFieldLabel(IdentField f) {
+    switch (f) {
+        case IdentField::TraceSequenceLine: return "Seq (Line)";
+        case IdentField::TraceSequenceFile: return "Seq (File)";
+        case IdentField::FieldRecord: return "Field Record";
+        case IdentField::TraceNumber: return "Trace Number";
+        case IdentField::Cdp: return "CDP";
+        case IdentField::X: return "X";
+        case IdentField::Y: return "Y";
+    }
+    return "";
+}
+
+int32_t identFieldValue(const segy::TraceHeader& th, IdentField f) {
+    switch (f) {
+        case IdentField::TraceSequenceLine: return th.traceSequenceLine;
+        case IdentField::TraceSequenceFile: return th.traceSequenceFile;
+        case IdentField::FieldRecord: return th.fieldRecord;
+        case IdentField::TraceNumber: return th.traceNumber;
+        case IdentField::Cdp: return th.cdp;
+        case IdentField::X: return th.x;
+        case IdentField::Y: return th.y;
+    }
+    return 0;
+}
+
+// Evenly-spaced trace indices across the visible view, clamped into
+// [0, traceCount), with adjacent duplicates collapsed (a heavily zoomed-in
+// view can otherwise request more positions than there are distinct
+// traces to show). `count` is deliberately different per caller -- see
+// native/README.md: ~12 for the readable text rows, one per plot pixel
+// column for the smooth ident plot/overlay lines.
+std::vector<int64_t> identTracePositions(const segy::ViewRange& view, int64_t traceCount, int count) {
+    std::vector<int64_t> result;
+    if (traceCount <= 0 || count <= 0) return result;
+    result.reserve(size_t(count));
+    double span = view.traceEnd - view.traceStart;
+    for (int i = 0; i < count; ++i) {
+        double frac = count == 1 ? 0.5 : double(i) / double(count - 1);
+        int64_t idx = int64_t(std::lround(view.traceStart + frac * span));
+        idx = std::clamp<int64_t>(idx, 0, traceCount - 1);
+        if (result.empty() || result.back() != idx) result.push_back(idx);
+    }
+    return result;
+}
+
 // " -- filename.sgy" once a file is loaded, otherwise empty -- appended to
 // every window title that shows data for one specific panel (the main
 // window, and every popup/dialog below), so which dataset a given window
 // is showing is always visible and titled the same way everywhere.
 QString datasetTitleSuffix(const AppState& app) {
-    if (!app.loaded || app.filePath.empty()) return QString();
-    return QString::fromUtf8(" \xe2\x80\x94 ") + QString::fromStdString(app.filePath.filename().string());
+    if (!app.loaded || app.foreground->filePath.empty()) return QString();
+    return QString::fromUtf8(" \xe2\x80\x94 ") + QString::fromStdString(app.foreground->filePath.filename().string());
 }
 
 // The vertical toolbar's gain value label (between the up/down arrows) can
@@ -244,11 +303,11 @@ void addButtonRow(QDialog* dialog, QVBoxLayout* layout,
 // so kept in one place rather than two copies drifting apart.
 segy::RenderContext makeRenderContextFor(AppState& app) {
     segy::RenderContext ctx;
-    ctx.file = &app.file;
-    ctx.pyramid = &app.pyramid;
-    ctx.binHeader = app.binHeader;
-    ctx.traceCount = app.traceCount;
-    ctx.traceStrideBytes = app.traceStrideBytes;
+    ctx.file = &app.foreground->file;
+    ctx.pyramid = &app.foreground->pyramid;
+    ctx.binHeader = app.foreground->binHeader;
+    ctx.traceCount = app.foreground->traceCount;
+    ctx.traceStrideBytes = app.foreground->traceStrideBytes;
     ctx.pool = &app.pool;
     return ctx;
 }
@@ -661,9 +720,9 @@ void ClipDialog::recomputeHistogram(float rangeMin, float rangeMax) {
     // whole file or a selection box (a third, dialog-local scoping
     // distinct from Histogram/Spectrum's Full View/Selection radio).
     int64_t traceStart = int64_t(std::max(0.0, app_.view.traceStart));
-    int64_t traceEnd = int64_t(std::min(double(app_.traceCount), app_.view.traceEnd));
+    int64_t traceEnd = int64_t(std::min(double(app_.foreground->traceCount), app_.view.traceEnd));
     int32_t sampleStart = int32_t(std::max(0.0, app_.view.sampleStart));
-    int32_t sampleEnd = int32_t(std::min(double(app_.binHeader.samplesPerTrace), app_.view.sampleEnd));
+    int32_t sampleEnd = int32_t(std::min(double(app_.foreground->binHeader.samplesPerTrace), app_.view.sampleEnd));
     constexpr int kBins = 101;
     segy::HistogramResult result = segy::computeHistogram(makeRenderContextFor(app_), traceStart, traceEnd,
                                                             sampleStart, sampleEnd, kBins, rangeMin, rangeMax);
@@ -675,7 +734,7 @@ void ClipDialog::showEvent(QShowEvent* event) {
     if (!app_.loaded) return;
     original_ = app_.display.manualClip;
 
-    float rawClip = std::max(std::fabs(app_.pyramid.globalMin), std::fabs(app_.pyramid.globalMax));
+    float rawClip = std::max(std::fabs(app_.foreground->pyramid.globalMin), std::fabs(app_.foreground->pyramid.globalMax));
     float posClip = app_.display.manualClip.enabled ? app_.display.manualClip.posMagnitude : rawClip;
     float negClip = app_.display.manualClip.enabled ? app_.display.manualClip.negMagnitude : rawClip;
 
@@ -794,8 +853,8 @@ void HistogramDialog::updateClipFieldsEnabled() {
         // real pass over the samples that doesn't exist yet (see
         // native/README.md); this uses the pyramid's already-computed
         // true min/max as a placeholder in the meantime.
-        minValueSpin_->setValue(app_.loaded ? app_.pyramid.globalMin : 0.0);
-        maxValueSpin_->setValue(app_.loaded ? app_.pyramid.globalMax : 0.0);
+        minValueSpin_->setValue(app_.loaded ? app_.foreground->pyramid.globalMin : 0.0);
+        maxValueSpin_->setValue(app_.loaded ? app_.foreground->pyramid.globalMax : 0.0);
     }
 }
 
@@ -1764,6 +1823,140 @@ QStringList filterPatterns(const QString& filterText) {
 }
 } // namespace
 
+DatasetPickerDialog::DatasetPickerDialog(QWidget* parent) : QDialog(parent) {
+    setWindowTitle("Select Dataset");
+    setModal(false);
+
+    QVBoxLayout* layout = new QVBoxLayout(this);
+    list_ = new QListWidget();
+    layout->addWidget(list_, 1);
+
+    connect(list_, &QListWidget::currentRowChanged, this, [this](int) { updateButtonsEnabled(); });
+    connect(list_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem*) {
+        if (okButton_->isEnabled()) okButton_->click();
+    });
+
+    QHBoxLayout* buttonRow = new QHBoxLayout();
+    buttonRow->addStretch();
+    okButton_ = new QPushButton("OK");
+    QPushButton* deleteButton = new QPushButton("Delete");
+    QPushButton* cancelButton = new QPushButton("Cancel");
+    deleteButton_ = deleteButton;
+    buttonRow->addWidget(okButton_);
+    buttonRow->addWidget(deleteButton);
+    buttonRow->addWidget(cancelButton);
+    layout->addLayout(buttonRow);
+
+    connect(okButton_, &QPushButton::clicked, this, [this]() {
+        int row = list_->currentRow();
+        if (row < 0 || row >= int(datasets_.size())) return;
+        if (onPicked_) onPicked_(datasets_[size_t(row)] ? datasets_[size_t(row)] : std::make_shared<Dataset>());
+        accept();
+    });
+    connect(deleteButton, &QPushButton::clicked, this, [this]() {
+        int row = list_->currentRow();
+        if (row < 0 || row >= int(datasets_.size())) return;
+        std::shared_ptr<Dataset> target = datasets_[size_t(row)];
+        if (!target || (isInUse_ && isInUse_(target))) return; // belt-and-suspenders; button should already be disabled
+        if (onDeleted_) onDeleted_(target);
+        datasets_.erase(datasets_.begin() + row);
+        delete list_->takeItem(row);
+        updateButtonsEnabled();
+    });
+    connect(cancelButton, &QPushButton::clicked, this, [this]() { reject(); });
+
+    resize(360, 320);
+}
+
+void DatasetPickerDialog::setDatasets(const std::vector<std::shared_ptr<Dataset>>& datasets,
+                                       const std::shared_ptr<Dataset>& current, bool allowNone,
+                                       std::function<bool(const std::shared_ptr<Dataset>&)> isInUse) {
+    isInUse_ = std::move(isInUse);
+    datasets_.clear();
+    list_->clear();
+
+    int currentRow = -1;
+    if (allowNone) {
+        datasets_.push_back(nullptr);
+        list_->addItem("(None)");
+        if (!current || current->name.empty()) currentRow = 0;
+    }
+    for (const std::shared_ptr<Dataset>& ds : datasets) {
+        datasets_.push_back(ds);
+        list_->addItem(QString::fromStdString(ds->name));
+        if (ds == current) currentRow = int(datasets_.size()) - 1;
+    }
+    list_->setCurrentRow(currentRow);
+    updateButtonsEnabled();
+}
+
+void DatasetPickerDialog::setCallbacks(std::function<void(std::shared_ptr<Dataset>)> onPicked,
+                                        std::function<void(std::shared_ptr<Dataset>)> onDeleted) {
+    onPicked_ = std::move(onPicked);
+    onDeleted_ = std::move(onDeleted);
+}
+
+void DatasetPickerDialog::updateButtonsEnabled() {
+    int row = list_->currentRow();
+    bool hasSelection = row >= 0 && row < int(datasets_.size());
+    okButton_->setEnabled(hasSelection);
+    bool isNoneRow = hasSelection && !datasets_[size_t(row)];
+    bool canDelete = hasSelection && !isNoneRow && !(isInUse_ && isInUse_(datasets_[size_t(row)]));
+    deleteButton_->setEnabled(canDelete);
+}
+
+DatasetSlotWidget::DatasetSlotWidget(const QString& label, QWidget* parent) : QWidget(parent), label_(label) {
+    setFixedSize(160, 34);
+
+    pickButton_ = new QPushButton(this);
+    pickButton_->setIcon(iconList());
+    pickButton_->setIconSize(QSize(12, 12));
+    pickButton_->setFixedSize(18, 18);
+    pickButton_->setFlat(true);
+    pickButton_->setCursor(Qt::PointingHandCursor);
+    pickButton_->setToolTip("Select dataset...");
+    pickButton_->setStyleSheet(
+        "QPushButton { background: transparent; border: none; } "
+        "QPushButton:hover { background: #3c3f41; border-radius: 2px; }");
+    pickButton_->move(width() - 22, 14);
+    connect(pickButton_, &QPushButton::clicked, this, [this]() { if (onPick_) onPick_(); });
+}
+
+void DatasetSlotWidget::setLabel(const QString& label) {
+    label_ = label;
+    update();
+}
+
+void DatasetSlotWidget::setDatasetName(const QString& name) {
+    datasetName_ = name;
+    update();
+}
+
+void DatasetSlotWidget::setPickCallback(std::function<void()> callback) { onPick_ = std::move(callback); }
+
+void DatasetSlotWidget::paintEvent(QPaintEvent*) {
+    QPainter painter(this);
+    QRect r = rect().adjusted(0, 0, -1, -1);
+    painter.fillRect(r, QColor(0x2b, 0x2d, 0x30));
+    painter.setPen(QColor(0x3c, 0x3f, 0x41));
+    painter.drawRect(r);
+
+    QFont captionFont = font();
+    captionFont.setPixelSize(9);
+    painter.setFont(captionFont);
+    painter.setPen(QColor(0x9a, 0x9c, 0xa3));
+    painter.drawText(QRect(4, 1, width() - 8, 12), Qt::AlignLeft | Qt::AlignVCenter, label_);
+
+    QFont nameFont = font();
+    nameFont.setPixelSize(11);
+    painter.setFont(nameFont);
+    painter.setPen(QColor(0xd4, 0xd4, 0xd8));
+    QString shown = datasetName_.isEmpty() ? QStringLiteral("—") : datasetName_;
+    QRect nameRect(4, 15, width() - 8 - 20, 16);
+    painter.drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter,
+                      painter.fontMetrics().elidedText(shown, Qt::ElideRight, nameRect.width()));
+}
+
 SegyOpenDialog::SegyOpenDialog(QWidget* parent) : QDialog(parent) {
     setWindowTitle("Open SEG-Y File");
     setModal(true);
@@ -2247,6 +2440,15 @@ SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(a
 
         menu.exec(amplitudeScale_->mapToGlobal(pos));
     });
+
+    // Foreground/Background dataset boxes -- see native/README.md,
+    // "Dataset pool: Foreground/Background." Labels ("Foreground 1" vs
+    // "Foreground 2" etc.) are set by MainWindow right after construction
+    // (setDatasetSlotLabels), since only it knows which panel this is.
+    foregroundSlot_ = new DatasetSlotWidget(QString(), this);
+    foregroundSlot_->setPickCallback([this]() { if (onDatasetSlotPick_) onDatasetSlotPick_(true); });
+    backgroundSlot_ = new DatasetSlotWidget(QString(), this);
+    backgroundSlot_->setPickCallback([this]() { if (onDatasetSlotPick_) onDatasetSlotPick_(false); });
 }
 
 void SegyCanvas::setAmplitudeScale(float posClip, float negClip, bool visible, segy::ColorScale colorScale) {
@@ -2255,26 +2457,81 @@ void SegyCanvas::setAmplitudeScale(float posClip, float negClip, bool visible, s
     amplitudeScale_->setVisible(visible);
 }
 
+void SegyCanvas::setDatasetSlotLabels(const QString& foregroundLabel, const QString& backgroundLabel) {
+    foregroundSlot_->setLabel(foregroundLabel);
+    backgroundSlot_->setLabel(backgroundLabel);
+}
+
+void SegyCanvas::setDatasetSlotPickCallback(std::function<void(bool)> callback) {
+    onDatasetSlotPick_ = std::move(callback);
+}
+
+void SegyCanvas::refreshDatasetSlotNames() {
+    foregroundSlot_->setDatasetName(QString::fromStdString(app_.foreground->name));
+    backgroundSlot_->setDatasetName(QString::fromStdString(app_.background->name));
+}
+
 int SegyCanvas::plotAreaWidth() const {
     int reserved = app_.display.showColorBar ? kAmplitudeScaleColumnWidth : 0;
     return std::max(0, this->width() - 2 * kCanvasMargin - reserved);
 }
 
+SegyCanvas::IdentInsets SegyCanvas::identInsets() const {
+    int topRows = 0, bottomRows = 0;
+    for (int i = 0; i < kIdentFieldCount; ++i) {
+        if (app_.idents.topEnabled[i]) ++topRows;
+        if (app_.idents.bottomEnabled[i]) ++bottomRows;
+    }
+    IdentInsets r;
+    if (app_.idents.plotField >= 0) r.top += kIdentPlotHeight + kIdentRowGap;
+    if (topRows > 0) r.top += topRows * kIdentRowHeight + kIdentRowGap;
+    if (bottomRows > 0) r.bottom += bottomRows * kIdentRowHeight + kIdentRowGap;
+    return r;
+}
+
 void SegyCanvas::repositionAmplitudeScale() {
     constexpr int kOverlayWidth = 46;
-    int insetHeight = std::max(0, height() - 2 * kCanvasMargin);
+    IdentInsets insets = identInsets();
+    int topInset = kCanvasMargin + insets.top;
+    int insetHeight = std::max(0, height() - topInset - (kCanvasMargin + insets.bottom));
     int overlayHeight = int(insetHeight * 0.7);
     // Its own reserved column, immediately right of the plot/chrome's own
     // right axis -- never overlapping either, unlike the first version of
     // this overlay (see native/README.md).
     int x = kCanvasMargin + plotAreaWidth() + (kAmplitudeScaleColumnWidth - kOverlayWidth);
-    int y = kCanvasMargin + (insetHeight - overlayHeight) / 2;
+    int y = topInset + (insetHeight - overlayHeight) / 2;
     amplitudeScale_->setGeometry(x, y, kOverlayWidth, overlayHeight);
+}
+
+void SegyCanvas::repositionDatasetSlots() {
+    // Flush with the plot's own left axis (lastPlotX_), not the widget's
+    // own left edge -- see native/README.md: in split view this is what
+    // makes panel 2's boxes line up near the screen's middle (where its
+    // own plot begins) rather than at the window's actual left edge.
+    // lastPlotX_ is only meaningful after the first paint; it defaults to
+    // 0, which still places the boxes at a reasonable spot before then.
+    // y tracks the image's actual top edge (kCanvasMargin, plus whatever
+    // idents' top rows/plot currently reserve) rather than a fixed 2px, so
+    // the boxes stay pinned the same 14px above the image as idents grow
+    // the inset -- 14 = kCanvasMargin(16) - the original fixed y(2), i.e.
+    // this reduces to the exact original position when no idents are
+    // enabled (identInsets().top == 0) -- see native/README.md, "Idents."
+    int x = kCanvasMargin + lastPlotX_;
+    int y = (kCanvasMargin + identInsets().top) - (kCanvasMargin - 2);
+    foregroundSlot_->move(x, y);
+    backgroundSlot_->move(x + foregroundSlot_->width() + 4, y);
 }
 
 void SegyCanvas::resizeEvent(QResizeEvent* event) {
     QWidget::resizeEvent(event);
     repositionAmplitudeScale();
+    repositionDatasetSlots();
+}
+
+void SegyCanvas::refreshIdentLayout() {
+    repositionAmplitudeScale();
+    repositionDatasetSlots();
+    update();
 }
 
 std::string SegyCanvas::statusLineText() const {
@@ -2314,15 +2571,17 @@ std::string SegyCanvas::statusLineText() const {
     const char* hint = (app_.tool == ToolMode::Pan) ? "drag=pan, wheel=zoom, R=reset" : "wheel=zoom, R=reset";
     std::snprintf(buf, sizeof(buf), "traces [%.0f, %.0f)  samples [%.0f, %.0f)  format=%d  render=%.2fms  (%s)",
                   app_.view.traceStart, app_.view.traceEnd, app_.view.sampleStart, app_.view.sampleEnd,
-                  int(app_.binHeader.formatCode), app_.lastRenderMs, hint);
+                  int(app_.foreground->binHeader.formatCode), app_.lastRenderMs, hint);
     return buf;
 }
 
 void SegyCanvas::updateStatusBar() {
-    if (statusBar_) statusBar_->showMessage(QString::fromStdString(statusLineText()));
+    if (statusBar_ && !statusOverrideActive_) statusBar_->showMessage(QString::fromStdString(statusLineText()));
 }
 
 void SegyCanvas::refreshStatusBar() { updateStatusBar(); }
+
+void SegyCanvas::setStatusOverrideActive(bool active) { statusOverrideActive_ = active; }
 
 void SegyCanvas::notifyStateChanged() {
     if (notifyStateChanged_) notifyStateChanged_();
@@ -2338,7 +2597,13 @@ void SegyCanvas::setHoverInfoCallback(std::function<void(const HoverInfo&)> call
     notifyHoverChanged_ = std::move(callback);
 }
 
+void SegyCanvas::setViewChangedCallback(std::function<void()> callback) { notifyViewChanged_ = std::move(callback); }
+
 void SegyCanvas::setActivatedCallback(std::function<void()> callback) { notifyActivated_ = std::move(callback); }
+
+void SegyCanvas::setDatasetLoadedCallback(std::function<void(std::shared_ptr<Dataset>)> callback) {
+    onDatasetLoaded_ = std::move(callback);
+}
 
 // Exact (not bilinearly-interpolated) sample at the hovered position, plus
 // that trace's header -- moved here from statusLineText() so it can feed
@@ -2349,20 +2614,20 @@ HoverInfo SegyCanvas::currentHoverInfo() const {
     double traceCoord = 0, sampleCoord = 0;
     if (!dataCoordAt(hoverPixelX_, hoverPixelY_, traceCoord, sampleCoord)) return info;
 
-    int64_t traceIdx = std::clamp<int64_t>(int64_t(traceCoord), 0, std::max<int64_t>(0, app_.traceCount - 1));
-    int sampleIdx = std::clamp(int(sampleCoord), 0, std::max(0, int(app_.binHeader.samplesPerTrace) - 1));
-    const uint8_t* fileBase = app_.file.data();
-    const uint8_t* traceBase = fileBase + segy::kHeaderTotalSize + size_t(traceIdx) * app_.traceStrideBytes;
+    int64_t traceIdx = std::clamp<int64_t>(int64_t(traceCoord), 0, std::max<int64_t>(0, app_.foreground->traceCount - 1));
+    int sampleIdx = std::clamp(int(sampleCoord), 0, std::max(0, int(app_.foreground->binHeader.samplesPerTrace) - 1));
+    const uint8_t* fileBase = app_.foreground->file.data();
+    const uint8_t* traceBase = fileBase + segy::kHeaderTotalSize + size_t(traceIdx) * app_.foreground->traceStrideBytes;
     segy::TraceHeader th = segy::parseTraceHeader(traceBase);
-    int sampleSize = segy::sampleFormatSizeBytes(app_.binHeader.formatCode);
+    int sampleSize = segy::sampleFormatSizeBytes(app_.foreground->binHeader.formatCode);
     const uint8_t* sampleBase = traceBase + segy::kTraceHeaderSize + size_t(sampleIdx) * size_t(sampleSize);
     float value = 0.0f;
-    segy::decodeSamples(sampleBase, &value, 1, app_.binHeader.formatCode);
+    segy::decodeSamples(sampleBase, &value, 1, app_.foreground->binHeader.formatCode);
 
     info.valid = true;
     info.traceIdx = traceIdx;
     info.seqNum = th.traceSequenceLine;
-    info.timeMs = double(sampleIdx) * (app_.binHeader.sampleIntervalUs / 1000.0);
+    info.timeMs = double(sampleIdx) * (app_.foreground->binHeader.sampleIntervalUs / 1000.0);
     info.amplitude = value;
     return info;
 }
@@ -2372,13 +2637,16 @@ void SegyCanvas::notifyHoverChanged() {
 }
 
 bool SegyCanvas::dataCoordAt(int pixelX, int pixelY, double& traceCoord, double& sampleCoord) const {
-    // pixelX/pixelY are widget-local (include the dark canvas margin);
-    // lastPlotX_/lastPlotWidth_ and the height used below are relative to
-    // the *inset* plot area's own origin, matching what paintEvent passes
-    // to chrome.
-    int insetHeight = this->height() - 2 * kCanvasMargin;
+    // pixelX/pixelY are widget-local (include the dark canvas margin, plus
+    // whatever extra top/bottom inset idents currently reserve -- see
+    // identInsets()); lastPlotX_/lastPlotWidth_ and the height used below
+    // are relative to the *inset* plot area's own origin, matching what
+    // paintEvent passes to chrome.
+    IdentInsets insets = identInsets();
+    int topInset = kCanvasMargin + insets.top;
+    int insetHeight = this->height() - topInset - (kCanvasMargin + insets.bottom);
     int localX = pixelX - kCanvasMargin;
-    int localY = pixelY - kCanvasMargin;
+    int localY = pixelY - topInset;
     if (lastPlotWidth_ <= 0 || insetHeight <= 0) return false;
     if (localX < lastPlotX_ || localX >= lastPlotX_ + lastPlotWidth_) return false;
     if (localY < 0 || localY >= insetHeight) return false;
@@ -2397,7 +2665,9 @@ bool SegyCanvas::dataCoordAt(int pixelX, int pixelY, double& traceCoord, double&
 }
 
 void SegyCanvas::pixelForData(double traceCoord, double sampleCoord, double& pixelX, double& pixelY) const {
-    int insetHeight = this->height() - 2 * kCanvasMargin;
+    IdentInsets insets = identInsets();
+    int topInset = kCanvasMargin + insets.top;
+    int insetHeight = this->height() - topInset - (kCanvasMargin + insets.bottom);
     double traceSpan = std::max(1e-9, app_.view.traceEnd - app_.view.traceStart);
     double sampleSpan = std::max(1e-9, app_.view.sampleEnd - app_.view.sampleStart);
     double xInPlot = (traceCoord - app_.view.traceStart) / traceSpan * lastPlotWidth_;
@@ -2405,7 +2675,7 @@ void SegyCanvas::pixelForData(double traceCoord, double sampleCoord, double& pix
     // the same mirrored pixel the (also mirrored) plot itself draws at.
     if (app_.display.flipHorizontal) xInPlot = lastPlotWidth_ - xInPlot;
     pixelX = kCanvasMargin + lastPlotX_ + xInPlot;
-    pixelY = kCanvasMargin + (sampleCoord - app_.view.sampleStart) / sampleSpan * insetHeight;
+    pixelY = topInset + (sampleCoord - app_.view.sampleStart) / sampleSpan * insetHeight;
 }
 
 int SegyCanvas::hitTestCorner(int pixelX, int pixelY, int* outBoxIndex) const {
@@ -2524,6 +2794,165 @@ void SegyCanvas::handleBoxSelectPress(QMouseEvent* event) {
 
 segy::RenderContext SegyCanvas::makeRenderContext() const { return makeRenderContextFor(app_); }
 
+// Idents (see native/README.md): top rows + the ident plot, then bottom
+// rows -- pure QPainter text/line drawing, disjoint from the image region
+// (kCanvasMargin..topInset above it, topInset+insetHeight..height-margin
+// below), so no clipping is needed here (unlike the overlay lines below,
+// which paint over the image itself).
+void SegyCanvas::paintIdentText(QPainter& painter, const segy::ChromeLayout& chrome, int topInset, int bottomInset,
+                                 int insetHeight) const {
+    (void)bottomInset;
+    const IdentSettings& idents = app_.idents;
+    int topRows = 0, bottomRows = 0;
+    for (int i = 0; i < kIdentFieldCount; ++i) {
+        if (idents.topEnabled[i]) ++topRows;
+        if (idents.bottomEnabled[i]) ++bottomRows;
+    }
+    if (idents.plotField < 0 && topRows == 0 && bottomRows == 0) return;
+
+    const uint8_t* fileBase = app_.foreground->file.data();
+    size_t stride = app_.foreground->traceStrideBytes;
+    int64_t traceCount = app_.foreground->traceCount;
+    auto headerAt = [&](int64_t idx) {
+        const uint8_t* traceBase = fileBase + segy::kHeaderTotalSize + size_t(idx) * stride;
+        return segy::parseTraceHeader(traceBase);
+    };
+
+    QFont font = axisFont();
+    QFontMetrics fm(font);
+    painter.save();
+    painter.setFont(font);
+    painter.setPen(Qt::white);
+
+    auto drawRow = [&](int y, IdentField field, const std::vector<int64_t>& ticks) {
+        for (int64_t idx : ticks) {
+            double px, py;
+            pixelForData(double(idx), 0.0, px, py);
+            QString text = QString::number(identFieldValue(headerAt(idx), field));
+            int tw = fm.horizontalAdvance(text);
+            painter.drawText(QPoint(int(std::lround(px)) - tw / 2, y + fm.ascent()), text);
+        }
+    };
+
+    std::vector<int64_t> textTicks = identTracePositions(app_.view, traceCount, 12);
+    int y = kCanvasMargin;
+
+    if (idents.plotField >= 0) {
+        IdentField field = IdentField(idents.plotField);
+        std::vector<int64_t> plotTicks = identTracePositions(app_.view, traceCount, std::max(1, chrome.plotWidth));
+        std::vector<QPointF> points;
+        std::vector<int32_t> values;
+        points.reserve(plotTicks.size());
+        values.reserve(plotTicks.size());
+        double minVal = 0, maxVal = 0;
+        for (size_t i = 0; i < plotTicks.size(); ++i) {
+            double px, py;
+            pixelForData(double(plotTicks[i]), 0.0, px, py);
+            int32_t v = identFieldValue(headerAt(plotTicks[i]), field);
+            if (i == 0) { minVal = maxVal = v; } else { minVal = std::min(minVal, double(v)); maxVal = std::max(maxVal, double(v)); }
+            points.emplace_back(px, 0.0);
+            values.push_back(v);
+        }
+        double range = std::max(1e-9, maxVal - minVal);
+        int labelH = fm.height();
+        int plotTop = y + labelH;           // leave room for the max label above the line
+        int plotBottom = y + kIdentPlotHeight - labelH; // and the min label below it
+        for (size_t i = 0; i < points.size(); ++i) {
+            double t = (double(values[i]) - minVal) / range;
+            points[i].setY(plotBottom - t * (plotBottom - plotTop));
+        }
+        if (points.size() >= 2) {
+            QPainterPath path;
+            path.moveTo(points[0]);
+            for (size_t i = 1; i < points.size(); ++i) path.lineTo(points[i]);
+            QPen linePen(QColor(90, 170, 255));
+            linePen.setWidth(0);
+            painter.setPen(linePen);
+            painter.drawPath(path);
+            painter.setPen(Qt::white);
+        }
+        int labelX = kCanvasMargin + chrome.plotX + 2;
+        painter.drawText(QPoint(labelX, y + fm.ascent()), QString::number(maxVal, 'f', 1));
+        painter.drawText(QPoint(labelX, y + kIdentPlotHeight - labelH + fm.ascent()), QString::number(minVal, 'f', 1));
+        y += kIdentPlotHeight + kIdentRowGap;
+    }
+
+    for (int i = 0; i < kIdentFieldCount; ++i) {
+        if (!idents.topEnabled[i]) continue;
+        drawRow(y, IdentField(i), textTicks);
+        y += kIdentRowHeight;
+    }
+
+    if (bottomRows > 0) {
+        y = topInset + insetHeight + kIdentRowGap;
+        for (int i = 0; i < kIdentFieldCount; ++i) {
+            if (!idents.bottomEnabled[i]) continue;
+            drawRow(y, IdentField(i), textTicks);
+            y += kIdentRowHeight;
+        }
+    }
+
+    painter.restore();
+}
+
+// Idents' "Display on Seismic" overlay lines: a field's raw value
+// reinterpreted as a time in ms, converted to a Y pixel via the same
+// pixelForData() selection-box corners already use. A gap (new subpath)
+// is started whenever a sampled point's reinterpreted time falls outside
+// the currently visible sample range, rather than clipping it to the
+// plot's edge -- confirmed with the user: makes "this part is out of
+// range" visually obvious instead of reading as a real flat value.
+void SegyCanvas::paintIdentOverlayLines(QPainter& painter, const segy::ChromeLayout& chrome, int topInset,
+                                         int insetHeight) const {
+    const IdentSettings& idents = app_.idents;
+    if (idents.overlayCyanField < 0 && idents.overlayRedField < 0) return;
+    if (chrome.plotWidth <= 0) return;
+
+    const uint8_t* fileBase = app_.foreground->file.data();
+    size_t stride = app_.foreground->traceStrideBytes;
+    int64_t traceCount = app_.foreground->traceCount;
+    double sampleIntervalMs = app_.foreground->binHeader.sampleIntervalUs / 1000.0;
+    if (sampleIntervalMs <= 0.0) return;
+
+    std::vector<int64_t> ticks = identTracePositions(app_.view, traceCount, chrome.plotWidth);
+
+    auto drawOverlay = [&](int fieldIdx, const QColor& color) {
+        if (fieldIdx < 0) return;
+        IdentField field = IdentField(fieldIdx);
+        painter.save();
+        painter.setClipRect(QRect(kCanvasMargin + chrome.plotX, topInset, chrome.plotWidth, insetHeight));
+        QPen pen(color);
+        pen.setWidth(0);
+        painter.setPen(pen);
+        QPainterPath path;
+        bool havePoint = false;
+        for (int64_t idx : ticks) {
+            const uint8_t* traceBase = fileBase + segy::kHeaderTotalSize + size_t(idx) * stride;
+            segy::TraceHeader th = segy::parseTraceHeader(traceBase);
+            double timeMs = double(identFieldValue(th, field));
+            double sampleCoord = timeMs / sampleIntervalMs;
+            bool inRange = sampleCoord >= app_.view.sampleStart && sampleCoord <= app_.view.sampleEnd;
+            if (!inRange) {
+                havePoint = false;
+                continue;
+            }
+            double px, py;
+            pixelForData(double(idx), sampleCoord, px, py);
+            if (!havePoint) {
+                path.moveTo(px, py);
+                havePoint = true;
+            } else {
+                path.lineTo(px, py);
+            }
+        }
+        painter.drawPath(path);
+        painter.restore();
+    };
+
+    drawOverlay(idents.overlayCyanField, QColor(0, 220, 220));
+    drawOverlay(idents.overlayRedField, QColor(230, 60, 60));
+}
+
 void SegyCanvas::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     int width = this->width();
@@ -2543,7 +2972,10 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
     // Variable Density/Wiggle switches, so the plot itself never resizes
     // just from toggling display mode.
     int insetWidth = plotAreaWidth();
-    int insetHeight = height - 2 * kCanvasMargin;
+    IdentInsets identInsetsNow = identInsets();
+    int topInset = kCanvasMargin + identInsetsNow.top;
+    int bottomInset = kCanvasMargin + identInsetsNow.bottom;
+    int insetHeight = height - topInset - bottomInset;
 
     if (app_.loaded && insetWidth > 0 && insetHeight > 0) {
         if (int(app_.pixels.size()) != insetWidth * insetHeight) {
@@ -2569,8 +3001,14 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         segy::ChromeLayout chrome = segy::renderFrameWithChrome(
             makeRenderContext(), app_.view, canvasDisplay, metrics, app_.pixels.data(), insetWidth, insetHeight);
         app_.lastRenderMs = chrome.lastRenderMs;
+        bool plotXChanged = lastPlotX_ != chrome.plotX;
         lastPlotX_ = chrome.plotX;
         lastPlotWidth_ = chrome.plotWidth;
+        // The time scale/color bar toggling (not just a resize) can move
+        // the plot's left edge -- keep the dataset boxes flush with it
+        // either way. Calling this mid-paintEvent is safe: it only moves
+        // child widgets, it doesn't trigger a synchronous repaint of them.
+        if (plotXChanged) repositionDatasetSlots();
 
         if (app_.display.flipHorizontal && chrome.plotWidth > 0) {
             // Mirrors the already-rendered plot columns left-right in place
@@ -2594,7 +3032,14 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         // buffer directly -- no copy, no per-platform blit call needed.
         QImage image(reinterpret_cast<uchar*>(app_.pixels.data()), insetWidth, insetHeight,
                      int(insetWidth * sizeof(uint32_t)), QImage::Format_RGB32);
-        painter.drawImage(QPoint(kCanvasMargin, kCanvasMargin), image);
+        painter.drawImage(QPoint(kCanvasMargin, topInset), image);
+
+        // Idents (see native/README.md): rows + plot above the image,
+        // rows below it -- disjoint from the image region, so no clip
+        // needed. Drawn right after the image blit, before the time-scale
+        // labels, so it reads as "chrome" rather than sitting over the
+        // axis text.
+        paintIdentText(painter, chrome, topInset, bottomInset, insetHeight);
 
         if (app_.display.showTimeScale) {
             int leftNumbersX = kCanvasMargin + chrome.leftScaleX + chrome.titleColumnWidth + chrome.columnGap;
@@ -2612,11 +3057,11 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
                 // inward just enough to stay fully visible, same as the
                 // reference example this feature was built from.
                 int halfSpan = fm.horizontalAdvance(QString::fromStdString(tick.label)) / 2;
-                int y = kCanvasMargin + std::clamp(tick.pixelY, halfSpan, insetHeight - halfSpan);
+                int y = topInset + std::clamp(tick.pixelY, halfSpan, insetHeight - halfSpan);
                 drawRotatedLabel(painter, font, leftNumbersX, y, tick.label);
                 drawRotatedLabel(painter, font, rightNumbersX, y, tick.label);
             }
-            int titleCenterY = kCanvasMargin + insetHeight / 2;
+            int titleCenterY = topInset + insetHeight / 2;
             drawRotatedLabel(painter, font, leftTitleX, titleCenterY, chrome.axisTitle);
             drawRotatedLabel(painter, font, rightTitleX, titleCenterY, chrome.axisTitle);
         }
@@ -2638,7 +3083,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             painter.save();
             // Wiggle is deliberately crisp/non-smoothed -- see native/README.md.
             painter.setRenderHint(QPainter::Antialiasing, false);
-            painter.translate(kCanvasMargin + chrome.plotX, kCanvasMargin);
+            painter.translate(kCanvasMargin + chrome.plotX, topInset);
             QPen linePen(Qt::black);
             linePen.setWidth(0); // cosmetic pen: always exactly 1 device pixel, cheapest to draw
             painter.setPen(linePen);
@@ -2729,6 +3174,11 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             painter.restore();
         }
 
+        // Idents' "Display on Seismic" overlay lines (see
+        // native/README.md) -- drawn before selection boxes so the box
+        // the user is actively dragging/editing stays the topmost element.
+        paintIdentOverlayLines(painter, chrome, topInset, insetHeight);
+
         // Selection boxes: derived fresh from their data-space corners every
         // frame (same reasoning as the density plot itself), so they stay
         // correctly anchored to the data across pan/zoom. Clipped to the
@@ -2736,7 +3186,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         // the current view doesn't visibly spill into the axis columns or
         // dark surround.
         painter.save();
-        painter.setClipRect(QRect(kCanvasMargin + chrome.plotX, kCanvasMargin, chrome.plotWidth, insetHeight));
+        painter.setClipRect(QRect(kCanvasMargin + chrome.plotX, topInset, chrome.plotWidth, insetHeight));
         for (size_t bi = 0; bi < app_.selectionBoxes.size(); ++bi) {
             const SelectionBox& box = app_.selectionBoxes[bi];
             if (!box.hasFirstCorner) continue;
@@ -2799,7 +3249,8 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
 
     if (app_.tool == ToolMode::Pan && app_.dragging) {
         int insetWidth = std::max(1, plotAreaWidth());
-        int insetHeight = std::max(1, this->height() - 2 * kCanvasMargin);
+        IdentInsets insets = identInsets();
+        int insetHeight = std::max(1, this->height() - (kCanvasMargin + insets.top) - (kCanvasMargin + insets.bottom));
         int dx = event->pos().x() - app_.dragAnchorX;
         int dy = event->pos().y() - app_.dragAnchorY;
         // panFromAnchor (renderer.cpp) always shifts `view` in the direction
@@ -2807,9 +3258,10 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
         // dx first so a mirrored display still follows the mouse instead of
         // panning backwards.
         if (app_.display.flipHorizontal) dx = -dx;
-        segy::panFromAnchor(app_.view, app_.dragAnchorView, app_.traceCount, app_.binHeader.samplesPerTrace,
+        segy::panFromAnchor(app_.view, app_.dragAnchorView, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace,
                              insetWidth, insetHeight, dx, dy);
         needsRepaint = true;
+        if (notifyViewChanged_) notifyViewChanged_();
     } else if (app_.tool == ToolMode::BoxSelect) {
         bool draggingCorner = app_.draggingBoxIndex >= 0;
         bool placingSecondCorner = !app_.selectionBoxes.empty() && !app_.selectionBoxes.back().complete;
@@ -2843,10 +3295,12 @@ void SegyCanvas::mouseReleaseEvent(QMouseEvent*) { app_.dragging = false; }
 void SegyCanvas::wheelEvent(QWheelEvent* event) {
     if (!app_.loaded) return;
     int insetWidth = std::max(1, plotAreaWidth());
-    int insetHeight = std::max(1, this->height() - 2 * kCanvasMargin);
+    IdentInsets insets = identInsets();
+    int topInset = kCanvasMargin + insets.top;
+    int insetHeight = std::max(1, this->height() - topInset - (kCanvasMargin + insets.bottom));
     QPoint pos = event->position().toPoint();
     int px = pos.x() - kCanvasMargin;
-    int py = pos.y() - kCanvasMargin;
+    int py = pos.y() - topInset;
     // zoomAt (renderer.cpp) has no notion of the mirrored display -- give it
     // the un-mirrored pixel position so it still zooms on the real trace
     // under the cursor (same reasoning as dataCoordAt).
@@ -2854,14 +3308,16 @@ void SegyCanvas::wheelEvent(QWheelEvent* event) {
     // Forward/up notches zoom in, matching the removed shells' convention.
     int notches = event->angleDelta().y() / 120;
     double factor = std::pow(1.15, double(-notches));
-    segy::zoomAt(app_.view, app_.traceCount, app_.binHeader.samplesPerTrace, insetWidth, insetHeight, px, py, factor);
+    segy::zoomAt(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace, insetWidth, insetHeight, px, py, factor);
+    if (notifyViewChanged_) notifyViewChanged_();
     updateStatusBar();
     update();
 }
 
 void SegyCanvas::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_R && app_.loaded) {
-        segy::resetView(app_.view, app_.traceCount, app_.binHeader.samplesPerTrace);
+        segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
+        if (notifyViewChanged_) notifyViewChanged_();
         updateStatusBar();
         update();
         return;
@@ -2873,6 +3329,35 @@ void SegyCanvas::leaveEvent(QEvent*) {
     hovering_ = false;
     updateStatusBar();
     notifyHoverChanged(); // clears the dock's Trace Info section
+}
+
+void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
+    // Never mutate a Dataset's fields in place -- it may be shared with
+    // the pool or another panel's Background slot, so this only ever
+    // reassigns the pointer (an O(1) swap, whether the dataset is brand
+    // new from startLoading or already sitting in the pool).
+    app_.foreground = std::move(dataset);
+    app_.loaded = true;
+    segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
+    // A newly-active dataset invalidates any boxes drawn against the
+    // previous one's trace/sample space.
+    app_.selectionBoxes.clear();
+    app_.activeBoxIndex = -1;
+    app_.draggingBoxIndex = -1;
+    app_.draggingCorner = -1;
+    app_.zoomHistory.clear();
+    notifyStateChanged();
+    updateStatusBar();
+    update();
+}
+
+void SegyCanvas::setBackgroundDataset(std::shared_ptr<Dataset> dataset) {
+    // Phase 1: purely a held reference (see native/README.md, "Dataset
+    // pool") -- nothing reads app_.background for rendering/analysis yet,
+    // so this is just the pointer swap plus telling the Background box to
+    // repaint its new name.
+    app_.background = std::move(dataset);
+    notifyStateChanged();
 }
 
 void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory) {
@@ -2913,23 +3398,25 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
             [this, path, result = std::move(result), processingHistory = std::move(processingHistory)]() mutable {
                 app_.loading = false;
                 if (result.ok) {
-                    app_.file = std::move(result.file);
-                    app_.filePath = path;
-                    app_.binHeader = result.binHeader;
-                    app_.traceCount = result.traceCount;
-                    app_.traceStrideBytes = result.traceStrideBytes;
-                    app_.pyramid = std::move(result.pyramid);
-                    app_.loaded = true;
-                    app_.processingHistory = std::move(processingHistory);
-                    segy::resetView(app_.view, app_.traceCount, app_.binHeader.samplesPerTrace);
-                    // A freshly-loaded file invalidates any boxes drawn
-                    // against the previous one's trace/sample space.
-                    app_.selectionBoxes.clear();
-                    app_.activeBoxIndex = -1;
-                    app_.draggingBoxIndex = -1;
-                    app_.draggingCorner = -1;
-                    app_.zoomHistory.clear();
-                    notifyStateChanged();
+                    auto dataset = std::make_shared<Dataset>();
+                    dataset->name = path.stem().string();
+                    dataset->filePath = path;
+                    dataset->file = std::move(result.file);
+                    dataset->binHeader = result.binHeader;
+                    dataset->traceCount = result.traceCount;
+                    dataset->traceStrideBytes = result.traceStrideBytes;
+                    dataset->pyramid = std::move(result.pyramid);
+                    dataset->processingHistory = std::move(processingHistory);
+                    // Foreground first: onDatasetLoaded_ (MainWindow::
+                    // registerDataset) ends by refreshing both panels'
+                    // Foreground/Background box text, which reads through
+                    // app_.foreground -- it must already point at this
+                    // dataset by then, or the box shows the *previous*
+                    // (possibly empty) one for one frame... or, as a real
+                    // bug caught by screenshot-testing this, forever, since
+                    // nothing else was re-triggering that refresh.
+                    setForegroundDataset(dataset);
+                    if (onDatasetLoaded_) onDatasetLoaded_(dataset);
                 } else {
                     app_.loaded = false;
                     std::fprintf(stderr, "Failed to open SEG-Y file: %s\n", result.error.c_str());
@@ -3132,6 +3619,79 @@ MainWindow::MainWindow() : QMainWindow() {
         refreshToolChrome();
     });
 
+    // Idents: trace-header reference rows/plot above and below the plot,
+    // plus up to two colored lines drawn directly on the seismic -- see
+    // native/README.md. Menu rebuilt fresh from the active panel's
+    // app_->idents every time it's opened (same approach as
+    // toolbarMoreMenu_), not persisted, not kept live-in-sync.
+    identsAction_ = toolbar->addAction(iconIdents(), "Idents");
+    identsAction_->setToolTip("Trace-header rows/plot, and lines on the seismic");
+    connect(identsAction_, &QAction::triggered, this, [this]() {
+        QMenu menu(this);
+
+        // Display at Top / Display at Bottom: independent checkable
+        // toggles, capped at 4/2 -- refusing an over-cap check (rather
+        // than evicting the oldest) is simplest: the real QAction/menu is
+        // thrown away the instant exec() returns, so there's no state to
+        // revert -- the next open just rebuilds from the untouched
+        // app_->idents.
+        auto buildCappedSubmenu = [this](QMenu& parent, const QString& title, bool (IdentSettings::*array)[kIdentFieldCount],
+                                          int cap) {
+            QMenu* sub = parent.addMenu(title);
+            for (int i = 0; i < kIdentFieldCount; ++i) {
+                QAction* a = sub->addAction(identFieldLabel(IdentField(i)));
+                a->setCheckable(true);
+                a->setChecked((app_->idents.*array)[i]);
+                connect(a, &QAction::triggered, this, [this, array, i, cap](bool checked) {
+                    if (checked) {
+                        int count = 0;
+                        for (int k = 0; k < kIdentFieldCount; ++k) {
+                            if ((app_->idents.*array)[k]) ++count;
+                        }
+                        if (count >= cap) {
+                            flashStatusMessage(QString("Limited to %1 idents here").arg(cap));
+                            return;
+                        }
+                    }
+                    for (Panel* p : targetPanels()) {
+                        (p->app.idents.*array)[i] = checked;
+                        p->canvas->refreshIdentLayout();
+                    }
+                });
+            }
+        };
+        buildCappedSubmenu(menu, "Display at Top", &IdentSettings::topEnabled, 4);
+        buildCappedSubmenu(menu, "Display at Bottom", &IdentSettings::bottomEnabled, 2);
+
+        // Ident Plot / each overlay-line color: single-select-or-none --
+        // an ExclusiveOptional QActionGroup (same policy already used for
+        // Pan/Box Select) makes clicking the checked entry again clear it.
+        auto buildPickerSubmenu = [this, &menu](QMenu& parent, const QString& title, int IdentSettings::*field) {
+            QMenu* sub = parent.addMenu(title);
+            QActionGroup* group = new QActionGroup(&menu);
+            group->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
+            for (int i = 0; i < kIdentFieldCount; ++i) {
+                QAction* a = sub->addAction(identFieldLabel(IdentField(i)));
+                a->setCheckable(true);
+                a->setChecked(app_->idents.*field == i);
+                a->setActionGroup(group);
+                connect(a, &QAction::triggered, this, [this, field, i](bool checked) {
+                    for (Panel* p : targetPanels()) {
+                        p->app.idents.*field = checked ? i : -1;
+                        p->canvas->refreshIdentLayout();
+                    }
+                });
+            }
+        };
+        buildPickerSubmenu(menu, "Ident Plot", &IdentSettings::plotField);
+        QMenu* seismicMenu = menu.addMenu("Display on Seismic");
+        buildPickerSubmenu(*seismicMenu, "Line Cyan", &IdentSettings::overlayCyanField);
+        buildPickerSubmenu(*seismicMenu, "Line Red", &IdentSettings::overlayRedField);
+
+        QWidget* button = toolbar_->widgetForAction(identsAction_);
+        if (button) menu.exec(button->mapToGlobal(QPoint(0, button->height())));
+    });
+
     toolbar->addSeparator();
 
     // Gain: dB gain applied on top of the pyramid's auto-computed clip
@@ -3268,7 +3828,7 @@ MainWindow::MainWindow() : QMainWindow() {
     connect(ebcdicHeaderAction_, &QAction::triggered, this, [this]() {
         if (!app_->loaded) return;
         if (!ebcdicHeaderWidget_) ebcdicHeaderWidget_ = new EbcdicHeaderWidget();
-        std::string text = segy::decodeEbcdicText(app_->file.data());
+        std::string text = segy::decodeEbcdicText(app_->foreground->file.data());
         // NOT fromStdString/fromUtf8: decodeEbcdicText's lookup table maps
         // each EBCDIC byte to a Latin-1 code point (0-255, one byte in,
         // one character out) -- treating that as UTF-8 instead corrupts
@@ -3288,7 +3848,7 @@ MainWindow::MainWindow() : QMainWindow() {
     connect(binaryHeaderAction_, &QAction::triggered, this, [this]() {
         if (!app_->loaded) return;
         if (!binaryHeaderWidget_) binaryHeaderWidget_ = new BinaryHeaderWidget();
-        binaryHeaderWidget_->setHeader(app_->file.data() + segy::kTextHeaderSize);
+        binaryHeaderWidget_->setHeader(app_->foreground->file.data() + segy::kTextHeaderSize);
         binaryHeaderWidget_->setWindowTitle(QString("Binary Header") + datasetTitleSuffix(*app_));
         binaryHeaderWidget_->show();
         binaryHeaderWidget_->raise();
@@ -3351,7 +3911,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // than grouped with the tool buttons to its left.
     QWidget* toolbarSpacer = new QWidget(this);
     toolbarSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    toolbar->addWidget(toolbarSpacer);
+    toolbarSpacerAction_ = toolbar->addWidget(toolbarSpacer);
 
     // Right dock visibility -- the dock has no close button of its own
     // (NoDockWidgetFeatures, set below), so this is the only way to hide
@@ -3360,6 +3920,48 @@ MainWindow::MainWindow() : QMainWindow() {
     sidebarToggleAction_->setCheckable(true);
     sidebarToggleAction_->setChecked(true);
     sidebarToggleAction_->setToolTip("Show/hide the sidebar");
+
+    // Toolbar overflow (see native/README.md) -- every plain icon button
+    // above is a candidate; the gain slider/value-label/spacer are
+    // deliberately excluded (the slider's only ever visible horizontally
+    // to begin with, and a QWidgetAction's widget can't be safely shown
+    // in both the toolbar and a menu at once -- it would just move).
+    toolbarOverflowCandidates_ = {
+        zoomAction_,          moozAction_,         panAction_,         boxSelectAction_,
+        seismicModeToolbarAction_, flipHorizontalAction_, identsAction_,  gainDetailAction_, gainUpAction_,
+        gainDownAction_,      spectrumAction_,     histogramAction_,   octaveBandAction_,
+        ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_,
+        sidebarToggleAction_,
+    };
+    // A plain QToolButton in the status bar -- see its own member
+    // comment in viewer_qt.h for why it doesn't live in toolbar_ itself.
+    toolbarMoreButton_ = new QToolButton(this);
+    toolbarMoreButton_->setIcon(iconList());
+    toolbarMoreButton_->setToolTip("More toolbar options");
+    toolbarMoreButton_->setAutoRaise(true);
+    toolbarMoreButton_->setVisible(false);
+    statusBar()->addPermanentWidget(toolbarMoreButton_);
+    toolbarMoreMenu_ = new QMenu(this);
+    connect(toolbarMoreButton_, &QToolButton::clicked, this, [this]() {
+        toolbarMoreMenu_->clear();
+        for (QAction* action : toolbarOverflowCandidates_) {
+            if (action->isVisible()) continue; // only the ones overflow actually hid
+            // A fresh proxy per item, not the real action reused directly
+            // -- see the member comment above for why, and rebuilt every
+            // time rather than kept in sync live, since the menu is only
+            // ever open for a moment.
+            QAction* proxy = toolbarMoreMenu_->addAction(action->icon(), action->text());
+            proxy->setCheckable(action->isCheckable());
+            proxy->setChecked(action->isChecked());
+            connect(proxy, &QAction::triggered, action, &QAction::trigger);
+        }
+        toolbarMoreMenu_->exec(toolbarMoreButton_->mapToGlobal(QPoint(0, toolbarMoreButton_->height())));
+    });
+    // The overflow check needs every candidate's real widget laid out at
+    // least once, which only exists once the toolbar has actually been
+    // shown -- same reasoning as gainValueLabel_'s width computation a
+    // little further down.
+    QTimer::singleShot(0, this, [this]() { updateToolbarOverflow(); });
 
     // Right dock: relocated color bar (Amplitude Scale) and hover readout
     // (Trace Info), plus a QC Notes placeholder -- see native/README.md
@@ -3422,7 +4024,29 @@ MainWindow::MainWindow() : QMainWindow() {
     for (Panel* p : {&panelA_, &panelB_}) {
         p->canvas->setStatusWidgets(statusBar(), [this]() { refreshToolChrome(); });
         p->canvas->setHoverInfoCallback([this](const HoverInfo& info) { updateHoverInfo(info); });
+        p->canvas->setDatasetLoadedCallback([this](std::shared_ptr<Dataset> dataset) {
+            registerDataset(std::move(dataset));
+        });
+        p->canvas->setViewChangedCallback([this, p]() { syncLockedView(p); });
     }
+    // "Foreground 1"/"Background 1" (panelA_) vs "...2" (panelB_) -- see
+    // native/README.md, "Dataset pool: Foreground/Background."
+    panelA_.canvas->setDatasetSlotLabels("Foreground 1", "Background 1");
+    panelB_.canvas->setDatasetSlotLabels("Foreground 2", "Background 2");
+    panelA_.canvas->setDatasetSlotPickCallback([this](bool isForeground) { openDatasetPicker(&panelA_, isForeground); });
+    panelB_.canvas->setDatasetSlotPickCallback([this](bool isForeground) { openDatasetPicker(&panelB_, isForeground); });
+
+    // Background-task progress (Calculator/Bandpass/Save SEG-Y/Octave
+    // Bands) -- see runBackgroundTask/native/README.md. Hidden until a
+    // task actually starts.
+    backgroundProgressBar_ = new QProgressBar();
+    backgroundProgressBar_->setFixedWidth(160);
+    backgroundProgressBar_->setTextVisible(false);
+    backgroundProgressBar_->setVisible(false);
+    statusBar()->addPermanentWidget(backgroundProgressBar_);
+    backgroundTaskTimer_ = new QTimer(this);
+    backgroundTaskTimer_->setInterval(33); // matches startLoading's own progress-post throttle
+    connect(backgroundTaskTimer_, &QTimer::timeout, this, [this]() { updateBackgroundTaskStatusBar(); });
 
     refreshSeismicModeToolbarIcon();
     setGainDb(0);
@@ -3503,6 +4127,74 @@ void MainWindow::applyToolbarPosition(ToolbarPosition position) {
         prefs_.drawerPosition = DrawerPosition::Left;
     }
     applyDrawerPosition(prefs_.drawerPosition);
+    updateToolbarOverflow();
+}
+
+void MainWindow::resizeEvent(QResizeEvent* event) {
+    QMainWindow::resizeEvent(event);
+    // Deferred, not called directly here: toolbar_->height() queried
+    // synchronously inside MainWindow's own resizeEvent can still reflect
+    // the *previous* layout pass (confirmed by screenshot-testing this --
+    // shrinking the window well past the point everything should have
+    // overflowed left every button visible, with no "More" button at
+    // all, because "available" was being measured before the toolbar's
+    // own geometry had actually caught up). Queuing it instead runs
+    // after the current layout pass has fully settled.
+    QTimer::singleShot(0, this, [this]() { updateToolbarOverflow(); });
+}
+
+void MainWindow::updateToolbarOverflow() {
+    if (toolbarOverflowCandidates_.empty() || !toolbarMoreButton_) return;
+    // toolbar_->orientation() is not reliable right after addToolBar()
+    // (see applyToolbarPosition()'s own comment on this same quirk) --
+    // the ToolbarPosition enum this app already tracks is the source of
+    // truth instead, same as that function uses.
+    bool vertical = prefs_.toolbarPosition == ToolbarPosition::Left || prefs_.toolbarPosition == ToolbarPosition::Right;
+
+    auto setActionVisible = [this](QAction* action, bool v) {
+        // QAction::setVisible() alone left the underlying QToolButton's
+        // own visibility lagging behind the action's (confirmed by
+        // logging both: the action reported visible=true while its
+        // widget still reported visible=false) -- setting the widget
+        // directly too forces the actual rendering to match immediately.
+        action->setVisible(v);
+        if (QWidget* w = toolbar_->widgetForAction(action)) w->setVisible(v);
+    };
+
+    // Rather than predicting from sizeHint() sums whether N candidates
+    // fit (tried first -- repeatedly wrong by a margin that tracked
+    // inter-item spacing/separators QToolBarLayout adds but sizeHint()
+    // doesn't report, confirmed via geometry-level debug logging: Qt
+    // marked a button "visible" with a plausible-looking cached geometry
+    // that put its bottom edge past the toolbar's own real height, and
+    // simply never painted it -- no chevron, no error), show everything
+    // and let Qt actually lay it out once, then read back each
+    // candidate's REAL resulting position and hide whichever ones
+    // overflow the toolbar's own rect. Positions are monotonic along the
+    // toolbar's axis, so the first overflowing candidate and everything
+    // after it all get hidden together.
+    for (QAction* action : toolbarOverflowCandidates_) setActionVisible(action, true);
+    if (toolbarSpacerAction_) setActionVisible(toolbarSpacerAction_, true);
+    if (toolbar_->layout()) toolbar_->layout()->activate();
+
+    int limit = vertical ? toolbar_->height() : toolbar_->width();
+    bool anyHidden = false;
+    for (QAction* action : toolbarOverflowCandidates_) {
+        QWidget* w = toolbar_->widgetForAction(action);
+        if (!w) continue;
+        QRect g = w->geometry();
+        bool fits = !anyHidden && (vertical ? g.bottom() <= limit : g.right() <= limit);
+        if (!fits) anyHidden = true;
+        setActionVisible(action, fits);
+    }
+    // The expanding spacer still claims a layout slot even at zero size,
+    // which left the sidebar-toggle button after it without a valid
+    // laid-out position once the toolbar genuinely ran out of room
+    // (confirmed by geometry-level debug logging) -- hiding it outright
+    // whenever anything's overflowed removes that competition.
+    if (toolbarSpacerAction_) setActionVisible(toolbarSpacerAction_, !anyHidden);
+    if (toolbar_->layout()) toolbar_->layout()->activate();
+    toolbarMoreButton_->setVisible(anyHidden);
 }
 
 void MainWindow::applyDrawerPosition(DrawerPosition position) {
@@ -3531,6 +4223,19 @@ void MainWindow::flashStatusMessage(const QString& text) {
 std::vector<Panel*> MainWindow::targetPanels() {
     if (lockAction_->isChecked()) return {&panelA_, &panelB_};
     return {activePanel_};
+}
+
+void MainWindow::syncLockedView(Panel* source) {
+    if (!lockAction_->isChecked()) return;
+    Panel* other = source == &panelA_ ? &panelB_ : &panelA_;
+    if (!other->app.loaded) return; // nothing sensible to sync into
+    other->app.view = source->app.view;
+    // The two panels' datasets can have different trace/sample extents --
+    // a view valid for `source` isn't necessarily valid for `other`.
+    segy::clampView(other->app.view, other->app.foreground->traceCount,
+                     other->app.foreground->binHeader.samplesPerTrace);
+    other->canvas->refreshStatusBar();
+    other->canvas->update();
 }
 
 void MainWindow::setActivePanel(Panel* panel) {
@@ -3566,7 +4271,7 @@ void MainWindow::zoomToBox() {
         p->app.view.traceEnd = std::max(box->traceA, box->traceB);
         p->app.view.sampleStart = std::min(box->sampleA, box->sampleB);
         p->app.view.sampleEnd = std::max(box->sampleA, box->sampleB);
-        segy::clampView(p->app.view, p->app.traceCount, p->app.binHeader.samplesPerTrace);
+        segy::clampView(p->app.view, p->app.foreground->traceCount, p->app.foreground->binHeader.samplesPerTrace);
     }
     refreshToolChrome();
 }
@@ -3644,7 +4349,7 @@ void MainWindow::refreshAmplitudeScale() {
         // renderer for this one caller. Respects the manual clip override
         // (ClipDialog) the same way the actual render does, so the legend
         // never shows a range the seismic itself isn't using.
-        float rawClip = std::max(std::fabs(p->app.pyramid.globalMin), std::fabs(p->app.pyramid.globalMax));
+        float rawClip = std::max(std::fabs(p->app.foreground->pyramid.globalMin), std::fabs(p->app.foreground->pyramid.globalMax));
         float basePos = p->app.display.manualClip.enabled ? p->app.display.manualClip.posMagnitude : rawClip;
         float baseNeg = p->app.display.manualClip.enabled ? p->app.display.manualClip.negMagnitude : rawClip;
         double linearGain = std::pow(10.0, p->app.display.gainDb / 20.0);
@@ -3715,8 +4420,8 @@ void MainWindow::computeAndShowHistogram(Panel* panel) {
         rangeMin = float(app.histogram.userMin);
         rangeMax = float(app.histogram.userMax);
     } else {
-        rangeMin = app.pyramid.globalMin;
-        rangeMax = app.pyramid.globalMax;
+        rangeMin = app.foreground->pyramid.globalMin;
+        rangeMax = app.foreground->pyramid.globalMax;
     }
     segy::HistogramResult result =
         segy::computeHistogram(makeRenderContextFor(app), src.traceStart, src.traceEnd, src.sampleStart,
@@ -3744,7 +4449,7 @@ void MainWindow::computeAndShowSpectrum(Panel* panel) {
     AnalysisSource src = resolveAnalysisSource(app, app.spectrum.useSelection);
     segy::SpectrumResult result =
         segy::computeSpectrum(makeRenderContextFor(app), src.traceStart, src.traceEnd, src.sampleStart,
-                               src.sampleEnd, app.binHeader.sampleIntervalUs, app.spectrum.smoothPoints);
+                               src.sampleEnd, app.foreground->binHeader.sampleIntervalUs, app.spectrum.smoothPoints);
     if (!spectrumPlot_) {
         spectrumPlot_ = new SpectrumPlotWidget();
         spectrumPlot_->setParametersCallback([this]() { openSpectrumDialog(); });
@@ -3764,97 +4469,104 @@ void MainWindow::runCalculator(AppState& a, AppState& b, bool subtract, const QS
     // Clipped to the overlap when the two datasets differ in size, rather
     // than refusing -- combining a full line with a sub-window of it is a
     // reasonable thing to want.
-    int64_t traceCount = std::min(a.traceCount, b.traceCount);
-    int samplesPerTrace = std::min<int>(a.binHeader.samplesPerTrace, b.binHeader.samplesPerTrace);
+    int64_t traceCount = std::min(a.foreground->traceCount, b.foreground->traceCount);
+    int samplesPerTrace = std::min<int>(a.foreground->binHeader.samplesPerTrace, b.foreground->binHeader.samplesPerTrace);
     if (traceCount <= 0 || samplesPerTrace <= 0) {
         flashStatusMessage("No data selected");
         return;
     }
 
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
-    std::vector<float> samplesA(static_cast<size_t>(samplesPerTrace));
-    std::vector<float> samplesB(static_cast<size_t>(samplesPerTrace));
-    for (int64_t t = 0; t < traceCount; ++t) {
-        const uint8_t* traceA = a.file.data() + segy::kHeaderTotalSize + size_t(t) * a.traceStrideBytes;
-        const uint8_t* traceB = b.file.data() + segy::kHeaderTotalSize + size_t(t) * b.traceStrideBytes;
-        segy::decodeSamples(traceA + segy::kTraceHeaderSize, samplesA.data(), size_t(samplesPerTrace),
-                            a.binHeader.formatCode);
-        segy::decodeSamples(traceB + segy::kTraceHeaderSize, samplesB.data(), size_t(samplesPerTrace),
-                            b.binHeader.formatCode);
-        segy::WriteTrace& out = traces[size_t(t)];
-        out.headerBytes.assign(traceA, traceA + segy::kTraceHeaderSize); // dataset A's own trace headers carry over
-        out.samples.resize(size_t(samplesPerTrace));
-        for (int s = 0; s < samplesPerTrace; ++s) {
-            out.samples[size_t(s)] =
-                subtract ? samplesA[size_t(s)] - samplesB[size_t(s)] : samplesA[size_t(s)] + samplesB[size_t(s)];
-        }
-    }
+    // Snapshot the two source Datasets by shared_ptr *now*, on the UI
+    // thread -- the background closure below reads through these, never
+    // through `a`/`b` again, so it stays correct (and the underlying
+    // mmap'd files/pyramids stay alive) even if the user switches a
+    // panel's Foreground or deletes one of these from the pool while the
+    // computation is still running.
+    std::shared_ptr<Dataset> dsA = a.foreground;
+    std::shared_ptr<Dataset> dsB = b.foreground;
 
-    segy::BinaryHeader outHeader = a.binHeader;
+    segy::BinaryHeader outHeader = dsA->binHeader;
     outHeader.samplesPerTrace = int16_t(samplesPerTrace);
 
-    QString nameA = QString::fromStdString(a.filePath.stem().string());
-    QString nameB = QString::fromStdString(b.filePath.stem().string());
+    QString nameA = QString::fromStdString(dsA->filePath.stem().string());
+    QString nameB = QString::fromStdString(dsB->filePath.stem().string());
     QStringList inputBlocks;
     inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
                        .arg(nameA)
-                       .arg(a.traceCount)
-                       .arg(a.binHeader.samplesPerTrace)
-                       .arg(a.binHeader.sampleIntervalUs);
+                       .arg(dsA->traceCount)
+                       .arg(dsA->binHeader.samplesPerTrace)
+                       .arg(dsA->binHeader.sampleIntervalUs);
     inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
                        .arg(nameB)
-                       .arg(b.traceCount)
-                       .arg(b.binHeader.samplesPerTrace)
-                       .arg(b.binHeader.sampleIntervalUs);
+                       .arg(dsB->traceCount)
+                       .arg(dsB->binHeader.samplesPerTrace)
+                       .arg(dsB->binHeader.sampleIntervalUs);
 
     // Dataset A's own history carries forward (it's the primary input); B's
     // is only named in the input block, not merged in.
-    std::vector<std::string> history = a.processingHistory;
+    std::vector<std::string> history = dsA->processingHistory;
     history.push_back(QString("CALCULATOR: %1 %2 %3").arg(nameA, subtract ? "MINUS" : "PLUS", nameB).toStdString());
 
     QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, traceCount, samplesPerTrace,
                                               outHeader.sampleIntervalUs);
     std::filesystem::path outPath = scratchSegyPath(outputName);
-    std::string error;
-    bool ok = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, &error);
-    QApplication::restoreOverrideCursor();
-    if (!ok) {
-        QMessageBox::warning(this, "Calculator", QString::fromStdString(error));
-        return;
-    }
-    panelA_.canvas->startLoading(outPath, history);
+
+    auto writeOk = std::make_shared<bool>(false);
+    auto writeError = std::make_shared<std::string>();
+
+    runBackgroundTask(
+        QString("Calculator: %1 %2 %3").arg(nameA, subtract ? "-" : "+", nameB),
+        [this, dsA, dsB, traceCount, samplesPerTrace, subtract, outHeader, textHeader, outPath, writeOk,
+         writeError]() {
+            backgroundTaskTotal_ = traceCount;
+            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
+            std::vector<float> samplesA(static_cast<size_t>(samplesPerTrace));
+            std::vector<float> samplesB(static_cast<size_t>(samplesPerTrace));
+            for (int64_t t = 0; t < traceCount; ++t) {
+                const uint8_t* traceA = dsA->file.data() + segy::kHeaderTotalSize + size_t(t) * dsA->traceStrideBytes;
+                const uint8_t* traceB = dsB->file.data() + segy::kHeaderTotalSize + size_t(t) * dsB->traceStrideBytes;
+                segy::decodeSamples(traceA + segy::kTraceHeaderSize, samplesA.data(), size_t(samplesPerTrace),
+                                    dsA->binHeader.formatCode);
+                segy::decodeSamples(traceB + segy::kTraceHeaderSize, samplesB.data(), size_t(samplesPerTrace),
+                                    dsB->binHeader.formatCode);
+                segy::WriteTrace& out = traces[size_t(t)];
+                out.headerBytes.assign(traceA, traceA + segy::kTraceHeaderSize); // dataset A's own trace headers carry over
+                out.samples.resize(size_t(samplesPerTrace));
+                for (int s = 0; s < samplesPerTrace; ++s) {
+                    out.samples[size_t(s)] =
+                        subtract ? samplesA[size_t(s)] - samplesB[size_t(s)] : samplesA[size_t(s)] + samplesB[size_t(s)];
+                }
+                backgroundTaskDone_ = t + 1;
+            }
+            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+        },
+        [this, writeOk, writeError, outPath, history]() {
+            if (!*writeOk) {
+                QMessageBox::warning(this, "Calculator", QString::fromStdString(*writeError));
+                return;
+            }
+            panelA_.canvas->startLoading(outPath, history);
+        });
 }
 
 void MainWindow::runBandpass(AppState& source, const segy::BandpassParams& params, const QString& outputName) {
-    if (!source.loaded || source.traceCount <= 0 || source.binHeader.samplesPerTrace <= 0) {
+    if (!source.loaded || source.foreground->traceCount <= 0 || source.foreground->binHeader.samplesPerTrace <= 0) {
         flashStatusMessage("No data selected");
         return;
     }
-    int64_t traceCount = source.traceCount;
-    int samplesPerTrace = source.binHeader.samplesPerTrace;
+    // Snapshot by shared_ptr now -- see runCalculator's comment for why.
+    std::shared_ptr<Dataset> ds = source.foreground;
+    int64_t traceCount = ds->traceCount;
+    int samplesPerTrace = ds->binHeader.samplesPerTrace;
 
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
-    std::vector<float> samples(static_cast<size_t>(samplesPerTrace));
-    for (int64_t t = 0; t < traceCount; ++t) {
-        const uint8_t* traceBase = source.file.data() + segy::kHeaderTotalSize + size_t(t) * source.traceStrideBytes;
-        segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples.data(), size_t(samplesPerTrace),
-                            source.binHeader.formatCode);
-        segy::applyBandpassFilter(samples, source.binHeader.sampleIntervalUs, params);
-        segy::WriteTrace& out = traces[size_t(t)];
-        out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-        out.samples = samples;
-    }
-
-    QString sourceName = QString::fromStdString(source.filePath.stem().string());
+    QString sourceName = QString::fromStdString(ds->filePath.stem().string());
     QStringList inputBlocks;
     inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
                        .arg(sourceName)
-                       .arg(source.traceCount)
-                       .arg(source.binHeader.samplesPerTrace)
-                       .arg(source.binHeader.sampleIntervalUs);
-    std::vector<std::string> history = source.processingHistory;
+                       .arg(ds->traceCount)
+                       .arg(ds->binHeader.samplesPerTrace)
+                       .arg(ds->binHeader.sampleIntervalUs);
+    std::vector<std::string> history = ds->processingHistory;
     history.push_back(QString("BANDPASS FILTER (HANNING TAPER) %1-%2-%3-%4 HZ")
                           .arg(params.lowCut, 0, 'g', 4)
                           .arg(params.lowPass, 0, 'g', 4)
@@ -3863,57 +4575,89 @@ void MainWindow::runBandpass(AppState& source, const segy::BandpassParams& param
                           .toStdString());
 
     QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, traceCount, samplesPerTrace,
-                                              source.binHeader.sampleIntervalUs);
+                                              ds->binHeader.sampleIntervalUs);
     std::filesystem::path outPath = scratchSegyPath(outputName);
-    std::string error;
-    bool ok = segy::writeSegyFile(outPath, textHeader.toStdString(), source.binHeader, traces, &error);
-    QApplication::restoreOverrideCursor();
-    if (!ok) {
-        QMessageBox::warning(this, "Bandpass Filter", QString::fromStdString(error));
-        return;
-    }
-    panelA_.canvas->startLoading(outPath, history);
+    segy::BinaryHeader outHeader = ds->binHeader;
+
+    auto writeOk = std::make_shared<bool>(false);
+    auto writeError = std::make_shared<std::string>();
+
+    runBackgroundTask(
+        QString("Bandpass: %1").arg(sourceName),
+        [this, ds, traceCount, samplesPerTrace, params, outHeader, textHeader, outPath, writeOk, writeError]() {
+            backgroundTaskTotal_ = traceCount;
+            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
+            std::vector<float> samples(static_cast<size_t>(samplesPerTrace));
+            for (int64_t t = 0; t < traceCount; ++t) {
+                const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples.data(), size_t(samplesPerTrace),
+                                    ds->binHeader.formatCode);
+                segy::applyBandpassFilter(samples, ds->binHeader.sampleIntervalUs, params);
+                segy::WriteTrace& out = traces[size_t(t)];
+                out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                out.samples = samples;
+                backgroundTaskDone_ = t + 1;
+            }
+            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+        },
+        [this, writeOk, writeError, outPath, history]() {
+            if (!*writeOk) {
+                QMessageBox::warning(this, "Bandpass Filter", QString::fromStdString(*writeError));
+                return;
+            }
+            panelA_.canvas->startLoading(outPath, history);
+        });
 }
 
 void MainWindow::runSaveSegy(AppState& source, const QString& filePath) {
-    if (!source.loaded || source.traceCount <= 0 || source.binHeader.samplesPerTrace <= 0) {
+    if (!source.loaded || source.foreground->traceCount <= 0 || source.foreground->binHeader.samplesPerTrace <= 0) {
         flashStatusMessage("No data selected");
         return;
     }
-    int64_t traceCount = source.traceCount;
-    int samplesPerTrace = source.binHeader.samplesPerTrace;
-
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
-    for (int64_t t = 0; t < traceCount; ++t) {
-        const uint8_t* traceBase = source.file.data() + segy::kHeaderTotalSize + size_t(t) * source.traceStrideBytes;
-        segy::WriteTrace& out = traces[size_t(t)];
-        out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-        out.samples.resize(size_t(samplesPerTrace));
-        segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
-                            source.binHeader.formatCode);
-    }
+    // Snapshot by shared_ptr now -- see runCalculator's comment for why.
+    std::shared_ptr<Dataset> ds = source.foreground;
+    int64_t traceCount = ds->traceCount;
+    int samplesPerTrace = ds->binHeader.samplesPerTrace;
 
     std::filesystem::path outPath(filePath.toStdString());
-    QString datasetName = QString::fromStdString(source.filePath.stem().string());
+    QString datasetName = QString::fromStdString(ds->filePath.stem().string());
     QString outputName = QString::fromStdString(outPath.stem().string());
     QStringList inputBlocks;
     inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
                        .arg(datasetName)
-                       .arg(source.traceCount)
-                       .arg(source.binHeader.samplesPerTrace)
-                       .arg(source.binHeader.sampleIntervalUs);
-    QString textHeader = buildSegyTextHeader(inputBlocks, source.processingHistory, outputName, traceCount,
-                                              samplesPerTrace, source.binHeader.sampleIntervalUs);
+                       .arg(ds->traceCount)
+                       .arg(ds->binHeader.samplesPerTrace)
+                       .arg(ds->binHeader.sampleIntervalUs);
+    QString textHeader = buildSegyTextHeader(inputBlocks, ds->processingHistory, outputName, traceCount,
+                                              samplesPerTrace, ds->binHeader.sampleIntervalUs);
+    segy::BinaryHeader outHeader = ds->binHeader;
 
-    std::string error;
-    bool ok = segy::writeSegyFile(outPath, textHeader.toStdString(), source.binHeader, traces, &error);
-    QApplication::restoreOverrideCursor();
-    if (!ok) {
-        QMessageBox::warning(this, "Save SEG-Y", QString::fromStdString(error));
-        return;
-    }
-    flashStatusMessage(QString("Saved %1").arg(QString::fromStdString(outPath.filename().string())));
+    auto writeOk = std::make_shared<bool>(false);
+    auto writeError = std::make_shared<std::string>();
+
+    runBackgroundTask(
+        QString("Save SEG-Y: %1").arg(QString::fromStdString(outPath.filename().string())),
+        [this, ds, traceCount, samplesPerTrace, outHeader, textHeader, outPath, writeOk, writeError]() {
+            backgroundTaskTotal_ = traceCount;
+            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
+            for (int64_t t = 0; t < traceCount; ++t) {
+                const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                segy::WriteTrace& out = traces[size_t(t)];
+                out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                out.samples.resize(size_t(samplesPerTrace));
+                segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                    ds->binHeader.formatCode);
+                backgroundTaskDone_ = t + 1;
+            }
+            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+        },
+        [this, writeOk, writeError, outPath]() {
+            if (!*writeOk) {
+                QMessageBox::warning(this, "Save SEG-Y", QString::fromStdString(*writeError));
+                return;
+            }
+            flashStatusMessage(QString("Saved %1").arg(QString::fromStdString(outPath.filename().string())));
+        });
 }
 
 void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, int maxFreqHz) {
@@ -3925,16 +4669,20 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
     // "Visible data in that window" -- the panel's current view, not the
     // whole file, per the original ask.
     int64_t t0 = std::max<int64_t>(0, int64_t(std::floor(app.view.traceStart)));
-    int64_t t1 = std::min<int64_t>(app.traceCount, int64_t(std::ceil(app.view.traceEnd)));
+    int64_t t1 = std::min<int64_t>(app.foreground->traceCount, int64_t(std::ceil(app.view.traceEnd)));
     int s0 = std::max(0, int(std::floor(app.view.sampleStart)));
-    int s1 = std::min<int>(app.binHeader.samplesPerTrace, int(std::ceil(app.view.sampleEnd)));
+    int s1 = std::min<int>(app.foreground->binHeader.samplesPerTrace, int(std::ceil(app.view.sampleEnd)));
     int64_t visibleTraces = t1 - t0;
     int visibleSamples = s1 - s0;
-    if (visibleTraces <= 0 || visibleSamples < 2 || app.binHeader.sampleIntervalUs <= 0) return;
+    if (visibleTraces <= 0 || visibleSamples < 2 || app.foreground->binHeader.sampleIntervalUs <= 0) return;
     if (maxFreqHz <= minFreqHz) {
         flashStatusMessage("Max frequency must be above min");
         return;
     }
+
+    // Snapshot by shared_ptr now -- see runCalculator's comment for why.
+    std::shared_ptr<Dataset> ds = app.foreground;
+    segy::ColorScale colorScale = app.display.colorScale;
 
     // A "look" tool over a handful of evenly-spaced traces, not an
     // exhaustive filter of every visible one -- filtering every trace of a
@@ -3944,48 +4692,59 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
     constexpr int kPanelWidth = 100;
     constexpr int kPanelHeight = 480;
     int decodeCount = int(std::min<int64_t>(visibleTraces, kMaxTracesPerBand));
-    double step = double(visibleTraces) / double(decodeCount);
 
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    std::vector<std::vector<float>> rawTraces(static_cast<size_t>(decodeCount));
-    for (int i = 0; i < decodeCount; ++i) {
-        int64_t traceIdx = std::min<int64_t>(t0 + int64_t((double(i) + 0.5) * step), t1 - 1);
-        const uint8_t* traceBase = app.file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * app.traceStrideBytes;
-        int sampleSize = segy::sampleFormatSizeBytes(app.binHeader.formatCode);
-        rawTraces[size_t(i)].resize(size_t(visibleSamples));
-        segy::decodeSamples(traceBase + segy::kTraceHeaderSize + size_t(s0) * size_t(sampleSize),
-                            rawTraces[size_t(i)].data(), size_t(visibleSamples), app.binHeader.formatCode);
-    }
+    auto result = std::make_shared<OctaveBandResult>();
 
-    OctaveBandResult result;
-    result.bands.push_back({"Unfiltered", rasterizeOctaveBand(rawTraces, kPanelWidth, kPanelHeight, app.display.colorScale)});
-    for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) {
-        int hi = std::min(lo * 2, maxFreqHz);
-        // A small taper past each edge (15% of the band's own width)
-        // instead of a hard wall at exactly lo/hi, so adjacent bands
-        // overlap smoothly rather than ringing -- same reasoning as
-        // Bandpass's Hanning taper.
-        double taper = double(hi - lo) * 0.15;
-        segy::BandpassParams params;
-        params.lowCut = std::max(0.0, double(lo) - taper);
-        params.lowPass = double(lo);
-        params.highPass = double(hi);
-        params.highCut = double(hi) + taper;
-        std::vector<std::vector<float>> filtered = rawTraces;
-        for (std::vector<float>& tr : filtered) {
-            segy::applyBandpassFilter(tr, app.binHeader.sampleIntervalUs, params);
-        }
-        result.bands.push_back({QString("%1 - %2 Hz").arg(lo).arg(hi),
-                                 rasterizeOctaveBand(filtered, kPanelWidth, kPanelHeight, app.display.colorScale)});
-    }
-    QApplication::restoreOverrideCursor();
+    runBackgroundTask(
+        QString("Octave Bands: %1-%2 Hz").arg(minFreqHz).arg(maxFreqHz),
+        [this, ds, t0, t1, s0, visibleSamples, decodeCount, minFreqHz, maxFreqHz, colorScale, result]() {
+            int bandCount = 1;
+            for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) ++bandCount;
+            backgroundTaskTotal_ = bandCount;
 
-    if (!octaveBandDialog_) openOctaveBandDialog(); // creates it, wires the callback, refreshes panel list
-    octaveBandDialog_->setResult(result);
-    octaveBandDialog_->setWindowTitle(QString("Octave Band Display") + datasetTitleSuffix(app));
-    octaveBandDialog_->show();
-    octaveBandDialog_->raise();
-    octaveBandDialog_->activateWindow();
+            double step = double(t1 - t0) / double(decodeCount);
+            std::vector<std::vector<float>> rawTraces(static_cast<size_t>(decodeCount));
+            int sampleSize = segy::sampleFormatSizeBytes(ds->binHeader.formatCode);
+            for (int i = 0; i < decodeCount; ++i) {
+                int64_t traceIdx = std::min<int64_t>(t0 + int64_t((double(i) + 0.5) * step), t1 - 1);
+                const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * ds->traceStrideBytes;
+                rawTraces[size_t(i)].resize(size_t(visibleSamples));
+                segy::decodeSamples(traceBase + segy::kTraceHeaderSize + size_t(s0) * size_t(sampleSize),
+                                    rawTraces[size_t(i)].data(), size_t(visibleSamples), ds->binHeader.formatCode);
+            }
+
+            result->bands.push_back({"Unfiltered", rasterizeOctaveBand(rawTraces, kPanelWidth, kPanelHeight, colorScale)});
+            backgroundTaskDone_ = 1;
+            int bandsDone = 1;
+            for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) {
+                int hi = std::min(lo * 2, maxFreqHz);
+                // A small taper past each edge (15% of the band's own
+                // width) instead of a hard wall at exactly lo/hi, so
+                // adjacent bands overlap smoothly rather than ringing --
+                // same reasoning as Bandpass's Hanning taper.
+                double taper = double(hi - lo) * 0.15;
+                segy::BandpassParams params;
+                params.lowCut = std::max(0.0, double(lo) - taper);
+                params.lowPass = double(lo);
+                params.highPass = double(hi);
+                params.highCut = double(hi) + taper;
+                std::vector<std::vector<float>> filtered = rawTraces;
+                for (std::vector<float>& tr : filtered) {
+                    segy::applyBandpassFilter(tr, ds->binHeader.sampleIntervalUs, params);
+                }
+                result->bands.push_back({QString("%1 - %2 Hz").arg(lo).arg(hi),
+                                         rasterizeOctaveBand(filtered, kPanelWidth, kPanelHeight, colorScale)});
+                backgroundTaskDone_ = ++bandsDone;
+            }
+        },
+        [this, sourcePanel, result]() {
+            if (!octaveBandDialog_) openOctaveBandDialog(); // creates it, wires the callback, refreshes panel list
+            octaveBandDialog_->setResult(*result);
+            octaveBandDialog_->setWindowTitle(QString("Octave Band Display") + datasetTitleSuffix(sourcePanel->app));
+            octaveBandDialog_->show();
+            octaveBandDialog_->raise();
+            octaveBandDialog_->activateWindow();
+        });
 }
 
 void MainWindow::openCalculatorDialog() {
@@ -3997,8 +4756,8 @@ void MainWindow::openCalculatorDialog() {
             runCalculator(a->app, b->app, subtract, outputName);
         });
     }
-    calculatorDialog_->refreshPanels(QString::fromStdString(panelA_.app.filePath.stem().string()), panelA_.app.loaded,
-                                      QString::fromStdString(panelB_.app.filePath.stem().string()), panelB_.app.loaded);
+    calculatorDialog_->refreshPanels(QString::fromStdString(panelA_.app.foreground->filePath.stem().string()), panelA_.app.loaded,
+                                      QString::fromStdString(panelB_.app.foreground->filePath.stem().string()), panelB_.app.loaded);
     calculatorDialog_->show();
     calculatorDialog_->raise();
     calculatorDialog_->activateWindow();
@@ -4015,7 +4774,7 @@ void MainWindow::openBandpassDialog() {
             runBandpass(activePanel_->app, params, outputName);
         });
     }
-    bandpassDialog_->refreshSource(QString::fromStdString(activePanel_->app.filePath.stem().string()),
+    bandpassDialog_->refreshSource(QString::fromStdString(activePanel_->app.foreground->filePath.stem().string()),
                                     activePanel_->app.loaded);
     bandpassDialog_->show();
     bandpassDialog_->raise();
@@ -4032,20 +4791,20 @@ void MainWindow::openSaveSegyDialog() {
         saveSegyDialog_ = new SaveSegyDialog(this);
         saveSegyDialog_->setSaveCallback([this](QString filePath) { runSaveSegy(activePanel_->app, filePath); });
     }
-    QString datasetName = QString::fromStdString(app.filePath.stem().string());
+    QString datasetName = QString::fromStdString(app.foreground->filePath.stem().string());
     QString summary = QString("%1 -- %2 traces x %3 samples, %4 us")
                           .arg(datasetName)
-                          .arg(app.traceCount)
-                          .arg(app.binHeader.samplesPerTrace)
-                          .arg(app.binHeader.sampleIntervalUs);
+                          .arg(app.foreground->traceCount)
+                          .arg(app.foreground->binHeader.samplesPerTrace)
+                          .arg(app.foreground->binHeader.sampleIntervalUs);
     QStringList inputBlocks;
     inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
                        .arg(datasetName)
-                       .arg(app.traceCount)
-                       .arg(app.binHeader.samplesPerTrace)
-                       .arg(app.binHeader.sampleIntervalUs);
-    QString header = buildSegyTextHeader(inputBlocks, app.processingHistory, datasetName, app.traceCount,
-                                          app.binHeader.samplesPerTrace, app.binHeader.sampleIntervalUs);
+                       .arg(app.foreground->traceCount)
+                       .arg(app.foreground->binHeader.samplesPerTrace)
+                       .arg(app.foreground->binHeader.sampleIntervalUs);
+    QString header = buildSegyTextHeader(inputBlocks, app.foreground->processingHistory, datasetName, app.foreground->traceCount,
+                                          app.foreground->binHeader.samplesPerTrace, app.foreground->binHeader.sampleIntervalUs);
     // Displayed one 80-column line per row -- the real header has no
     // newlines (fixed-width lines packed end to end), this is just for
     // reading.
@@ -4064,8 +4823,104 @@ void MainWindow::openOctaveBandDialog() {
             computeAndShowOctaveBands(sourceIdx == 0 ? &panelA_ : &panelB_, minHz, maxHz);
         });
     }
-    octaveBandDialog_->refreshPanels(QString::fromStdString(panelA_.app.filePath.stem().string()), panelA_.app.loaded,
-                                      QString::fromStdString(panelB_.app.filePath.stem().string()), panelB_.app.loaded);
+    octaveBandDialog_->refreshPanels(QString::fromStdString(panelA_.app.foreground->filePath.stem().string()), panelA_.app.loaded,
+                                      QString::fromStdString(panelB_.app.foreground->filePath.stem().string()), panelB_.app.loaded);
+}
+
+void MainWindow::registerDataset(std::shared_ptr<Dataset> dataset) {
+    // Renaming here (not in SegyCanvas::startLoading) is safe: at this
+    // point nothing else holds this shared_ptr yet (it's about to become
+    // this panel's Foreground, right after this callback returns), so
+    // there's no one else to see the name change mid-flight.
+    std::string baseName = dataset->name;
+    int suffix = 2;
+    while (std::any_of(datasetPool_.begin(), datasetPool_.end(),
+                        [&](const std::shared_ptr<Dataset>& d) { return d->name == dataset->name; })) {
+        dataset->name = baseName + " (" + std::to_string(suffix++) + ")";
+    }
+    datasetPool_.push_back(std::move(dataset));
+    refreshAllDatasetSlotNames();
+}
+
+bool MainWindow::isDatasetInUse(const std::shared_ptr<Dataset>& dataset) const {
+    for (const Panel* p : {&panelA_, &panelB_}) {
+        if (p->app.foreground == dataset || p->app.background == dataset) return true;
+    }
+    return false;
+}
+
+void MainWindow::openDatasetPicker(Panel* panel, bool isForeground) {
+    if (!datasetPickerDialog_) {
+        datasetPickerDialog_ = new DatasetPickerDialog(this);
+    }
+    std::shared_ptr<Dataset> current = isForeground ? panel->app.foreground : panel->app.background;
+    datasetPickerDialog_->setWindowTitle(isForeground ? "Select Foreground Dataset" : "Select Background Dataset");
+    datasetPickerDialog_->setDatasets(datasetPool_, current, /*allowNone=*/!isForeground,
+                                       [this](const std::shared_ptr<Dataset>& d) { return isDatasetInUse(d); });
+    datasetPickerDialog_->setCallbacks(
+        [this, panel, isForeground](std::shared_ptr<Dataset> picked) {
+            if (isForeground) {
+                panel->canvas->setForegroundDataset(std::move(picked));
+            } else {
+                panel->canvas->setBackgroundDataset(std::move(picked));
+            }
+            refreshAllDatasetSlotNames();
+            refreshToolChrome();
+        },
+        [this](std::shared_ptr<Dataset> removed) {
+            datasetPool_.erase(std::remove(datasetPool_.begin(), datasetPool_.end(), removed), datasetPool_.end());
+        });
+    datasetPickerDialog_->show();
+    datasetPickerDialog_->raise();
+    datasetPickerDialog_->activateWindow();
+}
+
+void MainWindow::refreshAllDatasetSlotNames() {
+    panelA_.canvas->refreshDatasetSlotNames();
+    panelB_.canvas->refreshDatasetSlotNames();
+}
+
+void MainWindow::runBackgroundTask(const QString& label, std::function<void()> backgroundWork,
+                                    std::function<void()> uiCompletion) {
+    if (backgroundTaskRunning_) {
+        flashStatusMessage("Another background operation is already running");
+        return;
+    }
+    backgroundTaskRunning_ = true;
+    backgroundTaskLabel_ = label;
+    backgroundTaskDone_ = 0;
+    backgroundTaskTotal_ = 1;
+    for (Panel* p : {&panelA_, &panelB_}) p->canvas->setStatusOverrideActive(true);
+    updateBackgroundTaskStatusBar();
+    backgroundTaskTimer_->start();
+
+    std::thread([this, backgroundWork = std::move(backgroundWork), uiCompletion = std::move(uiCompletion)]() mutable {
+        backgroundWork();
+        QMetaObject::invokeMethod(
+            this,
+            [this, uiCompletion = std::move(uiCompletion)]() mutable {
+                backgroundTaskTimer_->stop();
+                backgroundTaskRunning_ = false;
+                for (Panel* p : {&panelA_, &panelB_}) p->canvas->setStatusOverrideActive(false);
+                updateBackgroundTaskStatusBar();
+                uiCompletion();
+            },
+            Qt::QueuedConnection);
+    }).detach();
+}
+
+void MainWindow::updateBackgroundTaskStatusBar() {
+    if (!backgroundTaskRunning_) {
+        backgroundProgressBar_->setVisible(false);
+        for (Panel* p : {&panelA_, &panelB_}) p->canvas->refreshStatusBar();
+        return;
+    }
+    int64_t done = backgroundTaskDone_.load();
+    int64_t total = std::max<int64_t>(1, backgroundTaskTotal_.load());
+    backgroundProgressBar_->setVisible(true);
+    backgroundProgressBar_->setRange(0, int(std::min<int64_t>(total, 1'000'000)));
+    backgroundProgressBar_->setValue(int(std::min<int64_t>(done, total) * backgroundProgressBar_->maximum() / total));
+    statusBar()->showMessage(QString("%1 (%2 / %3)").arg(backgroundTaskLabel_).arg(done).arg(total));
 }
 
 void MainWindow::openInitialFile(const std::filesystem::path& path) { canvas_->startLoading(path); }
@@ -4189,6 +5044,12 @@ int main(int argc, char** argv) {
     }
 #endif
     QApplication app(argc, argv);
+    // Window/taskbar icon on both platforms -- compiled in via app_icon.qrc
+    // (native/assets/icons/LEESMIJ.md), so this doesn't depend on the built
+    // executable's location at runtime. The Windows exe's own icon
+    // (Explorer, taskbar before the window paints) is separate, embedded by
+    // app.rc.
+    app.setWindowIcon(QIcon(QStringLiteral(":/app_icon.png")));
     app.setStyleSheet(darkStyleSheet());
     segyqt::MainWindow window;
     window.show();

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=segyread
+Comment=Read and inspect SEG-Y seismic data
+Exec=segyread %f
+Icon=segyread
+Terminal=false
+Categories=Science;Geoscience;

@@ -15,6 +15,7 @@ project(segyread_native CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON) # compiles viewer/qt/app_icon.qrc (the app's window/taskbar icon)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
@@ -93,12 +94,17 @@ set(SEGY_VIEWER_SOURCES
     viewer/qt/viewer_qt.cpp
     viewer/qt/viewer_qt_icons.h
     viewer/qt/viewer_qt_icons.cpp
+    viewer/qt/app_icon.qrc # app window/taskbar icon, both platforms -- see app_icon.qrc
     $<$<PLATFORM_ID:Windows>:viewer/qt/app.manifest>
+    $<$<PLATFORM_ID:Windows>:viewer/qt/app.rc> # Windows exe icon -- see app.rc
 )
 if(SEGY_QT_USED EQUAL 6)
-    qt_add_executable(segyviewer ${SEGY_VIEWER_SOURCES})
+    # WIN32 links the GUI subsystem instead of the console one, so no cmd
+    # window pops up alongside the app on Windows -- a no-op on Linux. Qt
+    # still forwards argv to main() either way (qtmain/qtentrypoint).
+    qt_add_executable(segyviewer WIN32 ${SEGY_VIEWER_SOURCES})
 else()
-    add_executable(segyviewer ${SEGY_VIEWER_SOURCES})
+    add_executable(segyviewer WIN32 ${SEGY_VIEWER_SOURCES})
 endif()
 target_link_libraries(segyviewer PRIVATE segyviewercore Qt${SEGY_QT_USED}::Widgets Qt${SEGY_QT_USED}::Svg)
 
