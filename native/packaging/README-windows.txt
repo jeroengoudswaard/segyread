@@ -1,7 +1,7 @@
-Shockwave TraceLab for Windows (beta)
-=====================================
+TraceLab for Windows (beta)
+===========================
 
-Shockwave TraceLab is a fast SEG-Y viewer, on its way to becoming the ultimate
+TraceLab is a fast SEG-Y viewer, on its way to becoming the ultimate
 SEG-Y QC tool. This is a beta: it works, but it isn't finished yet.
 
 Start

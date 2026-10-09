@@ -1,4 +1,4 @@
-# Builds the Windows version of Shockwave TraceLab (this repo: segyread) and
+# Builds the Windows version of TraceLab (this repo: segyread) and
 # publishes it as a GitHub release. The dev build target stays "segyviewer";
 # only the shipped exe is named TraceLab.exe.
 #
@@ -62,7 +62,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dir = "Shockwave-TraceLab-$env:TAG-windows-x64"
+          $dir = "TraceLab-$env:TAG-windows-x64"
           New-Item -ItemType Directory $dir | Out-Null
           Copy-Item build\Release\segyviewer.exe "$dir\TraceLab.exe"
           # Qt DLLs and the platform/style/SVG plugins.
@@ -97,9 +97,9 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
-          name: Shockwave TraceLab ${{ env.TAG }} (beta)
+          name: TraceLab ${{ env.TAG }} (beta)
           body: |
-            Beta build of Shockwave TraceLab for Windows 10/11 (64-bit, CPU with AVX2).
+            Beta build of TraceLab for Windows 10/11 (64-bit, CPU with AVX2).
 
             Download `Shockwave-TraceLab-windows-x64.zip`, unzip it anywhere and run
             `TraceLab.exe`. No installer needed. See README.txt inside the
