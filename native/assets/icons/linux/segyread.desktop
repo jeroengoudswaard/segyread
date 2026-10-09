@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Shockwave TraceLab
+Name=TraceLab
 Comment=Read and inspect SEG-Y seismic data
 Exec=segyread %f
 Icon=segyread

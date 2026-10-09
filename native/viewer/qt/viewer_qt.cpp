@@ -3459,7 +3459,7 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
 }
 
 MainWindow::MainWindow() : QMainWindow() {
-    setWindowTitle("Shockwave TraceLab");
+    setWindowTitle("TraceLab");
     resize(1200, 800);
 
     // Split view: both panels' canvases always exist, side by side in a
@@ -4379,7 +4379,7 @@ void MainWindow::refreshToolChrome() {
     refreshWindowTitle();
 }
 
-void MainWindow::refreshWindowTitle() { setWindowTitle(QString("Shockwave TraceLab") + datasetTitleSuffix(*app_)); }
+void MainWindow::refreshWindowTitle() { setWindowTitle(QString("TraceLab") + datasetTitleSuffix(*app_)); }
 
 void MainWindow::setSeismicMode(segy::SeismicDisplayMode mode) {
     for (Panel* p : targetPanels()) p->app.display.seismicMode = mode;
