@@ -12,6 +12,8 @@ name: Release Windows build
 on:
   push:
     tags: ['v*']
+  # Pull requests only build and test; nothing is published.
+  pull_request:
   workflow_dispatch:
     inputs:
       tag:
@@ -30,7 +32,7 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
-      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      TAG: ${{ github.event_name == 'push' && github.ref_name || github.event_name == 'workflow_dispatch' && inputs.tag || 'pr-build' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -78,7 +80,7 @@ jobs:
           path: segyread-windows-x64.zip
 
       - name: Publish release
-        if: github.event_name == 'push' || inputs.publish
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
