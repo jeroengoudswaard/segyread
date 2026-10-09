@@ -1,0 +1,94 @@
+# Builds the Windows version of segyread and publishes it as a GitHub release.
+#
+# Release: push a tag (git tag v0.1b && git push origin v0.1b), or start it
+# from the Actions tab with "Run workflow" and fill in the tag.
+# With "publish" unticked, the build and tests run and the zip is attached to
+# the workflow run as an artifact only (handy for trying out a branch).
+#
+# The download link on the website always points at the newest release:
+#   https://github.com/jeroengoudswaard/segyread/releases/latest/download/segyread-windows-x64.zip
+name: Release Windows build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.1b'
+        required: true
+        default: 'v0.1b'
+      publish:
+        description: 'Publish as a GitHub release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure
+        run: cmake -S native -B build -A x64 -DSEGY_QT_MAJOR=6
+
+      - name: Build
+        run: cmake --build build --config Release --target segyviewer segytest
+
+      - name: Run tests
+        run: build\Release\segytest.exe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "segyread-$env:TAG-windows-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item build\Release\segyviewer.exe $dir
+          # Qt DLLs, the platform/style/SVG plugins and the MSVC runtime.
+          windeployqt --release --compiler-runtime --no-translations `
+            --no-system-d3d-compiler --no-opengl-sw "$dir\segyviewer.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item native\packaging\README-windows.txt "$dir\README.txt"
+          if (-not (Test-Path "$dir\platforms\qwindows.dll")) { throw "qwindows.dll missing" }
+          Compress-Archive -Path $dir -DestinationPath segyread-windows-x64.zip
+          Get-ChildItem $dir -Recurse | Measure-Object -Property Length -Sum |
+            ForEach-Object { "Packaged {0} files, {1:N1} MB" -f $_.Count, ($_.Sum / 1MB) }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: segyread-windows-x64
+          path: segyread-windows-x64.zip
+
+      - name: Publish release
+        if: github.event_name == 'push' || inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          name: segyread ${{ env.TAG }} (beta)
+          body: |
+            Beta build of segyread for Windows 10/11 (64-bit, CPU with AVX2).
+
+            Download `segyread-windows-x64.zip`, unzip it anywhere and run
+            `segyviewer.exe`. No installer needed. See README.txt inside the
+            zip, and https://jeroengoudswaard.github.io/segyread/ for more.
+          files: segyread-windows-x64.zip
+          make_latest: true
