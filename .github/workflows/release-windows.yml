@@ -1,4 +1,6 @@
-# Builds the Windows version of segyread and publishes it as a GitHub release.
+# Builds the Windows version of Shockwave TraceLab (this repo: segyread) and
+# publishes it as a GitHub release. The dev build target stays "segyviewer";
+# only the shipped exe is named TraceLab.exe.
 #
 # Release: push a tag (git tag v0.1b && git push origin v0.1b), or start it
 # from the Actions tab with "Run workflow" and fill in the tag.
@@ -6,7 +8,7 @@
 # the workflow run as an artifact only (handy for trying out a branch).
 #
 # The download link on the website always points at the newest release:
-#   https://github.com/jeroengoudswaard/segyread/releases/latest/download/segyread-windows-x64.zip
+#   https://github.com/jeroengoudswaard/segyread/releases/latest/download/Shockwave-TraceLab-windows-x64.zip
 name: Release Windows build
 
 on:
@@ -60,12 +62,12 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dir = "segyread-$env:TAG-windows-x64"
+          $dir = "Shockwave-TraceLab-$env:TAG-windows-x64"
           New-Item -ItemType Directory $dir | Out-Null
-          Copy-Item build\Release\segyviewer.exe $dir
+          Copy-Item build\Release\segyviewer.exe "$dir\TraceLab.exe"
           # Qt DLLs and the platform/style/SVG plugins.
           windeployqt --release --compiler-runtime --no-translations `
-            --no-system-d3d-compiler --no-opengl-sw "$dir\segyviewer.exe"
+            --no-system-d3d-compiler --no-opengl-sw "$dir\TraceLab.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # windeployqt ships the MSVC runtime as vc_redist.x64.exe, which users
           # would have to install first. Put the runtime DLLs next to the exe
@@ -79,15 +81,15 @@ jobs:
           }
           Copy-Item native\packaging\README-windows.txt "$dir\README.txt"
           if (-not (Test-Path "$dir\platforms\qwindows.dll")) { throw "qwindows.dll missing" }
-          Compress-Archive -Path $dir -DestinationPath segyread-windows-x64.zip
+          Compress-Archive -Path $dir -DestinationPath Shockwave-TraceLab-windows-x64.zip
           Get-ChildItem $dir -Recurse | Measure-Object -Property Length -Sum |
             ForEach-Object { "Packaged {0} files, {1:N1} MB" -f $_.Count, ($_.Sum / 1MB) }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: segyread-windows-x64
-          path: segyread-windows-x64.zip
+          name: Shockwave-TraceLab-windows-x64
+          path: Shockwave-TraceLab-windows-x64.zip
 
       - name: Publish release
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
@@ -95,12 +97,12 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
-          name: segyread ${{ env.TAG }} (beta)
+          name: Shockwave TraceLab ${{ env.TAG }} (beta)
           body: |
-            Beta build of segyread for Windows 10/11 (64-bit, CPU with AVX2).
+            Beta build of Shockwave TraceLab for Windows 10/11 (64-bit, CPU with AVX2).
 
-            Download `segyread-windows-x64.zip`, unzip it anywhere and run
-            `segyviewer.exe`. No installer needed. See README.txt inside the
-            zip, and https://jeroengoudswaard.github.io/segyread/ for more.
-          files: segyread-windows-x64.zip
+            Download `Shockwave-TraceLab-windows-x64.zip`, unzip it anywhere and run
+            `TraceLab.exe`. No installer needed. See README.txt inside the
+            zip, and https://jeroengoudswaard.github.io/tracelab/ for more.
+          files: Shockwave-TraceLab-windows-x64.zip
           make_latest: true
