@@ -1,7 +1,9 @@
-# segyread-iconen
+# TraceLab-iconen
 
-Gouden seismogramlijn op een donker vierkantje (#1a1a2e), afgeleid van het
-Shockwave Apps-logo.
+Drie zwarte wiggle-traces met gevulde positieve lussen op een oranje tegel
+met een rond verloop (#ffc08a → #ff9650 → #d95a1e), in de signaalkleur van
+de app. De bestandsnamen beginnen nog met `segyread`, zodat app.rc en
+app_icon.qrc niet hoeven te veranderen.
 
 ## Inhoud
 
@@ -11,10 +13,10 @@ Shockwave Apps-logo.
 | `linux/hicolor/…` | Linux-icoonthema (16–512 px + scalable SVG) |
 | `linux/segyread.desktop` | Voorbeeld-starter voor het applicatiemenu |
 | `png/` | Losse PNG's, 16 t/m 1024 px, transparante hoeken |
-| `png/segyread-mark-*.png` | Alleen de gouden lijn, transparant (splash/About-scherm) |
+| `png/segyread-mark-*.png` | Alleen de traces in oranje, transparant (splash/About-scherm) |
 | `svg/segyread.svg` | Master, schaalbaar (vanaf ~40 px) |
-| `svg/segyread-small.svg` | Vereenvoudigd voor 16–32 px (dikkere lijn) |
-| `svg/segyread-mark.svg` | Alleen de lijn, schaalbaar |
+| `svg/segyread-small.svg` | Voor 16–32 px (dikkere traces) |
+| `svg/segyread-mark.svg` | Alleen de traces, schaalbaar |
 
 16–32 px zijn bewust vereenvoudigd: de volledige lijn wordt op die maat een
 waas. Gebruik voor kleine weergaven dus de PNG's of de `.ico`, niet een
