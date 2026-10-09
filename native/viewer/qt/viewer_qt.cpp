@@ -258,6 +258,32 @@ std::vector<int64_t> identTracePositions(const segy::ViewRange& view, int64_t tr
     return result;
 }
 
+// Toolbar overflow "More" button icon: the chevron glyph (iconChevronDown(),
+// same one used for Gain -3dB) with a small accent-colored badge showing
+// how many actions are currently hidden, when any are -- the "Option A"
+// mockup look the user picked (chevron fused to the toolbar + a count
+// badge) over the plain list icon the status-bar version originally
+// shipped with. Regenerated fresh each time updateToolbarOverflow() runs,
+// since the count changes with the window size.
+QIcon renderOverflowIcon(int hiddenCount) {
+    QPixmap pm = iconChevronDown().pixmap(24, 24);
+    if (hiddenCount > 0) {
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        QRectF badgeRect(12, 0, 12, 12);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0xe8, 0x90, 0x5a)); // Dark Pro accent
+        p.drawEllipse(badgeRect);
+        QFont font = p.font();
+        font.setPixelSize(9);
+        font.setBold(true);
+        p.setFont(font);
+        p.setPen(QColor(0x1e, 0x1f, 0x22)); // dark text, readable on the accent orange
+        p.drawText(badgeRect, Qt::AlignCenter, QString::number(std::min(hiddenCount, 99)));
+    }
+    return QIcon(pm);
+}
+
 // " -- filename.sgy" once a file is loaded, otherwise empty -- appended to
 // every window title that shows data for one specific panel (the main
 // window, and every popup/dialog below), so which dataset a given window
@@ -3933,14 +3959,18 @@ MainWindow::MainWindow() : QMainWindow() {
         ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_,
         sidebarToggleAction_,
     };
-    // A plain QToolButton in the status bar -- see its own member
-    // comment in viewer_qt.h for why it doesn't live in toolbar_ itself.
-    toolbarMoreButton_ = new QToolButton(this);
-    toolbarMoreButton_->setIcon(iconList());
+    // A QToolButton parented to toolbar_ but deliberately NOT added via
+    // toolbar->addWidget() -- it's positioned manually in
+    // updateToolbarOverflow() instead, fused to the bottom/right edge of
+    // whatever's currently visible (the "Option A" mockup the user
+    // picked, chevron + a count badge -- see its own member comment for
+    // why it isn't managed by QToolBarLayout like every other toolbar
+    // widget here).
+    toolbarMoreButton_ = new QToolButton(toolbar);
+    toolbarMoreButton_->setIcon(renderOverflowIcon(0));
     toolbarMoreButton_->setToolTip("More toolbar options");
     toolbarMoreButton_->setAutoRaise(true);
     toolbarMoreButton_->setVisible(false);
-    statusBar()->addPermanentWidget(toolbarMoreButton_);
     toolbarMoreMenu_ = new QMenu(this);
     connect(toolbarMoreButton_, &QToolButton::clicked, this, [this]() {
         toolbarMoreMenu_->clear();
@@ -4178,13 +4208,26 @@ void MainWindow::updateToolbarOverflow() {
     if (toolbar_->layout()) toolbar_->layout()->activate();
 
     int limit = vertical ? toolbar_->height() : toolbar_->width();
+    // zoomAction_ is always the very first candidate and never hidden, so
+    // its widget's geometry is always real/laid-out -- used as a
+    // same-style reference size/offset for the manually-positioned More
+    // button below, rather than guessing fixed pixel values.
+    QWidget* refWidget = toolbar_->widgetForAction(zoomAction_);
+    QRect refGeom = refWidget ? refWidget->geometry() : QRect(4, 4, 45, 37);
+    int moreLength = vertical ? refGeom.height() : refGeom.width();
+    int budget = std::max(0, limit - moreLength);
+
     bool anyHidden = false;
+    int hiddenCount = 0;
     for (QAction* action : toolbarOverflowCandidates_) {
         QWidget* w = toolbar_->widgetForAction(action);
         if (!w) continue;
         QRect g = w->geometry();
-        bool fits = !anyHidden && (vertical ? g.bottom() <= limit : g.right() <= limit);
-        if (!fits) anyHidden = true;
+        bool fits = !anyHidden && (vertical ? g.bottom() <= budget : g.right() <= budget);
+        if (!fits) {
+            anyHidden = true;
+            ++hiddenCount;
+        }
         setActionVisible(action, fits);
     }
     // The expanding spacer still claims a layout slot even at zero size,
@@ -4193,8 +4236,32 @@ void MainWindow::updateToolbarOverflow() {
     // (confirmed by geometry-level debug logging) -- hiding it outright
     // whenever anything's overflowed removes that competition.
     if (toolbarSpacerAction_) setActionVisible(toolbarSpacerAction_, !anyHidden);
-    if (toolbar_->layout()) toolbar_->layout()->activate();
+
     toolbarMoreButton_->setVisible(anyHidden);
+    toolbarMoreButton_->setIcon(renderOverflowIcon(hiddenCount));
+    if (anyHidden) {
+        // Manually positioned (not toolbar->addWidget()'d into
+        // QToolBarLayout) -- see its own member comment for why: the
+        // layout's own last one or two children reliably come back with
+        // stale, never-laid-out geometry, independent of overflow/space,
+        // confirmed by logging every candidate's geometry alongside
+        // this button's (Lock/Sidebar -- always the last two candidates
+        // in toolbarOverflowCandidates_ -- showed the exact same stale
+        // (0,0,100,30) rect whenever they were hidden, i.e. whenever
+        // *they* were the layout's actual last children; it had nothing
+        // to do with available space). Floating on top of the toolbar
+        // instead sidesteps that entirely, fused to the bottom/right
+        // edge of whatever's currently visible -- same technique this
+        // file already uses for DatasetSlotWidget/AmplitudeScaleWidget.
+        int crossOffset = vertical ? refGeom.x() : refGeom.y();
+        int crossSize = vertical ? refGeom.width() : refGeom.height();
+        if (vertical) {
+            toolbarMoreButton_->setGeometry(crossOffset, budget, crossSize, moreLength);
+        } else {
+            toolbarMoreButton_->setGeometry(budget, crossOffset, moreLength, crossSize);
+        }
+        toolbarMoreButton_->raise();
+    }
 }
 
 void MainWindow::applyDrawerPosition(DrawerPosition position) {

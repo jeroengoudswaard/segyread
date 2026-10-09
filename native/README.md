@@ -2272,16 +2272,19 @@ exact `Dataset` (mmap, pyramid, everything) alive for the task's
 duration even if the pool or every panel drops its reference to it
 while the task is still running.
 
-### Toolbar overflow: a More button, in the status bar
+### Toolbar overflow: a chevron + count badge, fused to the toolbar
 
 When the window's too short (toolbar docked Left/Right) or too narrow
 (Top/Bottom) to show every toolbar button, the ones that don't fit are
-hidden and reachable instead through a small list-icon button in the
-status bar's permanent-widget area — "an icon at the bottom," matching
-how this was originally asked for. Clicking it rebuilds a `QMenu` from
-scratch each time from whatever's currently hidden: a fresh proxy
-`QAction` per hidden item (icon/text/checkable/checked copied from the
-real one, `triggered` forwarded to the real action via `connect(proxy,
+hidden and reachable instead through a chevron button fused to the
+bottom/right edge of whatever's currently visible, with a small
+accent-colored badge showing how many actions are hidden
+(`renderOverflowIcon()`) — "Option A" from a round of mockups the user
+reviewed and picked (chevron + count badge), over a plainer list-icon
+button that was tried first. Clicking it rebuilds a `QMenu` from scratch
+each time from whatever's currently hidden: a fresh proxy `QAction` per
+hidden item (icon/text/checkable/checked copied from the real one,
+`triggered` forwarded to the real action via `connect(proxy,
 &QAction::triggered, action, &QAction::trigger)`) rather than reusing
 the real actions directly, since a `QWidgetAction`'s widget can only
 ever live in one place at a time and would just move into the menu.
@@ -2313,6 +2316,34 @@ whenever anything's overflowed, for the same reason: it still claims a
 layout slot at zero size, which was observed to leave the sidebar-toggle
 button after it without a valid laid-out position once the toolbar was
 genuinely out of room.
+
+**The overflow button itself is manually positioned, not
+`toolbar->addWidget()`'d into `QToolBarLayout` like every other toolbar
+widget here.** It went through two earlier designs first: added as a
+normal `QToolBarLayout` child the same way as every candidate (broke for
+the same `sizeHint()`-sum reason above, before that was fixed), then
+moved to the status bar's permanent-widget area to sidestep
+`QToolBarLayout` entirely (worked, but wasn't the look the user actually
+picked from the mockups). Once the empirical fit check above replaced
+the `sizeHint()`-sum approach for candidates, moving it back into the
+toolbar as a normal child seemed safe — except geometry-level debug
+logging then showed a third, independent `QToolBarLayout` quirk:
+**the layout's actual last one or two children reliably come back with
+stale, never-laid-out `(0,0,100,30)` geometry, regardless of overflow
+state or available space.** This wasn't a new bug the button introduced
+— logging every candidate's own geometry alongside it showed
+Lock/Sidebar (always the last two entries in `toolbarOverflowCandidates_`)
+exhibiting the exact same stale rect *whenever they themselves were
+hidden and therefore the layout's actual last children* — it had been
+there the whole time, just never visibly mattered before because the
+affected items happened to always be ones already hidden. Rather than
+chase a fourth `QToolBarLayout` workaround, the button is now parented to
+`toolbar_` but kept out of its layout altogether and positioned by hand
+in `updateToolbarOverflow()`, using the always-valid geometry of
+`zoomAction_`'s widget (the first candidate, never hidden) as a
+same-style reference for its own size/offset — the same manual-overlay
+technique this file already uses for `DatasetSlotWidget`/
+`AmplitudeScaleWidget` on the canvas.
 
 ### Idents: trace-header reference rows/plot/overlay lines
 

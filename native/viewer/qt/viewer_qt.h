@@ -1233,19 +1233,32 @@ private:
     // the normal case) or too narrow (horizontal) to fit every button,
     // the ones that don't fit are hidden (QAction::setVisible(false), the
     // one reliable way to actually collapse a toolbar button's space --
-    // see native/README.md) and this button reaches them via a popup
-    // menu instead of leaving them simply gone with no way back. It
-    // lives in the status bar, not the toolbar itself -- an earlier
-    // version added it to the toolbar the same way as every candidate,
-    // but predicting from sizeHint() sums whether N candidates fit was
-    // repeatedly wrong by a margin that tracked inter-item
-    // spacing/separators QToolBarLayout adds but sizeHint() doesn't
-    // report, so the last couple of "fitting" items (and this button,
-    // added right after them) sometimes got a plausible-looking cached
-    // geometry whose bottom edge was actually past the toolbar's own
-    // real height -- Qt just never painted them, no chevron, no error.
-    // Moving it to the status bar sidesteps that entirely, and "an icon
-    // at the bottom" is exactly how the user described it.
+    // see native/README.md) and this button -- a chevron fused to the
+    // bottom/right edge of whatever's currently visible, with a small
+    // badge showing how many actions are hidden (renderOverflowIcon()) --
+    // reaches them via a popup menu instead of leaving them simply gone
+    // with no way back. "Option A" from the mockups the user reviewed.
+    //
+    // Parented to toolbar_, but deliberately never added via
+    // toolbar->addWidget() -- positioned manually in
+    // updateToolbarOverflow() instead of being one more QToolBarLayout
+    // child. Two earlier versions both tried letting the layout manage
+    // it: first added the same way as every candidate, which failed
+    // because predicting fit from sizeHint() sums (sizeHint() doesn't
+    // report inter-item spacing/separators QToolBarLayout adds) was
+    // wrong by varying margins; moving it to the status bar sidestepped
+    // that, but once the empirical fit check below replaced the
+    // sizeHint()-sum approach for candidates, it seemed safe to add it
+    // back as a normal toolbar child too -- except geometry-level
+    // debug logging then showed QToolBarLayout's actual *last one or two
+    // children* reliably come back with stale, never-laid-out (0,0,100,30)
+    // geometry regardless of overflow/available space (confirmed:
+    // Lock/Sidebar -- always the last two toolbarOverflowCandidates_ --
+    // showed the exact same stale rect whenever *they* were hidden and
+    // therefore the layout's actual last children, with no relation to
+    // how much room was available). Manual positioning sidesteps
+    // QToolBarLayout for this one widget entirely -- same technique this
+    // file already uses for DatasetSlotWidget/AmplitudeScaleWidget.
     QToolButton* toolbarMoreButton_ = nullptr;
     QMenu* toolbarMoreMenu_ = nullptr; // rebuilt fresh from whatever's currently hidden, each time it's about to show
     // The expanding spacer that pushes the sidebar toggle to the toolbar's
