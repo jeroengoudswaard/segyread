@@ -2310,12 +2310,23 @@ The failure mode was quiet and easy to misdiagnose: Qt marked an action
 "visible" with a plausible, non-stale-looking cached geometry, and then
 just never painted it — no native overflow chevron, no error, no size
 mismatch visible from the outside except careful geometry-level logging.
-The expanding spacer that pushes the sidebar-toggle button to the
-toolbar's far end (see its own construction comment) is hidden outright
-whenever anything's overflowed, for the same reason: it still claims a
-layout slot at zero size, which was observed to leave the sidebar-toggle
-button after it without a valid laid-out position once the toolbar was
-genuinely out of room.
+**The expanding spacer that pushes the sidebar-toggle button to the
+toolbar's far end (see its own construction comment) has to stay hidden
+through the entire measurement pass, not just once overflow is already
+known.** Showing it during measurement was a real, user-reported bug
+(not a hypothetical): with every candidate visible and a window tall
+enough to comfortably fit all of them, the spacer's `Expanding` policy
+still claimed *all* of the toolbar's unused height during that pass —
+exactly its intended cosmetic job once the final layout is known, but
+premature here — which pushed the sidebar-toggle button's *measured* Y
+position down to where the spacer's far end would be, past the actual
+budget, so it measured as "doesn't fit" and vanished into the overflow
+menu on windows that had more than enough room for it. Fixed by forcing
+the spacer hidden for the whole measurement pass regardless of prior
+state, only re-showing it (and re-`activate()`-ing the layout so the
+resulting push is resolved synchronously, not left to Qt's own lazy
+relayout on some later paint) once the fit check confirms nothing
+actually overflowed.
 
 **The overflow button itself is manually positioned, not
 `toolbar->addWidget()`'d into `QToolBarLayout` like every other toolbar

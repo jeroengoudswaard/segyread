@@ -4203,8 +4203,19 @@ void MainWindow::updateToolbarOverflow() {
     // overflow the toolbar's own rect. Positions are monotonic along the
     // toolbar's axis, so the first overflowing candidate and everything
     // after it all get hidden together.
+    // The expanding spacer (see its own construction comment) must stay
+    // hidden through this measurement pass, not just whenever overflow
+    // is already known -- confirmed by geometry-level debug logging: with
+    // it shown here, its Expanding size policy claimed all of the
+    // toolbar's unused height during measurement (there being plenty,
+    // since every candidate is visible and the toolbar is genuinely
+    // tall), inflating the sidebar-toggle button's *measured* Y position
+    // (pushed to the spacer's far end, exactly its intended cosmetic
+    // effect when truly idle) well past the real budget, so it measured
+    // as "doesn't fit" even on a window tall enough to fit every
+    // candidate comfortably without the spacer in the way.
     for (QAction* action : toolbarOverflowCandidates_) setActionVisible(action, true);
-    if (toolbarSpacerAction_) setActionVisible(toolbarSpacerAction_, true);
+    if (toolbarSpacerAction_) setActionVisible(toolbarSpacerAction_, false);
     if (toolbar_->layout()) toolbar_->layout()->activate();
 
     int limit = vertical ? toolbar_->height() : toolbar_->width();
@@ -4230,12 +4241,18 @@ void MainWindow::updateToolbarOverflow() {
         }
         setActionVisible(action, fits);
     }
-    // The expanding spacer still claims a layout slot even at zero size,
-    // which left the sidebar-toggle button after it without a valid
-    // laid-out position once the toolbar genuinely ran out of room
-    // (confirmed by geometry-level debug logging) -- hiding it outright
-    // whenever anything's overflowed removes that competition.
+    // Only re-shown once it's known nothing overflowed -- see the
+    // measurement-phase comment above for why it has to stay hidden
+    // through the loop itself, not just whenever overflow was already
+    // known from a previous call. Re-activating afterward resolves its
+    // (cosmetic, intended) push to the toolbar's far end synchronously,
+    // rather than leaving it for Qt's own lazy relayout to apply on some
+    // later, uncontrolled paint pass -- confirmed by screenshot-testing
+    // this: without it, the sidebar-toggle button it pushes landed
+    // somewhere past the toolbar's visible area instead of at its
+    // intended resting place right at the bottom.
     if (toolbarSpacerAction_) setActionVisible(toolbarSpacerAction_, !anyHidden);
+    if (toolbar_->layout()) toolbar_->layout()->activate();
 
     toolbarMoreButton_->setVisible(anyHidden);
     toolbarMoreButton_->setIcon(renderOverflowIcon(hiddenCount));
