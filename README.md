@@ -1,6 +1,6 @@
 # segyread
 
-Source of **Shockwave TraceLab**, a fast SEG-Y reader with dedicated QC
+Source of **TraceLab**, a fast SEG-Y reader with dedicated QC
 options ([website](https://jeroengoudswaard.github.io/tracelab/)).
 
 This repository tracks the native C++/Qt6 application in
