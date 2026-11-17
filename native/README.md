@@ -284,8 +284,11 @@ extra complexity of a persistent pool.
 ### Menu bar: one Qt `QMenuBar`, inert-by-default surface
 
 Both platforms get the identical conventional File/Edit/Selection/View/Help
-menu bar from one `QMenuBar`/`QAction` block in `viewer_qt.cpp`. Only
-**File > Open** and **File > Exit** do anything; every other item (Undo,
+menu bar from one `QMenuBar`/`QAction` block in `viewer_qt.cpp`. (Historical:
+many items have since become real, and an Analysis menu was added, see
+"Customizable toolbar, and every toolbar function in a menu". What follows
+describes the original pass.) Originally only
+**File > Open** and **File > Exit** did anything; every other item (Undo,
 Redo, Cut, Copy, Paste, Select All, Clear Selection, Zoom In/Out, Reset
 View, Fit to Window, About) is a plain `addAction("...")` with nothing
 connected to its `triggered` signal — clicking it is a true no-op, not a
@@ -2354,11 +2357,93 @@ there the whole time, just never visibly mattered before because the
 affected items happened to always be ones already hidden. Rather than
 chase a fourth `QToolBarLayout` workaround, the button is now parented to
 `toolbar_` but kept out of its layout altogether and positioned by hand
-in `updateToolbarOverflow()`, using the always-valid geometry of
-`zoomAction_`'s widget (the first candidate, never hidden) as a
+in `updateToolbarOverflow()`, using the always-valid geometry of the
+first *shown* candidate's widget (originally always `zoomAction_`'s, until
+the customizable toolbar below made Zoom itself removable) as a
 same-style reference for its own size/offset — the same manual-overlay
 technique this file already uses for `DatasetSlotWidget`/
 `AmplitudeScaleWidget` on the canvas.
+
+### Customizable toolbar, and every toolbar function in a menu
+
+COPILOT.md item 1. Every toolbar button can be removed from or added back
+to the toolbar; the order stays fixed (show/hide only, no drag-reordering
+yet). Two ways in:
+
+- **Right-click the toolbar** (on a button or on empty space): a quick
+  *Remove "<item>" from Toolbar* for the button under the cursor, then a
+  checkable list of every item plus *Reset Toolbar*. `QToolButton`
+  ignores context-menu events, so they propagate to the toolbar's own
+  `customContextMenuRequested` handler. The Split View button and the gain
+  value label keep their own, older right-click menus.
+- **View > Toolbar**: the same checkable list plus Reset, rebuilt on every
+  `aboutToShow`.
+
+The list is `MainWindow::toolbarItems_`, one `ToolbarItem` per item:
+a stable persisted id, a label, a separator group, and the `QAction`s it
+covers. **Gain** is one item covering all four of its widgets (slider,
++/- arrows, dB label), because only some of them are ever shown at once.
+Hidden ids persist to `$HOME/.segyread_settings` as `toolbarHiddenItems`;
+unknown ids are ignored, so renaming an id would just silently un-hide
+that item for existing users. Don't rename them.
+
+`isToolbarActionWanted()` combines the user's hidden list with the gain
+orientation rule (slider only when horizontal, arrows only when vertical),
+which used to be three `setVisible()` calls in `applyToolbarPosition()`.
+`applyToolbarCustomization()` applies it to every item, then hides each
+separator unless the group before it and some later group both still
+have a shown item. Hiding a whole group therefore never leaves a doubled
+or dangling divider. It then reruns `updateToolbarOverflow()`.
+The overflow pass only measures and shows *wanted* candidates, and its
+More menu never lists a removed item, because removed items belong to the
+menus, not the overflow chevron. Its reference geometry for sizing the
+More button is now the first shown candidate, because Zoom can be removed.
+
+**Every toolbar function is also in a menu**, so removing a button never
+strands a feature:
+
+| Menu | Entries added |
+|---|---|
+| File | Text Header, Binary Header |
+| Selection | Box Select Tool, Zoom to Selection, Undo Zoom (Mooz) |
+| View | Pan Tool, Flip Horizontal, Display Parameters..., Gain (Increase / Decrease / Set Gain...), Idents, Split View, Split Layout (Set Split 50% / Side by Side / Stacked), Lock Panels, Sidebar, Toolbar |
+| Analysis (new) | Spectrum..., Histogram..., Octave Bands |
+
+The seismic-mode toggle was already covered by View > Seismic Display.
+Most entries come from `addMenuMirror()`, which creates a *separate*
+`QAction` that triggers the toolbar action and follows its enabled and
+checked state (via `changed` and `toggled`). The toolbar action itself is
+not added to the menu because QAction visibility is shared by every widget
+showing it, and the toolbar hides actions for both overflow and
+customization, which would hide the menu entries too.
+A checkable mirror has already flipped itself by the time `triggered`
+fires, so it re-syncs from the source after triggering it. That keeps the
+two in step even if the source refused the change.
+
+Three toolbar behaviors were factored out so the menus could share them:
+- `populateIdentsMenu()`, used by the Idents button's popup and View >
+  Idents. View > Idents is a persistent menu rebuilt on every show, so it
+  uses `clearMenuCompletely()`: `QMenu::clear()` alone doesn't delete
+  child submenus or the `QActionGroup`s parented to the menu.
+- `promptForGainDb()`, used by the gain label's right-click and View >
+  Gain > Set Gain.
+- `setSplitOrientation()`, used by the Split View button's right-click and
+  View > Split Layout.
+
+When Idents is triggered with no visible button (removed, or overflowed
+and reached via More), its popup opens at the cursor instead.
+
+Verified by screenshot, with hand-written `toolbarHiddenItems` in the
+settings file (restored afterward):
+- **Left toolbar**, with Zoom, Mooz, Idents and Spectrum hidden: the
+  emptied first group's separator disappeared, and the gain arrows (not
+  the slider) still showed.
+- **Top toolbar**, with Histogram, the two header viewers and the Sidebar
+  toggle hidden: the slider (not the arrows) showed, and the dock itself
+  stayed visible.
+
+The new menu entries and the right-click menu were not clicked through
+interactively; see "Trade-offs".
 
 ### Idents: trace-header reference rows/plot/overlay lines
 
@@ -2530,11 +2615,16 @@ the layout pixel-for-pixel to the pre-feature baseline.
   against one real dataset; if a different dataset or display makes it
   read as over/under-corrected, the fix is one constant in `viewer_qt.cpp`,
   not a rearchitecture.
-- **Toolbar overflow order is fixed** (the toolbar's own button order,
-  least-recently-added hidden first) — not user-reorderable, and not
-  based on actual usage frequency. Matches every other fixed-order
-  toolbar in this app; a user-customizable toolbar is an explicitly
-  planned follow-up, not built yet.
+- **Toolbar order is fixed** (the toolbar's own button order, which is
+  also the overflow order) — buttons can be shown/hidden (see
+  "Customizable toolbar") but not reordered, and overflow isn't based on
+  usage frequency. Drag-reordering would be the natural next step if
+  wanted.
+- **The customizable toolbar's menus weren't interactively click-tested**
+  (right-click Remove/Reset, View > Toolbar, and the new File/Selection/
+  View/Analysis entries) — the visible result of a hidden-items list was
+  verified by screenshot in both orientations, and the menu entries are
+  thin mirrors that call the same toolbar actions' existing handlers.
 - **A second background task (Calculator/Bandpass/Save SEG-Y/Octave
   Bands) while one's already running is refused with a flashed status
   message**, not queued — simple and safe, but means starting a second

@@ -3716,6 +3716,19 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
     update();
 }
 
+namespace {
+// QMenu::clear() deletes the menu's own actions but not child QMenus made
+// by addMenu() or QActionGroups parented to it -- a menu repopulated on
+// every aboutToShow (View > Idents) would otherwise leak those each time.
+void clearMenuCompletely(QMenu* menu) {
+    menu->clear();
+    const QObjectList children = menu->children();
+    for (QObject* child : children) {
+        if (qobject_cast<QMenu*>(child) || qobject_cast<QActionGroup*>(child)) delete child;
+    }
+}
+} // namespace
+
 MainWindow::MainWindow() : QMainWindow() {
     setWindowTitle("TraceLab");
     resize(1200, 800);
@@ -3749,7 +3762,9 @@ MainWindow::MainWindow() : QMainWindow() {
     QAction* saveSegyAction = fileMenu->addAction("&Save SEG-Y...");
     saveSegyAction->setShortcut(QKeySequence::Save);
     connect(saveSegyAction, &QAction::triggered, this, &MainWindow::openSaveSegyDialog);
-    fileMenu->addSeparator();
+    // Text/Binary Header entries are inserted before this separator once
+    // their toolbar actions exist -- see the menu mirrors after the toolbar.
+    QAction* fileExitSeparator = fileMenu->addSeparator();
     QAction* exitAction = fileMenu->addAction("E&xit");
     connect(exitAction, &QAction::triggered, qApp, &QApplication::quit);
 
@@ -3850,6 +3865,10 @@ MainWindow::MainWindow() : QMainWindow() {
         }
     });
 
+    // Filled in after the toolbar, like the File/Selection/View additions --
+    // created here only so it lands in the menu bar before Help.
+    QMenu* analysisMenu = menuBar()->addMenu("&Analysis");
+
     QMenu* helpMenu = menuBar()->addMenu("&Help");
     helpMenu->addAction("&About");
 
@@ -3876,7 +3895,7 @@ MainWindow::MainWindow() : QMainWindow() {
     moozAction_->setEnabled(false);
     connect(moozAction_, &QAction::triggered, this, &MainWindow::moozBack);
 
-    toolbar->addSeparator();
+    toolbarSeparators_.push_back(toolbar->addSeparator());
 
     QActionGroup* toolGroup = new QActionGroup(this);
     toolGroup->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
@@ -3905,7 +3924,7 @@ MainWindow::MainWindow() : QMainWindow() {
         refreshToolChrome();
     });
 
-    toolbar->addSeparator();
+    toolbarSeparators_.push_back(toolbar->addSeparator());
 
     // Seismic Display: a single standard-size toolbar button rather than a
     // segmented pair -- its icon always shows the *other* mode (the one
@@ -3937,71 +3956,18 @@ MainWindow::MainWindow() : QMainWindow() {
     identsAction_->setToolTip("Trace-header rows/plot, and lines on the seismic");
     connect(identsAction_, &QAction::triggered, this, [this]() {
         QMenu menu(this);
-
-        // Display at Top / Display at Bottom: independent checkable
-        // toggles, capped at 4/2 -- refusing an over-cap check (rather
-        // than evicting the oldest) is simplest: the real QAction/menu is
-        // thrown away the instant exec() returns, so there's no state to
-        // revert -- the next open just rebuilds from the untouched
-        // app_->idents.
-        auto buildCappedSubmenu = [this](QMenu& parent, const QString& title, bool (IdentSettings::*array)[kIdentFieldCount],
-                                          int cap) {
-            QMenu* sub = parent.addMenu(title);
-            for (int i = 0; i < kIdentFieldCount; ++i) {
-                QAction* a = sub->addAction(identFieldLabel(IdentField(i)));
-                a->setCheckable(true);
-                a->setChecked((app_->idents.*array)[i]);
-                connect(a, &QAction::triggered, this, [this, array, i, cap](bool checked) {
-                    if (checked) {
-                        int count = 0;
-                        for (int k = 0; k < kIdentFieldCount; ++k) {
-                            if ((app_->idents.*array)[k]) ++count;
-                        }
-                        if (count >= cap) {
-                            flashStatusMessage(QString("Limited to %1 idents here").arg(cap));
-                            return;
-                        }
-                    }
-                    for (Panel* p : targetPanels()) {
-                        (p->app.idents.*array)[i] = checked;
-                        p->canvas->refreshIdentLayout();
-                    }
-                });
-            }
-        };
-        buildCappedSubmenu(menu, "Display at Top", &IdentSettings::topEnabled, 4);
-        buildCappedSubmenu(menu, "Display at Bottom", &IdentSettings::bottomEnabled, 2);
-
-        // Ident Plot / each overlay-line color: single-select-or-none --
-        // an ExclusiveOptional QActionGroup (same policy already used for
-        // Pan/Box Select) makes clicking the checked entry again clear it.
-        auto buildPickerSubmenu = [this, &menu](QMenu& parent, const QString& title, int IdentSettings::*field) {
-            QMenu* sub = parent.addMenu(title);
-            QActionGroup* group = new QActionGroup(&menu);
-            group->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
-            for (int i = 0; i < kIdentFieldCount; ++i) {
-                QAction* a = sub->addAction(identFieldLabel(IdentField(i)));
-                a->setCheckable(true);
-                a->setChecked(app_->idents.*field == i);
-                a->setActionGroup(group);
-                connect(a, &QAction::triggered, this, [this, field, i](bool checked) {
-                    for (Panel* p : targetPanels()) {
-                        p->app.idents.*field = checked ? i : -1;
-                        p->canvas->refreshIdentLayout();
-                    }
-                });
-            }
-        };
-        buildPickerSubmenu(menu, "Ident Plot", &IdentSettings::plotField);
-        QMenu* seismicMenu = menu.addMenu("Display on Seismic");
-        buildPickerSubmenu(*seismicMenu, "Line Cyan", &IdentSettings::overlayCyanField);
-        buildPickerSubmenu(*seismicMenu, "Line Red", &IdentSettings::overlayRedField);
-
+        populateIdentsMenu(menu);
+        // Hidden (customized away, or overflowed and reached via the More
+        // menu): no button to anchor to, so pop up at the cursor instead.
         QWidget* button = toolbar_->widgetForAction(identsAction_);
-        if (button) menu.exec(button->mapToGlobal(QPoint(0, button->height())));
+        if (button && button->isVisible()) {
+            menu.exec(button->mapToGlobal(QPoint(0, button->height())));
+        } else {
+            menu.exec(QCursor::pos());
+        }
     });
 
-    toolbar->addSeparator();
+    toolbarSeparators_.push_back(toolbar->addSeparator());
 
     // Gain: dB gain applied on top of the pyramid's auto-computed clip
     // (see DisplaySettings::gainDb) -- auto-scaling stays the baseline,
@@ -4083,20 +4049,15 @@ MainWindow::MainWindow() : QMainWindow() {
     // the value between them for an exact, arbitrary value instead.
     gainValueLabel_->setToolTip("Right-click to enter an exact gain value");
     gainValueLabel_->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(gainValueLabel_, &QWidget::customContextMenuRequested, this, [this](const QPoint&) {
-        bool ok = false;
-        double value = QInputDialog::getDouble(this, "Set Gain", "Gain (dB):", app_->display.gainDb, -6.0, 24.0, 1,
-                                                &ok);
-        if (ok) setGainDb(value);
-    });
-    toolbar->addWidget(gainValueLabel_);
+    connect(gainValueLabel_, &QWidget::customContextMenuRequested, this, [this](const QPoint&) { promptForGainDb(); });
+    gainValueLabelAction_ = toolbar->addWidget(gainValueLabel_);
 
     gainDownAction_ = toolbar->addAction(iconChevronDown(), "Gain -3 dB");
     gainDownAction_->setToolTip("Decrease gain by 3 dB");
     connect(gainDownAction_, &QAction::triggered, this,
             [this]() { setGainDb(std::clamp(app_->display.gainDb - 3.0, -6.0, 24.0)); });
 
-    toolbar->addSeparator();
+    toolbarSeparators_.push_back(toolbar->addSeparator());
 
     // Spectrum/Histogram both open real parameters dialogs (see
     // native/README.md). Lock is a real two-state toggle -- see
@@ -4194,14 +4155,7 @@ MainWindow::MainWindow() : QMainWindow() {
             if (chosen == set50) {
                 resetSplitToHalf();
             } else if (chosen == toggleOrientation) {
-                splitter_->setOrientation(splitter_->orientation() == Qt::Horizontal ? Qt::Vertical
-                                                                                      : Qt::Horizontal);
-                resetSplitToHalf();
-                // Depict the actual divider orientation -- a vertical
-                // (top/bottom) split shows a horizontal-divider icon, not
-                // the vertical-divider default.
-                splitViewAction_->setIcon(splitter_->orientation() == Qt::Horizontal ? iconLayoutColumns()
-                                                                                      : iconLayoutRows());
+                setSplitOrientation(splitter_->orientation() == Qt::Horizontal ? Qt::Vertical : Qt::Horizontal);
             }
         });
     }
@@ -4258,7 +4212,9 @@ MainWindow::MainWindow() : QMainWindow() {
     connect(toolbarMoreButton_, &QToolButton::clicked, this, [this]() {
         toolbarMoreMenu_->clear();
         for (QAction* action : toolbarOverflowCandidates_) {
-            if (action->isVisible()) continue; // only the ones overflow actually hid
+            // Only the ones overflow actually hid -- not ones the user
+            // removed from the toolbar (those live in the menus instead).
+            if (action->isVisible() || !isToolbarActionWanted(action)) continue;
             // A fresh proxy per item, not the real action reused directly
             // -- see the member comment above for why, and rebuilt every
             // time rather than kept in sync live, since the menu is only
@@ -4275,6 +4231,120 @@ MainWindow::MainWindow() : QMainWindow() {
     // shown -- same reasoning as gainValueLabel_'s width computation a
     // little further down.
     QTimer::singleShot(0, this, [this]() { updateToolbarOverflow(); });
+
+    // Customizable toolbar -- see ToolbarItem in viewer_qt.h. Groups match
+    // the separators above (toolbarSeparators_[g] follows group g); group 5
+    // is the sidebar toggle past the expanding spacer, which has no
+    // separator of its own.
+    toolbarItems_ = {
+        {"zoom", "Zoom to Selection", 0, {zoomAction_}},
+        {"mooz", "Undo Zoom (Mooz)", 0, {moozAction_}},
+        {"pan", "Pan", 1, {panAction_}},
+        {"boxSelect", "Box Select", 1, {boxSelectAction_}},
+        {"seismicMode", "Seismic Display Toggle", 2, {seismicModeToolbarAction_}},
+        {"flipHorizontal", "Flip Horizontal", 2, {flipHorizontalAction_}},
+        {"idents", "Idents", 2, {identsAction_}},
+        {"displayParameters", "Display Parameters", 3, {gainDetailAction_}},
+        {"gain", "Gain", 3, {gainSliderAction_, gainUpAction_, gainValueLabelAction_, gainDownAction_}},
+        {"spectrum", "Spectrum", 4, {spectrumAction_}},
+        {"histogram", "Histogram", 4, {histogramAction_}},
+        {"octaveBands", "Octave Bands", 4, {octaveBandAction_}},
+        {"textHeader", "Text Header", 4, {ebcdicHeaderAction_}},
+        {"binaryHeader", "Binary Header", 4, {binaryHeaderAction_}},
+        {"splitView", "Split View", 4, {splitViewAction_}},
+        {"lock", "Lock Panels", 4, {lockAction_}},
+        {"sidebar", "Sidebar Toggle", 5, {sidebarToggleAction_}},
+    };
+
+    // Right-click anywhere on the toolbar (buttons included -- a
+    // QToolButton ignores context-menu events, so they propagate here;
+    // the Split View button and gain value label keep their own menus):
+    // a quick "Remove <item>" for the button under the cursor, then the
+    // full show/hide list.
+    toolbar_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(toolbar_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QMenu menu(this);
+        if (QAction* hit = toolbar_->actionAt(pos)) {
+            for (const ToolbarItem& item : toolbarItems_) {
+                if (std::find(item.actions.begin(), item.actions.end(), hit) == item.actions.end()) continue;
+                QString id = item.id;
+                QAction* remove = menu.addAction(QString("Remove \"%1\" from Toolbar").arg(item.label));
+                connect(remove, &QAction::triggered, this, [this, id]() { setToolbarItemShown(id, false); });
+                menu.addSeparator();
+                break;
+            }
+        }
+        populateToolbarCustomizeMenu(&menu);
+        menu.exec(toolbar_->mapToGlobal(pos));
+    });
+
+    // Every toolbar function in a menu too (COPILOT.md item 1), so hiding
+    // a button never strands its feature -- mirrors, not the toolbar
+    // actions themselves; see addMenuMirror's comment.
+    fileMenu->insertSeparator(fileExitSeparator);
+    addMenuMirror(fileMenu, ebcdicHeaderAction_, "&Text Header", fileExitSeparator);
+    addMenuMirror(fileMenu, binaryHeaderAction_, "&Binary Header", fileExitSeparator);
+
+    selectionMenu->addSeparator();
+    addMenuMirror(selectionMenu, boxSelectAction_, "&Box Select Tool");
+    addMenuMirror(selectionMenu, zoomAction_, "&Zoom to Selection");
+    addMenuMirror(selectionMenu, moozAction_, "&Undo Zoom (Mooz)");
+
+    viewMenu->addSeparator();
+    addMenuMirror(viewMenu, panAction_, "&Pan Tool");
+    addMenuMirror(viewMenu, flipHorizontalAction_, "Flip &Horizontal");
+    addMenuMirror(viewMenu, gainDetailAction_, "Display &Parameters...");
+
+    QMenu* gainMenu = viewMenu->addMenu("&Gain");
+    QAction* gainUpMenuAction = gainMenu->addAction("&Increase Gain (+3 dB)");
+    connect(gainUpMenuAction, &QAction::triggered, this,
+            [this]() { setGainDb(std::clamp(app_->display.gainDb + 3.0, -6.0, 24.0)); });
+    QAction* gainDownMenuAction = gainMenu->addAction("&Decrease Gain (-3 dB)");
+    connect(gainDownMenuAction, &QAction::triggered, this,
+            [this]() { setGainDb(std::clamp(app_->display.gainDb - 3.0, -6.0, 24.0)); });
+    gainMenu->addSeparator();
+    QAction* setGainMenuAction = gainMenu->addAction("&Set Gain...");
+    connect(setGainMenuAction, &QAction::triggered, this, &MainWindow::promptForGainDb);
+
+    // Rebuilt on every open, from whichever panel is active right then.
+    QMenu* identsMenu = viewMenu->addMenu("I&dents");
+    connect(identsMenu, &QMenu::aboutToShow, this, [this, identsMenu]() {
+        clearMenuCompletely(identsMenu);
+        populateIdentsMenu(*identsMenu);
+    });
+
+    viewMenu->addSeparator();
+    addMenuMirror(viewMenu, splitViewAction_, "Split &View");
+    QMenu* splitLayoutMenu = viewMenu->addMenu("Split &Layout");
+    QAction* split50MenuAction = splitLayoutMenu->addAction("Set Split &50%");
+    connect(split50MenuAction, &QAction::triggered, this, &MainWindow::resetSplitToHalf);
+    splitLayoutMenu->addSeparator();
+    QActionGroup* splitOrientationGroup = new QActionGroup(this);
+    QAction* sideBySideAction = splitLayoutMenu->addAction("&Side by Side");
+    QAction* stackedAction = splitLayoutMenu->addAction("S&tacked");
+    for (QAction* a : {sideBySideAction, stackedAction}) {
+        a->setCheckable(true);
+        a->setActionGroup(splitOrientationGroup);
+    }
+    connect(sideBySideAction, &QAction::triggered, this, [this]() { setSplitOrientation(Qt::Horizontal); });
+    connect(stackedAction, &QAction::triggered, this, [this]() { setSplitOrientation(Qt::Vertical); });
+    connect(splitLayoutMenu, &QMenu::aboutToShow, this, [this, sideBySideAction, stackedAction]() {
+        sideBySideAction->setChecked(splitter_->orientation() == Qt::Horizontal);
+        stackedAction->setChecked(splitter_->orientation() == Qt::Vertical);
+    });
+    addMenuMirror(viewMenu, lockAction_, "Lock Pa&nels");
+
+    viewMenu->addSeparator();
+    addMenuMirror(viewMenu, sidebarToggleAction_, "Side&bar");
+    QMenu* toolbarMenu = viewMenu->addMenu("&Toolbar");
+    connect(toolbarMenu, &QMenu::aboutToShow, this, [this, toolbarMenu]() {
+        toolbarMenu->clear();
+        populateToolbarCustomizeMenu(toolbarMenu);
+    });
+
+    addMenuMirror(analysisMenu, spectrumAction_, "&Spectrum...");
+    addMenuMirror(analysisMenu, histogramAction_, "&Histogram...");
+    addMenuMirror(analysisMenu, octaveBandAction_, "&Octave Bands");
 
     // Right dock: relocated color bar (Amplitude Scale) and hover readout
     // (Trace Info), plus a QC Notes placeholder -- see native/README.md
@@ -4376,6 +4446,160 @@ namespace {
 QString preferencesFilePath() { return QDir::homePath() + "/.segyread_settings"; }
 } // namespace
 
+QAction* MainWindow::addMenuMirror(QMenu* menu, QAction* source, const QString& text, QAction* before) {
+    QAction* mirror = new QAction(text.isEmpty() ? source->text() : text, menu);
+    mirror->setCheckable(source->isCheckable());
+    menu->insertAction(before, mirror); // before == nullptr appends
+    auto sync = [mirror, source]() {
+        mirror->setEnabled(source->isEnabled());
+        if (mirror->isCheckable()) mirror->setChecked(source->isChecked());
+    };
+    sync();
+    connect(source, &QAction::changed, mirror, sync);
+    connect(source, &QAction::toggled, mirror, sync);
+    // A checkable mirror has already flipped itself by the time triggered
+    // fires; re-syncing after the source handles it keeps the two equal
+    // even if the source refused the change. trigger() works on a hidden
+    // action (the toolbar's More menu already relies on that).
+    connect(mirror, &QAction::triggered, mirror, [source, sync]() {
+        source->trigger();
+        sync();
+    });
+    return mirror;
+}
+
+bool MainWindow::isToolbarActionWanted(QAction* action) const {
+    bool vertical = prefs_.toolbarPosition == ToolbarPosition::Left || prefs_.toolbarPosition == ToolbarPosition::Right;
+    if (action == gainSliderAction_ && vertical) return false;
+    if ((action == gainUpAction_ || action == gainDownAction_) && !vertical) return false;
+    for (const ToolbarItem& item : toolbarItems_) {
+        if (std::find(item.actions.begin(), item.actions.end(), action) != item.actions.end()) {
+            return !hiddenToolbarItems_.contains(item.id);
+        }
+    }
+    return true;
+}
+
+void MainWindow::applyToolbarCustomization() {
+    for (const ToolbarItem& item : toolbarItems_) {
+        for (QAction* action : item.actions) {
+            bool wanted = isToolbarActionWanted(action);
+            // Widget too, not just the action -- same lag
+            // updateToolbarOverflow's setActionVisible works around.
+            action->setVisible(wanted);
+            if (QWidget* w = toolbar_->widgetForAction(action)) w->setVisible(wanted);
+        }
+    }
+    // Groups 0..lastSeparatedGroup are the ones separators sit between;
+    // anything after (the sidebar toggle) is set apart by the spacer.
+    const int lastSeparatedGroup = int(toolbarSeparators_.size());
+    auto groupHasShownItem = [this](int group) {
+        for (const ToolbarItem& item : toolbarItems_) {
+            if (item.group == group && !hiddenToolbarItems_.contains(item.id)) return true;
+        }
+        return false;
+    };
+    for (int g = 0; g < int(toolbarSeparators_.size()); ++g) {
+        bool laterShown = false;
+        for (int later = g + 1; later <= lastSeparatedGroup && !laterShown; ++later) laterShown = groupHasShownItem(later);
+        toolbarSeparators_[g]->setVisible(groupHasShownItem(g) && laterShown);
+    }
+    updateToolbarOverflow();
+}
+
+void MainWindow::setToolbarItemShown(const QString& id, bool shown) {
+    hiddenToolbarItems_.removeAll(id);
+    if (!shown) hiddenToolbarItems_.append(id);
+    applyToolbarCustomization();
+    savePreferences();
+}
+
+void MainWindow::populateToolbarCustomizeMenu(QMenu* menu) {
+    for (const ToolbarItem& item : toolbarItems_) {
+        QAction* a = menu->addAction(item.label);
+        a->setCheckable(true);
+        a->setChecked(!hiddenToolbarItems_.contains(item.id));
+        QString id = item.id;
+        connect(a, &QAction::triggered, this, [this, id](bool checked) { setToolbarItemShown(id, checked); });
+    }
+    menu->addSeparator();
+    QAction* reset = menu->addAction("Reset Toolbar");
+    reset->setEnabled(!hiddenToolbarItems_.isEmpty());
+    connect(reset, &QAction::triggered, this, [this]() {
+        hiddenToolbarItems_.clear();
+        applyToolbarCustomization();
+        savePreferences();
+    });
+}
+
+// The Idents menu (Display at Top/Bottom, Ident Plot, Display on Seismic),
+// built fresh from the active panel's app_->idents -- shared by the Idents
+// toolbar button's popup and View > Idents (rebuilt on every aboutToShow).
+// Its QActionGroups are parented to `menu`, so a persistent menu must
+// delete its child groups/submenus before repopulating -- see
+// clearMenuCompletely().
+void MainWindow::populateIdentsMenu(QMenu& menu) {
+    // Display at Top / Display at Bottom: independent checkable
+    // toggles, capped at 4/2 -- refusing an over-cap check (rather
+    // than evicting the oldest) is simplest: the real QAction/menu is
+    // thrown away the instant exec() returns, so there's no state to
+    // revert -- the next open just rebuilds from the untouched
+    // app_->idents.
+    auto buildCappedSubmenu = [this](QMenu& parent, const QString& title, bool (IdentSettings::*array)[kIdentFieldCount],
+                                      int cap) {
+        QMenu* sub = parent.addMenu(title);
+        for (int i = 0; i < kIdentFieldCount; ++i) {
+            QAction* a = sub->addAction(identFieldLabel(IdentField(i)));
+            a->setCheckable(true);
+            a->setChecked((app_->idents.*array)[i]);
+            connect(a, &QAction::triggered, this, [this, array, i, cap](bool checked) {
+                if (checked) {
+                    int count = 0;
+                    for (int k = 0; k < kIdentFieldCount; ++k) {
+                        if ((app_->idents.*array)[k]) ++count;
+                    }
+                    if (count >= cap) {
+                        flashStatusMessage(QString("Limited to %1 idents here").arg(cap));
+                        return;
+                    }
+                }
+                for (Panel* p : targetPanels()) {
+                    (p->app.idents.*array)[i] = checked;
+                    p->canvas->refreshIdentLayout();
+                }
+            });
+        }
+    };
+    buildCappedSubmenu(menu, "Display at Top", &IdentSettings::topEnabled, 4);
+    buildCappedSubmenu(menu, "Display at Bottom", &IdentSettings::bottomEnabled, 2);
+
+    // Ident Plot / each overlay-line color: single-select-or-none --
+    // an ExclusiveOptional QActionGroup (same policy already used for
+    // Pan/Box Select) makes clicking the checked entry again clear it.
+    auto buildPickerSubmenu = [this, &menu](QMenu& parent, const QString& title, int IdentSettings::*field) {
+        QMenu* sub = parent.addMenu(title);
+        QActionGroup* group = new QActionGroup(&menu);
+        group->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
+        for (int i = 0; i < kIdentFieldCount; ++i) {
+            QAction* a = sub->addAction(identFieldLabel(IdentField(i)));
+            a->setCheckable(true);
+            a->setChecked(app_->idents.*field == i);
+            a->setActionGroup(group);
+            connect(a, &QAction::triggered, this, [this, field, i](bool checked) {
+                for (Panel* p : targetPanels()) {
+                    p->app.idents.*field = checked ? i : -1;
+                    p->canvas->refreshIdentLayout();
+                }
+            });
+        }
+    };
+    buildPickerSubmenu(menu, "Ident Plot", &IdentSettings::plotField);
+    QMenu* seismicMenu = menu.addMenu("Display on Seismic");
+    buildPickerSubmenu(*seismicMenu, "Line Cyan", &IdentSettings::overlayCyanField);
+    buildPickerSubmenu(*seismicMenu, "Line Red", &IdentSettings::overlayRedField);
+
+}
+
 void MainWindow::loadPreferences() {
     QSettings settings(preferencesFilePath(), QSettings::IniFormat);
     prefs_.toolbarPosition =
@@ -4386,6 +4610,8 @@ void MainWindow::loadPreferences() {
     if (labelPosition >= int(DatasetLabelPosition::TopLeft) && labelPosition <= int(DatasetLabelPosition::Off)) {
         datasetLabelPosition_ = DatasetLabelPosition(labelPosition);
     }
+    hiddenToolbarItems_ = settings.value("toolbarHiddenItems").toStringList();
+    hiddenToolbarItems_.removeAll(QString()); // an empty list can read back as {""}
 }
 
 void MainWindow::savePreferences() {
@@ -4394,6 +4620,7 @@ void MainWindow::savePreferences() {
     settings.setValue("drawerPosition", int(prefs_.drawerPosition));
     settings.setValue("uiScalePercent", prefs_.uiScalePercent);
     settings.setValue("datasetLabelPosition", int(datasetLabelPosition_));
+    settings.setValue("toolbarHiddenItems", hiddenToolbarItems_);
 }
 
 void MainWindow::applyDatasetLabelPosition(DatasetLabelPosition position) {
@@ -4413,21 +4640,17 @@ void MainWindow::applyToolbarPosition(ToolbarPosition position) {
     // A toolbar already added to the window just moves when re-added to a
     // different area -- no need to remove it first.
     addToolBar(area, toolbar_);
-    // Swap the Gain controls for whichever pair fits this position -- driven
-    // directly by the enum rather than QToolBar::orientation()/
+    // The Gain controls are swapped for whichever pair fits this position
+    // (slider horizontal, +/- arrows vertical) by applyToolbarCustomization()
+    // at the end of this function, via isToolbarActionWanted() -- driven
+    // directly by the ToolbarPosition enum (prefs_.toolbarPosition, which
+    // every caller passes as `position`) rather than QToolBar::orientation()/
     // orientationChanged, which don't reliably flip to Qt::Vertical purely
     // from this addToolBar(area, ...) call (observed: both pairs staying
-    // visible at once on Windows).
-    bool vertical = position == ToolbarPosition::Left || position == ToolbarPosition::Right;
-    // Toggling the *action*'s visibility, not just the embedded widget's --
-    // QToolBar re-shows a widget added via addWidget() on its next layout
-    // pass as long as the QWidgetAction wrapping it is still visible, which
-    // silently undid a plain gainSlider_->setVisible(false) here (the
-    // slider kept reappearing after addToolBar() above triggered exactly
-    // that relayout).
-    gainSliderAction_->setVisible(!vertical);
-    gainUpAction_->setVisible(vertical);
-    gainDownAction_->setVisible(vertical);
+    // visible at once on Windows). It toggles the *action*'s visibility,
+    // not just the embedded widget's -- QToolBar re-shows a widget added via
+    // addWidget() on its next layout pass as long as the QWidgetAction
+    // wrapping it is still visible.
     // gainValueLabel_ (the dB readout) is the one gain control shown in
     // both orientations -- see its construction, above. Its fixed width is
     // (re)computed here, not at construction time, against
@@ -4452,7 +4675,7 @@ void MainWindow::applyToolbarPosition(ToolbarPosition position) {
         prefs_.drawerPosition = DrawerPosition::Left;
     }
     applyDrawerPosition(prefs_.drawerPosition);
-    updateToolbarOverflow();
+    applyToolbarCustomization(); // also re-runs updateToolbarOverflow()
 }
 
 void MainWindow::resizeEvent(QResizeEvent* event) {
@@ -4509,7 +4732,7 @@ void MainWindow::updateToolbarOverflow() {
     // effect when truly idle) well past the real budget, so it measured
     // as "doesn't fit" even on a window tall enough to fit every
     // candidate comfortably without the spacer in the way.
-    for (QAction* action : toolbarOverflowCandidates_) setActionVisible(action, true);
+    for (QAction* action : toolbarOverflowCandidates_) setActionVisible(action, isToolbarActionWanted(action));
     if (toolbarSpacerAction_) setActionVisible(toolbarSpacerAction_, false);
     if (toolbar_->layout()) toolbar_->layout()->activate();
 
@@ -4518,7 +4741,14 @@ void MainWindow::updateToolbarOverflow() {
     // its widget's geometry is always real/laid-out -- used as a
     // same-style reference size/offset for the manually-positioned More
     // button below, rather than guessing fixed pixel values.
-    QWidget* refWidget = toolbar_->widgetForAction(zoomAction_);
+    // (Or the first *shown* candidate, now that Zoom itself can be
+    // removed from the toolbar.)
+    QWidget* refWidget = nullptr;
+    for (QAction* action : toolbarOverflowCandidates_) {
+        if (!isToolbarActionWanted(action)) continue;
+        refWidget = toolbar_->widgetForAction(action);
+        if (refWidget) break;
+    }
     QRect refGeom = refWidget ? refWidget->geometry() : QRect(4, 4, 45, 37);
     int moreLength = vertical ? refGeom.height() : refGeom.width();
     int budget = std::max(0, limit - moreLength);
@@ -4526,6 +4756,7 @@ void MainWindow::updateToolbarOverflow() {
     bool anyHidden = false;
     int hiddenCount = 0;
     for (QAction* action : toolbarOverflowCandidates_) {
+        if (!isToolbarActionWanted(action)) continue; // already hidden above, not overflow
         QWidget* w = toolbar_->widgetForAction(action);
         if (!w) continue;
         QRect g = w->geometry();
@@ -4578,6 +4809,21 @@ void MainWindow::updateToolbarOverflow() {
 
 void MainWindow::applyDrawerPosition(DrawerPosition position) {
     addDockWidget(position == DrawerPosition::Left ? Qt::LeftDockWidgetArea : Qt::RightDockWidgetArea, dock_);
+}
+
+void MainWindow::setSplitOrientation(Qt::Orientation orientation) {
+    splitter_->setOrientation(orientation);
+    resetSplitToHalf();
+    // Depict the actual divider orientation -- a vertical (top/bottom)
+    // split shows a horizontal-divider icon, not the vertical-divider
+    // default.
+    splitViewAction_->setIcon(orientation == Qt::Horizontal ? iconLayoutColumns() : iconLayoutRows());
+}
+
+void MainWindow::promptForGainDb() {
+    bool ok = false;
+    double value = QInputDialog::getDouble(this, "Set Gain", "Gain (dB):", app_->display.gainDb, -6.0, 24.0, 1, &ok);
+    if (ok) setGainDb(value);
 }
 
 void MainWindow::resetSplitToHalf() {

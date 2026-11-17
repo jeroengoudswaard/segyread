@@ -10,6 +10,7 @@
 #include <QDialog>
 #include <QImage>
 #include <QMainWindow>
+#include <QStringList>
 #include <QWidget>
 
 #include <atomic>
@@ -1291,6 +1292,48 @@ private:
     // sums (see toolbarMoreButton_'s comment for why that didn't work).
     std::vector<QAction*> toolbarOverflowCandidates_;
     void updateToolbarOverflow();
+
+    // Customizable toolbar (COPILOT.md item 1): every toolbar button is one
+    // ToolbarItem the user can show or hide -- right-click the toolbar, or
+    // View > Toolbar. "Gain" is a single item covering all four of its
+    // widgets (slider, +/- arrows, value label), since only some of them
+    // are ever shown at once anyway (see applyToolbarPosition). Hidden item
+    // ids persist to $HOME/.segyread_settings ("toolbarHiddenItems").
+    // Every item's function is also reachable from a menu, so hiding a
+    // button never makes a feature unreachable -- see addMenuMirror.
+    struct ToolbarItem {
+        QString id;    // stable persisted key -- never rename once shipped
+        QString label; // shown in the customize menus
+        int group;     // separator group, 0..kToolbarSeparatorGroups (last = after the spacer)
+        std::vector<QAction*> actions;
+    };
+    std::vector<ToolbarItem> toolbarItems_;
+    // toolbarSeparators_[g] sits between group g and group g+1; shown only
+    // while group g and some later (pre-spacer) group both have a shown
+    // item, so hiding a whole group never leaves doubled/dangling dividers.
+    std::vector<QAction*> toolbarSeparators_;
+    QStringList hiddenToolbarItems_;
+    QAction* gainValueLabelAction_ = nullptr;
+    // False if `action` belongs to a user-hidden item, or is the gain
+    // control for the other toolbar orientation (slider: horizontal only;
+    // +/- arrows: vertical only). updateToolbarOverflow() only measures/
+    // shows wanted actions, and its More menu never lists unwanted ones.
+    bool isToolbarActionWanted(QAction* action) const;
+    void applyToolbarCustomization();
+    void setToolbarItemShown(const QString& id, bool shown);
+    void populateToolbarCustomizeMenu(QMenu* menu);
+    // A menu entry that triggers `source` (a toolbar action) and tracks its
+    // enabled/checked state. A separate QAction rather than `source`
+    // itself added to the menu: QAction visibility is shared by every
+    // widget showing it, and the toolbar hides its actions for both
+    // overflow and customization -- which must not hide the menu entries.
+    QAction* addMenuMirror(QMenu* menu, QAction* source, const QString& text = QString(), QAction* before = nullptr);
+    // Shared by the Idents toolbar button's popup and View > Idents.
+    void populateIdentsMenu(QMenu& menu);
+    // Shared by the gain value label's right-click and View > Gain.
+    void promptForGainDb();
+    // Shared by the Split View button's right-click and View > Split Layout.
+    void setSplitOrientation(Qt::Orientation orientation);
     // Forces splitter_ to an even 50/50 split along its current
     // orientation -- see splitViewAction_'s triggered handler and its
     // right-click menu.
