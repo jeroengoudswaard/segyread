@@ -594,6 +594,26 @@ void testColorScalesEndpointsAndZero() {
     segy::applyColorScale(segy::ColorScale::YellowRedWhiteBlackCyan, 1.0f, &b, &g, &r);
     CHECK(r == 0 && g == 255 && b == 255); // cyan
 
+    // Rainbow runs from violet through green to red.
+    segy::applyColorScale(segy::ColorScale::Rainbow, -1.0f, &b, &g, &r);
+    CHECK(r == 128 && g == 0 && b == 255);
+    segy::applyColorScale(segy::ColorScale::Rainbow, 0.0f, &b, &g, &r);
+    CHECK(r == 0 && g == 255 && b == 0);
+    segy::applyColorScale(segy::ColorScale::Rainbow, 1.0f, &b, &g, &r);
+    CHECK(r == 255 && g == 0 && b == 0);
+
+    // Red-yellow-green can be flipped without changing the original palette.
+    segy::applyColorScale(segy::ColorScale::RedYellowGreen, -1.0f, &b, &g, &r);
+    CHECK(r == 255 && g == 0 && b == 0);
+    segy::applyColorScale(segy::ColorScale::RedYellowGreen, 0.0f, &b, &g, &r);
+    CHECK(r == 255 && g == 255 && b == 0);
+    segy::applyColorScale(segy::ColorScale::RedYellowGreen, 1.0f, &b, &g, &r);
+    CHECK(r == 0 && g == 255 && b == 0);
+    segy::applyColorScale(segy::ColorScale::RedYellowGreen, -1.0f, &b, &g, &r, true);
+    CHECK(r == 0 && g == 255 && b == 0);
+    segy::applyColorScale(segy::ColorScale::RedYellowGreen, 1.0f, &b, &g, &r, true);
+    CHECK(r == 255 && g == 0 && b == 0);
+
     // Out-of-range input clamps rather than extrapolating/undefined-behaving.
     segy::applyColorScale(segy::ColorScale::RedWhiteBlue, 5.0f, &b, &g, &r);
     CHECK(r == 255 && g == 0 && b == 0);

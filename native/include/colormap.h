@@ -106,6 +106,31 @@ inline void yellowRedWhiteBlackCyanColormap(float t, uint8_t* outB, uint8_t* out
     multiStopColormap(t, kStops, 5, outB, outG, outR);
 }
 
+// Violet -> blue -> cyan -> green -> yellow -> orange -> red.
+inline void rainbowColormap(float t, uint8_t* outB, uint8_t* outG, uint8_t* outR) {
+    static const float kStops[7][3] = {
+        {0.5f, 0.0f, 1.0f}, // violet
+        {0.0f, 0.0f, 1.0f}, // blue
+        {0.0f, 1.0f, 1.0f}, // cyan
+        {0.0f, 1.0f, 0.0f}, // green
+        {1.0f, 1.0f, 0.0f}, // yellow
+        {1.0f, 0.5f, 0.0f}, // orange
+        {1.0f, 0.0f, 0.0f}, // red
+    };
+    multiStopColormap(t, kStops, 7, outB, outG, outR);
+}
+
+// Red (low end) -> yellow -> green (high end). For a nonnegative spectrum
+// magnitude, map zero to t=+1 and the maximum to t=-1.
+inline void redYellowGreenColormap(float t, uint8_t* outB, uint8_t* outG, uint8_t* outR) {
+    static const float kStops[3][3] = {
+        {1.0f, 0.0f, 0.0f}, // red
+        {1.0f, 1.0f, 0.0f}, // yellow
+        {0.0f, 1.0f, 0.0f}, // green
+    };
+    multiStopColormap(t, kStops, 3, outB, outG, outR);
+}
+
 // AppState::display.colorScale (chrome.h's DisplaySettings) -- read fresh
 // every frame, same convention as every other display toggle, so switching
 // it just needs a repaint, not a re-render pipeline change.
@@ -115,14 +140,20 @@ enum class ColorScale {
     GrayscaleWhiteToBlack,
     GrayscaleBlackToWhite,
     YellowRedWhiteBlackCyan,
+    Rainbow,
+    RedYellowGreen,
 };
 
-inline void applyColorScale(ColorScale scale, float t, uint8_t* outB, uint8_t* outG, uint8_t* outR) {
+inline void applyColorScale(ColorScale scale, float t, uint8_t* outB, uint8_t* outG, uint8_t* outR,
+                            bool flipped = false) {
+    if (flipped) t = -t;
     switch (scale) {
         case ColorScale::RedWhiteBlack: redWhiteBlackColormap(t, outB, outG, outR); return;
         case ColorScale::GrayscaleWhiteToBlack: grayscaleWhiteToBlackColormap(t, outB, outG, outR); return;
         case ColorScale::GrayscaleBlackToWhite: grayscaleBlackToWhiteColormap(t, outB, outG, outR); return;
         case ColorScale::YellowRedWhiteBlackCyan: yellowRedWhiteBlackCyanColormap(t, outB, outG, outR); return;
+        case ColorScale::Rainbow: rainbowColormap(t, outB, outG, outR); return;
+        case ColorScale::RedYellowGreen: redYellowGreenColormap(t, outB, outG, outR); return;
         case ColorScale::RedWhiteBlue: default: divergingColormap(t, outB, outG, outR); return;
     }
 }

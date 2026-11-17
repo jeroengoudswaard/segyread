@@ -57,6 +57,7 @@
 #include <QStringList>
 #include <QTableWidget>
 #include <QToolButton>
+#include <QWidgetAction>
 #include <QTimer>
 #include <QtGlobal>
 #include <QToolBar>
@@ -410,7 +411,7 @@ std::filesystem::path scratchSegyPath(const QString& outputName) {
 // magnitude since amplitude varies wildly band-to-band. `Format_RGB32` packs
 // 0x00RRGGBB, matching renderFrame()'s own convention.
 QImage rasterizeOctaveBand(const std::vector<std::vector<float>>& traces, int width, int height,
-                            segy::ColorScale colorScale) {
+                            segy::ColorScale colorScale, bool colorScaleFlipped) {
     QImage img(width, height, QImage::Format_RGB32);
     if (traces.empty() || traces[0].empty()) {
         img.fill(Qt::white);
@@ -421,6 +422,7 @@ QImage rasterizeOctaveBand(const std::vector<std::vector<float>>& traces, int wi
         for (float v : tr) clip = std::max(clip, std::fabs(v));
     }
     int samplesPerTrace = int(traces[0].size());
+    const float colorScaleDirection = colorScaleFlipped ? -1.0f : 1.0f;
     for (int y = 0; y < height; ++y) {
         int s = std::clamp(int((double(y) + 0.5) / height * samplesPerTrace), 0, samplesPerTrace - 1);
         uint32_t* row = reinterpret_cast<uint32_t*>(img.scanLine(y));
@@ -428,12 +430,194 @@ QImage rasterizeOctaveBand(const std::vector<std::vector<float>>& traces, int wi
             int t = std::clamp(int((double(x) + 0.5) / width * traces.size()), 0, int(traces.size()) - 1);
             float value = traces[size_t(t)][size_t(s)];
             uint8_t r, g, b;
-            segy::applyColorScale(colorScale, value / clip, &b, &g, &r);
+            segy::applyColorScale(colorScale, (value / clip) * colorScaleDirection, &b, &g, &r);
             row[x] = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
         }
     }
     return img;
 }
+
+QIcon colorScalePreviewIcon(segy::ColorScale scale, bool flipped) {
+    constexpr int kWidth = 96;
+    constexpr int kHeight = 16;
+    QPixmap pixmap(kWidth, kHeight);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    const float direction = flipped ? -1.0f : 1.0f;
+    for (int x = 0; x < kWidth; ++x) {
+        float t = (2.0f * float(x) / float(kWidth - 1) - 1.0f) * direction;
+        uint8_t r, g, b;
+        segy::applyColorScale(scale, t, &b, &g, &r);
+        painter.setPen(QColor(r, g, b));
+        painter.drawLine(x, 0, x, kHeight - 1);
+    }
+    painter.setPen(QColor(0x66, 0x68, 0x6d));
+    painter.drawRect(0, 0, kWidth - 1, kHeight - 1);
+    return QIcon(pixmap);
+}
+
+class OctaveBandCrosshairOverlay : public QWidget {
+public:
+    explicit OctaveBandCrosshairOverlay(QWidget* parent = nullptr) : QWidget(parent) {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_NoSystemBackground);
+        setAttribute(Qt::WA_TranslucentBackground);
+    }
+
+    void setCrosshair(double x, double y, bool visible) {
+        crosshairX_ = x;
+        crosshairY_ = y;
+        crosshairVisible_ = visible;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        if (!crosshairVisible_) return;
+        QPainter painter(this);
+        const int x = int(crosshairX_ * width());
+        const int y = int(crosshairY_ * height());
+        painter.setPen(QPen(QColor(0, 0, 0, 190), 3));
+        painter.drawLine(x, 0, x, height() - 1);
+        painter.drawLine(0, y, width() - 1, y);
+        painter.setPen(QPen(Qt::white, 1, Qt::DashLine));
+        painter.drawLine(x, 0, x, height() - 1);
+        painter.drawLine(0, y, width() - 1, y);
+    }
+
+private:
+    double crosshairX_ = 0.5;
+    double crosshairY_ = 0.5;
+    bool crosshairVisible_ = false;
+};
+
+class OctaveBandPlotWidget : public QWidget {
+public:
+    explicit OctaveBandPlotWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setMinimumSize(150, 200);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        setMouseTracking(true);
+        crosshairOverlay_ = new OctaveBandCrosshairOverlay(this);
+    }
+
+    void setImage(const QImage& image) {
+        image_ = image;
+        rebuildScaledImage();
+        update();
+    }
+
+    void setAxisRange(double traceStart, double traceEnd, int sampleStart, int sampleEnd, double sampleIntervalUs) {
+        traceStart_ = traceStart;
+        traceEnd_ = traceEnd;
+        sampleStart_ = sampleStart;
+        sampleEnd_ = sampleEnd;
+        sampleIntervalUs_ = sampleIntervalUs;
+        update();
+    }
+
+    void setCrosshair(double x, double y, bool visible) { crosshairOverlay_->setCrosshair(x, y, visible); }
+
+    void setMouseCallbacks(std::function<void(double, double)> onMoved, std::function<void()> onLeft) {
+        onMoved_ = std::move(onMoved);
+        onLeft_ = std::move(onLeft);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
+        QRect plot = plotRect();
+        if (plot.width() <= 0 || plot.height() <= 0) return;
+        if (!scaledImage_.isNull()) painter.drawImage(plot, scaledImage_);
+
+        painter.setPen(QColor(0x9a, 0x9c, 0xa3));
+        painter.drawLine(plot.topLeft(), plot.bottomLeft());
+        painter.drawLine(plot.bottomLeft(), plot.bottomRight());
+        painter.setPen(QColor(0xe0, 0xe2, 0xe7));
+        QFont axisFont = painter.font();
+        axisFont.setPixelSize(8);
+        painter.setFont(axisFont);
+        auto formatTimeTick = [](double timeMs) {
+            double magnitude = std::abs(timeMs);
+            if (magnitude > 99999.0) return QString::number(timeMs, 'g', 3);
+            int decimals = magnitude < 0.01 ? 4 : magnitude < 0.1 ? 3 : magnitude < 10.0 ? 2 : magnitude < 100.0 ? 1 : 0;
+            return QString::number(timeMs, 'f', decimals);
+        };
+        for (int i = 0; i <= 2; ++i) {
+            double fraction = double(i) / 2.0;
+            int x = plot.left() + int(std::round(fraction * (plot.width() - 1)));
+            int y = plot.top() + int(std::round(fraction * (plot.height() - 1)));
+            double trace = traceStart_ + fraction * (traceEnd_ - traceStart_);
+            double sample = sampleStart_ + fraction * (sampleEnd_ - sampleStart_);
+            double timeMs = sample * sampleIntervalUs_ / 1000.0;
+            painter.drawLine(x, plot.bottom(), x, plot.bottom() + 4);
+            if (i == 0) {
+                painter.drawText(QRect(plot.left(), plot.bottom() + 3, 48, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                                 QString::number(std::round(trace), 'g', 4));
+            } else if (i == 2) {
+                painter.drawText(QRect(plot.right() - 47, plot.bottom() + 3, 48, 15),
+                                 Qt::AlignRight | Qt::AlignVCenter, QString::number(std::round(trace), 'g', 4));
+            }
+            painter.drawLine(plot.left() - 4, y, plot.left(), y);
+            painter.save();
+            painter.translate(plot.left() - 12, y);
+            painter.rotate(-90);
+            painter.drawText(QRect(-24, -8, 48, 16), Qt::AlignCenter, formatTimeTick(timeMs));
+            painter.restore();
+        }
+        painter.setFont(font());
+        painter.drawText(QRect(plot.left(), plot.bottom() + 18, plot.width(), 16), Qt::AlignCenter, "Trace");
+        painter.save();
+        painter.translate(10, plot.center().y());
+        painter.rotate(-90);
+        painter.drawText(QRect(-plot.height() / 2, -9, plot.height(), 18), Qt::AlignCenter, "Time (ms)");
+        painter.restore();
+    }
+
+    void resizeEvent(QResizeEvent* event) override {
+        QWidget::resizeEvent(event);
+        rebuildScaledImage();
+        crosshairOverlay_->setGeometry(plotRect());
+        crosshairOverlay_->raise();
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (onMoved_) {
+            QRect plot = plotRect();
+            double x = std::clamp(double(event->pos().x() - plot.left()) / std::max(1, plot.width()), 0.0, 1.0);
+            double y = std::clamp(double(event->pos().y() - plot.top()) / std::max(1, plot.height()), 0.0, 1.0);
+            onMoved_(x, y);
+        }
+    }
+
+    void leaveEvent(QEvent* event) override {
+        if (onLeft_) onLeft_();
+        QWidget::leaveEvent(event);
+    }
+
+private:
+    QImage image_;
+    QImage scaledImage_;
+    OctaveBandCrosshairOverlay* crosshairOverlay_ = nullptr;
+    double traceStart_ = 0.0;
+    double traceEnd_ = 0.0;
+    int sampleStart_ = 0;
+    int sampleEnd_ = 0;
+    double sampleIntervalUs_ = 0.0;
+    std::function<void(double, double)> onMoved_;
+    std::function<void()> onLeft_;
+
+    QRect plotRect() const { return rect().adjusted(42, 24, -6, -38); }
+
+    void rebuildScaledImage() {
+        QSize size = plotRect().size();
+        if (!image_.isNull() && size.width() > 0 && size.height() > 0) {
+            scaledImage_ = image_.scaled(size, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+        } else {
+            scaledImage_ = QImage();
+        }
+    }
+};
 
 } // namespace
 
@@ -445,8 +629,9 @@ void AmplitudeScaleWidget::setClipRange(float posClip, float negClip) {
     update();
 }
 
-void AmplitudeScaleWidget::setColorScale(segy::ColorScale scale) {
+void AmplitudeScaleWidget::setColorScale(segy::ColorScale scale, bool flipped) {
     colorScale_ = scale;
+    colorScaleFlipped_ = flipped;
     update();
 }
 
@@ -483,20 +668,21 @@ void AmplitudeScaleWidget::paintEvent(QPaintEvent*) {
     // at whatever fraction posClip_/(posClip_+negClip_) actually is.
     float totalClip = posClip_ + negClip_;
     float zeroFrac = totalClip > 0.0f ? posClip_ / totalClip : 0.5f; // 0 sits this far down from the top
+    const float colorScaleDirection = colorScaleFlipped_ ? -1.0f : 1.0f;
     QLinearGradient gradient(0, barY, 0, barY + barH);
     constexpr int kStopsPerHalf = 8;
     for (int i = 0; i <= kStopsPerHalf; ++i) {
         float frac = float(i) / float(kStopsPerHalf);  // 0 (top of this half) .. 1 (zero line)
         float t = 1.0f - frac;                          // +1 (top) .. 0 (zero line), for the positive half
         uint8_t r, g, b;
-        segy::applyColorScale(colorScale_, t, &b, &g, &r);
+        segy::applyColorScale(colorScale_, t * colorScaleDirection, &b, &g, &r);
         gradient.setColorAt(double(frac) * zeroFrac, QColor(r, g, b));
     }
     for (int i = 0; i <= kStopsPerHalf; ++i) {
         float frac = float(i) / float(kStopsPerHalf);  // 0 (zero line) .. 1 (bottom of this half)
         float t = -frac;                                // 0 (zero line) .. -1 (bottom), for the negative half
         uint8_t r, g, b;
-        segy::applyColorScale(colorScale_, t, &b, &g, &r);
+        segy::applyColorScale(colorScale_, t * colorScaleDirection, &b, &g, &r);
         gradient.setColorAt(double(zeroFrac) + double(frac) * (1.0 - zeroFrac), QColor(r, g, b));
     }
     painter.fillRect(QRectF(barX, barY, barW, barH), gradient);
@@ -1505,24 +1691,47 @@ void OctaveBandDialog::setSourcePanel(int panelIndex) {
 
 void OctaveBandDialog::setResult(const OctaveBandResult& result) {
     QLayout* oldLayout = bandsRow_->layout();
+    bandCrosshairUpdaters_.clear();
+    if (oldLayout) {
+        while (QLayoutItem* item = oldLayout->takeAt(0)) {
+            delete item->widget();
+            delete item;
+        }
+        delete oldLayout;
+    }
     QHBoxLayout* bandsLayout = new QHBoxLayout();
     bandsLayout->setSpacing(0);
     bandsLayout->setContentsMargins(0, 0, 0, 0);
     for (const OctaveBandResult::Band& band : result.bands) {
         QWidget* col = new QWidget();
+        col->setMinimumWidth(140);
+        col->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         col->setStyleSheet("border-right: 1px solid #3c3f41;");
         QVBoxLayout* colLayout = new QVBoxLayout(col);
         colLayout->setContentsMargins(4, 4, 4, 4);
         QLabel* labelWidget = new QLabel(band.label);
         labelWidget->setAlignment(Qt::AlignCenter);
-        labelWidget->setStyleSheet("font-size: 11px;");
+        labelWidget->setStyleSheet(
+            "QLabel { color: #f0f2f5; background-color: #303238; font-size: 12px; font-weight: bold; padding: 2px; "
+            "border: none; }");
         colLayout->addWidget(labelWidget);
-        QLabel* imageWidget = new QLabel();
-        imageWidget->setPixmap(QPixmap::fromImage(band.image));
-        colLayout->addWidget(imageWidget);
+        OctaveBandPlotWidget* plotWidget = new OctaveBandPlotWidget();
+        plotWidget->setImage(band.image);
+        plotWidget->setAxisRange(result.traceStart, result.traceEnd, result.sampleStart, result.sampleEnd,
+                                result.sampleIntervalUs);
+        bandCrosshairUpdaters_.push_back([plotWidget](double x, double y, bool visible) {
+            plotWidget->setCrosshair(x, y, visible);
+        });
+        plotWidget->setMouseCallbacks(
+            [this](double x, double y) {
+                for (const auto& updateCrosshair : bandCrosshairUpdaters_) updateCrosshair(x, y, true);
+            },
+            [this]() {
+                for (const auto& updateCrosshair : bandCrosshairUpdaters_) updateCrosshair(0.0, 0.0, false);
+            });
+        colLayout->addWidget(plotWidget, 1);
         bandsLayout->addWidget(col);
     }
-    delete oldLayout;
     bandsRow_->setLayout(bandsLayout);
 }
 
@@ -1955,6 +2164,12 @@ void DatasetSlotWidget::setLabel(const QString& label) {
 
 void DatasetSlotWidget::setDatasetName(const QString& name) {
     datasetName_ = name;
+    update();
+}
+
+void DatasetSlotWidget::setSlotWidth(int width) {
+    setFixedWidth(std::max(24, width));
+    pickButton_->move(this->width() - 22, 14);
     update();
 }
 
@@ -2422,6 +2637,7 @@ SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(a
     amplitudeScale_->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(amplitudeScale_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
         QMenu menu(amplitudeScale_);
+        menu.setToolTipsVisible(true);
         struct Entry {
             const char* label;
             segy::ColorScale scale;
@@ -2432,19 +2648,40 @@ SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(a
             {"Grayscale (White to Black)", segy::ColorScale::GrayscaleWhiteToBlack},
             {"Grayscale (Black to White)", segy::ColorScale::GrayscaleBlackToWhite},
             {"Yellow - Red - White - Black - Cyan", segy::ColorScale::YellowRedWhiteBlackCyan},
+            {"Rainbow", segy::ColorScale::Rainbow},
+            {"Red - Yellow - Green", segy::ColorScale::RedYellowGreen},
         };
         QActionGroup* group = new QActionGroup(&menu);
         for (const Entry& entry : kEntries) {
-            QAction* action = menu.addAction(entry.label);
+            QWidgetAction* action = new QWidgetAction(&menu);
+            action->setText(entry.label);
+            action->setToolTip(entry.label);
+            action->setIcon(colorScalePreviewIcon(entry.scale, app_.display.colorScaleFlipped));
             action->setCheckable(true);
             action->setChecked(app_.display.colorScale == entry.scale);
             action->setActionGroup(group);
+            QToolButton* preview = new QToolButton(&menu);
+            preview->setToolButtonStyle(Qt::ToolButtonIconOnly);
+            preview->setIconSize(QSize(96, 16));
+            action->setDefaultWidget(preview);
+            preview->setDefaultAction(action);
+            menu.addAction(action);
             connect(action, &QAction::triggered, this, [this, scale = entry.scale]() {
                 app_.display.colorScale = scale;
-                amplitudeScale_->setColorScale(scale);
+                amplitudeScale_->setColorScale(scale, app_.display.colorScaleFlipped);
                 update();
             });
         }
+
+        menu.addSeparator();
+        QAction* flipColorMapAction = menu.addAction("Flip Color Map");
+        flipColorMapAction->setCheckable(true);
+        flipColorMapAction->setChecked(app_.display.colorScaleFlipped);
+        connect(flipColorMapAction, &QAction::triggered, this, [this](bool flipped) {
+            app_.display.colorScaleFlipped = flipped;
+            amplitudeScale_->setColorScale(app_.display.colorScale, flipped);
+            update();
+        });
 
         menu.addSeparator();
         QAction* clipAction = menu.addAction("Clip...");
@@ -2477,15 +2714,22 @@ SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(a
     backgroundSlot_->setPickCallback([this]() { if (onDatasetSlotPick_) onDatasetSlotPick_(false); });
 }
 
-void SegyCanvas::setAmplitudeScale(float posClip, float negClip, bool visible, segy::ColorScale colorScale) {
+void SegyCanvas::setAmplitudeScale(float posClip, float negClip, bool visible, segy::ColorScale colorScale,
+                                    bool colorScaleFlipped) {
     amplitudeScale_->setClipRange(posClip, negClip);
-    amplitudeScale_->setColorScale(colorScale);
+    amplitudeScale_->setColorScale(colorScale, colorScaleFlipped);
     amplitudeScale_->setVisible(visible);
 }
 
 void SegyCanvas::setDatasetSlotLabels(const QString& foregroundLabel, const QString& backgroundLabel) {
     foregroundSlot_->setLabel(foregroundLabel);
     backgroundSlot_->setLabel(backgroundLabel);
+    repositionDatasetSlots();
+}
+
+void SegyCanvas::setDatasetLabelPosition(DatasetLabelPosition position) {
+    datasetLabelPosition_ = position;
+    repositionDatasetSlots();
 }
 
 void SegyCanvas::setDatasetSlotPickCallback(std::function<void(bool)> callback) {
@@ -2530,22 +2774,36 @@ void SegyCanvas::repositionAmplitudeScale() {
 }
 
 void SegyCanvas::repositionDatasetSlots() {
-    // Flush with the plot's own left axis (lastPlotX_), not the widget's
-    // own left edge -- see native/README.md: in split view this is what
-    // makes panel 2's boxes line up near the screen's middle (where its
-    // own plot begins) rather than at the window's actual left edge.
-    // lastPlotX_ is only meaningful after the first paint; it defaults to
-    // 0, which still places the boxes at a reasonable spot before then.
-    // y tracks the image's actual top edge (kCanvasMargin, plus whatever
-    // idents' top rows/plot currently reserve) rather than a fixed 2px, so
-    // the boxes stay pinned the same 14px above the image as idents grow
-    // the inset -- 14 = kCanvasMargin(16) - the original fixed y(2), i.e.
-    // this reduces to the exact original position when no idents are
-    // enabled (identInsets().top == 0) -- see native/README.md, "Idents."
-    int x = kCanvasMargin + lastPlotX_;
-    int y = (kCanvasMargin + identInsets().top) - (kCanvasMargin - 2);
+    if (datasetLabelPosition_ == DatasetLabelPosition::Off) {
+        foregroundSlot_->hide();
+        backgroundSlot_->hide();
+        return;
+    }
+
+    int plotLeft = kCanvasMargin + lastPlotX_;
+    int plotRight = plotLeft + lastPlotWidth_;
+    int plotTop = kCanvasMargin + identInsets().top;
+    int plotBottom = height() - kCanvasMargin - identInsets().bottom;
+    int availableWidth = std::max(0, width() - 2 * kCanvasMargin - 4);
+    int slotWidth = std::min(160, availableWidth / 2);
+    foregroundSlot_->setSlotWidth(slotWidth);
+    backgroundSlot_->setSlotWidth(slotWidth);
+    int groupWidth = foregroundSlot_->width() + 4 + backgroundSlot_->width();
+    int groupHeight = std::max(foregroundSlot_->height(), backgroundSlot_->height());
+    bool right = datasetLabelPosition_ == DatasetLabelPosition::TopRight ||
+                 datasetLabelPosition_ == DatasetLabelPosition::BottomRight;
+    bool bottom = datasetLabelPosition_ == DatasetLabelPosition::BottomLeft ||
+                  datasetLabelPosition_ == DatasetLabelPosition::BottomRight;
+    int x = right ? plotRight - groupWidth - 4 : plotLeft + 4;
+    int y = bottom ? plotBottom - groupHeight - 4 : plotTop + 4;
+    x = std::clamp(x, kCanvasMargin, std::max(kCanvasMargin, width() - groupWidth - kCanvasMargin));
+    y = std::clamp(y, kCanvasMargin, std::max(kCanvasMargin, height() - groupHeight - kCanvasMargin));
     foregroundSlot_->move(x, y);
     backgroundSlot_->move(x + foregroundSlot_->width() + 4, y);
+    foregroundSlot_->show();
+    backgroundSlot_->show();
+    foregroundSlot_->raise();
+    backgroundSlot_->raise();
 }
 
 void SegyCanvas::resizeEvent(QResizeEvent* event) {
@@ -3027,14 +3285,14 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         segy::ChromeLayout chrome = segy::renderFrameWithChrome(
             makeRenderContext(), app_.view, canvasDisplay, metrics, app_.pixels.data(), insetWidth, insetHeight);
         app_.lastRenderMs = chrome.lastRenderMs;
-        bool plotXChanged = lastPlotX_ != chrome.plotX;
+        bool plotGeometryChanged = lastPlotX_ != chrome.plotX || lastPlotWidth_ != chrome.plotWidth;
         lastPlotX_ = chrome.plotX;
         lastPlotWidth_ = chrome.plotWidth;
         // The time scale/color bar toggling (not just a resize) can move
         // the plot's left edge -- keep the dataset boxes flush with it
         // either way. Calling this mid-paintEvent is safe: it only moves
         // child widgets, it doesn't trigger a synchronous repaint of them.
-        if (plotXChanged) repositionDatasetSlots();
+        if (plotGeometryChanged) repositionDatasetSlots();
 
         if (app_.display.flipHorizontal && chrome.plotWidth > 0) {
             // Mirrors the already-rendered plot columns left-right in place
@@ -3535,6 +3793,31 @@ MainWindow::MainWindow() : QMainWindow() {
     viewMenu->addSeparator();
     viewMenu->addAction("&Fit to Window");
     viewMenu->addSeparator();
+
+    QMenu* datasetLabelsMenu = viewMenu->addMenu("Dataset Labels");
+    QActionGroup* datasetLabelsGroup = new QActionGroup(this);
+    const std::pair<const char*, DatasetLabelPosition> labelPositions[] = {
+        {"Top Left", DatasetLabelPosition::TopLeft},
+        {"Bottom Left", DatasetLabelPosition::BottomLeft},
+        {"Top Right", DatasetLabelPosition::TopRight},
+        {"Bottom Right", DatasetLabelPosition::BottomRight},
+        {"Off", DatasetLabelPosition::Off},
+    };
+    for (const auto& entry : labelPositions) {
+        QAction* action = datasetLabelsMenu->addAction(entry.first);
+        action->setCheckable(true);
+        action->setData(int(entry.second));
+        action->setActionGroup(datasetLabelsGroup);
+        connect(action, &QAction::triggered, this, [this, position = entry.second]() {
+            applyDatasetLabelPosition(position);
+            savePreferences();
+        });
+    }
+    connect(datasetLabelsMenu, &QMenu::aboutToShow, this, [this, datasetLabelsGroup]() {
+        for (QAction* action : datasetLabelsGroup->actions()) {
+            action->setChecked(action->data().toInt() == int(datasetLabelPosition_));
+        }
+    });
 
     // Seismic Display: real, working toggles (unlike the placeholders
     // above) -- DisplaySettings is read fresh every frame, so flipping
@@ -4082,6 +4365,7 @@ MainWindow::MainWindow() : QMainWindow() {
     setGainDb(0);
 
     loadPreferences();
+    applyDatasetLabelPosition(datasetLabelPosition_);
     applyToolbarPosition(prefs_.toolbarPosition); // also applies prefs_.drawerPosition -- see its own comment
 }
 
@@ -4098,6 +4382,10 @@ void MainWindow::loadPreferences() {
         ToolbarPosition(settings.value("toolbarPosition", int(ToolbarPosition::Left)).toInt());
     prefs_.drawerPosition = DrawerPosition(settings.value("drawerPosition", int(DrawerPosition::Right)).toInt());
     prefs_.uiScalePercent = settings.value("uiScalePercent", 100.0).toDouble();
+    int labelPosition = settings.value("datasetLabelPosition", int(DatasetLabelPosition::TopLeft)).toInt();
+    if (labelPosition >= int(DatasetLabelPosition::TopLeft) && labelPosition <= int(DatasetLabelPosition::Off)) {
+        datasetLabelPosition_ = DatasetLabelPosition(labelPosition);
+    }
 }
 
 void MainWindow::savePreferences() {
@@ -4105,6 +4393,13 @@ void MainWindow::savePreferences() {
     settings.setValue("toolbarPosition", int(prefs_.toolbarPosition));
     settings.setValue("drawerPosition", int(prefs_.drawerPosition));
     settings.setValue("uiScalePercent", prefs_.uiScalePercent);
+    settings.setValue("datasetLabelPosition", int(datasetLabelPosition_));
+}
+
+void MainWindow::applyDatasetLabelPosition(DatasetLabelPosition position) {
+    datasetLabelPosition_ = position;
+    panelA_.canvas->setDatasetLabelPosition(position);
+    panelB_.canvas->setDatasetLabelPosition(position);
 }
 
 void MainWindow::applyToolbarPosition(ToolbarPosition position) {
@@ -4441,7 +4736,8 @@ void MainWindow::refreshAmplitudeScale() {
         float negClip = float(double(baseNeg) / linearGain);
         if (posClip <= 0.0f) posClip = 1.0f;
         if (negClip <= 0.0f) negClip = 1.0f;
-        p->canvas->setAmplitudeScale(posClip, negClip, visible, p->app.display.colorScale);
+        p->canvas->setAmplitudeScale(posClip, negClip, visible, p->app.display.colorScale,
+                                     p->app.display.colorScaleFlipped);
     }
 }
 
@@ -4767,21 +5063,26 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
     // Snapshot by shared_ptr now -- see runCalculator's comment for why.
     std::shared_ptr<Dataset> ds = app.foreground;
     segy::ColorScale colorScale = app.display.colorScale;
+    bool colorScaleFlipped = app.display.colorScaleFlipped;
 
-    // A "look" tool over a handful of evenly-spaced traces, not an
-    // exhaustive filter of every visible one -- filtering every trace of a
-    // huge view eight-plus times over would freeze the UI for no visible
-    // benefit at this panel width.
-    constexpr int kMaxTracesPerBand = 80;
-    constexpr int kPanelWidth = 100;
-    constexpr int kPanelHeight = 480;
+    // Sample enough evenly-spaced traces to fill a panel at native raster
+    // resolution, without filtering every trace in a large view.
+    constexpr int kMaxTracesPerBand = 160;
+    constexpr int kPanelWidth = 200;
+    constexpr int kPanelHeight = 960;
     int decodeCount = int(std::min<int64_t>(visibleTraces, kMaxTracesPerBand));
 
     auto result = std::make_shared<OctaveBandResult>();
+    result->traceStart = double(t0);
+    result->traceEnd = double(t1 - 1);
+    result->sampleStart = s0;
+    result->sampleEnd = s1 - 1;
+    result->sampleIntervalUs = app.foreground->binHeader.sampleIntervalUs;
 
     runBackgroundTask(
         QString("Octave Bands: %1-%2 Hz").arg(minFreqHz).arg(maxFreqHz),
-        [this, ds, t0, t1, s0, visibleSamples, decodeCount, minFreqHz, maxFreqHz, colorScale, result]() {
+        [this, ds, t0, t1, s0, visibleSamples, decodeCount, minFreqHz, maxFreqHz, colorScale, colorScaleFlipped,
+         result]() {
             int bandCount = 1;
             for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) ++bandCount;
             backgroundTaskTotal_ = bandCount;
@@ -4797,7 +5098,8 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
                                     rawTraces[size_t(i)].data(), size_t(visibleSamples), ds->binHeader.formatCode);
             }
 
-            result->bands.push_back({"Unfiltered", rasterizeOctaveBand(rawTraces, kPanelWidth, kPanelHeight, colorScale)});
+            result->bands.push_back(
+                {"Unfiltered", rasterizeOctaveBand(rawTraces, kPanelWidth, kPanelHeight, colorScale, colorScaleFlipped)});
             backgroundTaskDone_ = 1;
             int bandsDone = 1;
             for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) {
@@ -4817,7 +5119,8 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
                     segy::applyBandpassFilter(tr, ds->binHeader.sampleIntervalUs, params);
                 }
                 result->bands.push_back({QString("%1 - %2 Hz").arg(lo).arg(hi),
-                                         rasterizeOctaveBand(filtered, kPanelWidth, kPanelHeight, colorScale)});
+                                         rasterizeOctaveBand(filtered, kPanelWidth, kPanelHeight, colorScale,
+                                                             colorScaleFlipped)});
                 backgroundTaskDone_ = ++bandsDone;
             }
         },

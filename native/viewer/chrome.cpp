@@ -84,7 +84,8 @@ ChromeLayout renderFrameWithChrome(const RenderContext& ctx, const ViewRange& vi
         if (settings.seismicMode == SeismicDisplayMode::VariableDensity) {
             result.lastRenderMs =
                 renderFrame(ctx, view, scratch.data(), result.plotWidth, canvasHeight, settings.gainDb,
-                            settings.colorScale, settings.manualClip, settings.reversePolarity);
+                            settings.colorScale, settings.manualClip, settings.reversePolarity,
+                            settings.colorScaleFlipped);
         } else {
             std::fill(scratch.begin(), scratch.end(), 0x00FFFFFFu);
         }
@@ -97,8 +98,9 @@ ChromeLayout renderFrameWithChrome(const RenderContext& ctx, const ViewRange& vi
 
     // --- Color bar: vertical gradient, positive (red) at top, negative (blue) at bottom ---
     if (effectiveShowColorBar) {
+        const float colorScaleDirection = settings.colorScaleFlipped ? -1.0f : 1.0f;
         for (int y = 0; y < canvasHeight; ++y) {
-            float t = 1.0f - 2.0f * float(y) / float(std::max(1, canvasHeight - 1));
+            float t = (1.0f - 2.0f * float(y) / float(std::max(1, canvasHeight - 1))) * colorScaleDirection;
             uint8_t r, g, b;
             applyColorScale(settings.colorScale, t, &b, &g, &r);
             uint32_t px = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);

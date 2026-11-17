@@ -1679,29 +1679,28 @@ by the wiggle display's own, unrelated min/max envelope reduction
 (`wiggle.cpp`) — only the variable-density color-fill path stopped
 consuming per-block statistics.
 
-### Color scale selection: five palettes, right-click the amplitude legend
+### Color scale selection: seven palettes, live previews, and flip
 
 `include/colormap.h` grew from one hardcoded diverging colormap to a
 `segy::ColorScale` enum (`RedWhiteBlue`, `RedWhiteBlack`,
 `GrayscaleWhiteToBlack`, `GrayscaleBlackToWhite`,
-`YellowRedWhiteBlackCyan`) dispatched through `applyColorScale()`. The first
-four are 2-3 stop gradients; the fifth reuses a new generic
-`multiStopColormap()` N-stop linear interpolator (yellow → red → white →
-black → cyan) rather than writing a fifth bespoke lerp. `DisplaySettings`
-carries the active scale (`colorScale`, default `RedWhiteBlue`) and both
-render paths read it fresh every frame, same as every other display
-toggle.
+`YellowRedWhiteBlackCyan`, `Rainbow`, `RedYellowGreen`) dispatched through
+`applyColorScale()`. The first four are 2-3 stop gradients; the fifth reuses
+a new generic `multiStopColormap()` N-stop linear interpolator (yellow → red
+→ white → black → cyan) rather than writing a fifth bespoke lerp. Rainbow
+and red-yellow-green are also N-stop gradients. `DisplaySettings` carries
+the active scale (`colorScale`, default `RedWhiteBlue`) and its flip state;
+both render paths read them fresh every frame.
 
 Picked via a right-click context menu on the amplitude-scale legend
 (`AmplitudeScaleWidget`) — previously that widget was
 `Qt::WA_TransparentForMouseEvents` (deliberately click-through, so canvas
 interactions underneath weren't blocked); that flag was removed to let it
 receive the right-click, which is safe since the legend sits in a corner
-overlay the canvas's own mouse handling doesn't otherwise need. The menu is
-a plain `QActionGroup`-checked list, scoped to that one panel only (not
-Lock-aware like the toolbar's gain/mode controls) since it's triggered from
-one specific panel's own overlay widget, not a shared control — there's
-never ambiguity about which panel it means.
+overlay the canvas's own mouse handling doesn't otherwise need. The menu
+shows a live color-bar preview for each map, plus a flip toggle, scoped to
+that one panel only (not Lock-aware like the toolbar's gain/mode controls)
+since it's triggered from one specific panel's own overlay widget.
 
 Also swapped two toolbar icons this pass, unrelated to color scales but
 same session: the "Display Parameters" action's caret-up-down icon (looked
@@ -1901,8 +1900,15 @@ that machinery was built once and shared:
   traces/samples (current view) of the chosen Left/Right panel into
   unfiltered + 2^N Hz octave bands (min/max are power-of-2 combos), each with
   a 15% taper past its edges, rendered **variable-density** (per the mockup
-  feedback), each band auto-clipped to its own peak. Capped at 80 evenly
-  spaced traces per band — a look tool, not an exhaustive filter.
+  feedback), each band auto-clipped to its own peak. Capped at 160 evenly
+  spaced traces per band and rendered into a 200 x 960 cached raster to
+  preserve detail without filtering every visible trace. Resizing scales the
+  cached raster to each plot without re-running the filters. A
+  crosshair follows the cursor in every band at the same normalized
+  trace/time position, spanning each plot to its labeled Trace/Time axes
+  with endpoint trace labels and rotated time tick values (fixed notation
+  through 99,999 ms); the overlay repaints independently of the raster to
+  keep cursor movement responsive.
 - **Known limitation**: Calculator/Bandpass/Save run synchronously on the UI
   thread behind a wait cursor (Histogram/Spectrum's existing precedent), but
   unlike those they must touch every trace, so a huge file will freeze the UI
@@ -2192,13 +2198,11 @@ weren't quite the same thing, and preserving that exact timing mattered
 more than the derivation being conceptually cleaner.
 
 **UI**: two small boxes per panel ("Foreground N"/"Background N"),
-overlaid on the canvas (same technique as `AmplitudeScaleWidget`) at the
-top, flush with that panel's own plot left axis (`lastPlotX_`) — so in
-split view, panel 2's boxes land near the screen's middle (where its own
-plot begins), not the window's actual left edge, and both panels' boxes
-stay at the top regardless of split orientation (each is simply
-positioned relative to its own panel). Each box's small list-icon button
-opens `DatasetPickerDialog` (OK/Delete/Cancel, matching the reference
+overlaid on the seismic canvas (same technique as `AmplitudeScaleWidget`).
+`View > Dataset Labels` positions both boxes at a selected corner or hides
+them; the choice is saved with the app preferences. In split view each
+panel positions its own boxes relative to its plot. Each box's small
+list-icon button opens `DatasetPickerDialog` (OK/Delete/Cancel, matching the reference
 tool this was modeled on) scoped to that slot; `MainWindow::datasetPool_`
 is the shared list every load (File > Open, Calculator, Bandpass) adds to
 via `SegyCanvas::setDatasetLoadedCallback`. Delete is blocked (button

@@ -42,9 +42,10 @@ struct DisplaySettings {
     // Applied on top of the pyramid's auto-computed (or manualClip's, below)
     // clip -- 0 dB means "trust that base clip as-is."
     double gainDb = 0.0;
-    // Right-click the amplitude scale legend to change this -- see
+    // Right-click the amplitude scale legend to choose/flip the map -- see
     // colormap.h's ColorScale/applyColorScale.
     ColorScale colorScale = ColorScale::RedWhiteBlue;
+    bool colorScaleFlipped = false;
     // Right-click the amplitude scale legend > Clip... -- see
     // renderer.h's ManualClip for what posMagnitude/negMagnitude mean and
     // how gainDb still composes with it.

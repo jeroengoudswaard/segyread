@@ -103,7 +103,8 @@ void effectiveClipPosNeg(float rawClip, double gainDb, const ManualClip& manualC
 }
 
 void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pixels, int width, int height,
-                      double gainDb, ColorScale colorScale, const ManualClip& manualClip, bool reversePolarity) {
+                      double gainDb, ColorScale colorScale, const ManualClip& manualClip, bool reversePolarity,
+                      bool colorScaleFlipped) {
     int64_t t0 = std::max<int64_t>(0, int64_t(std::floor(v.traceStart)));
     int64_t t1 = std::min<int64_t>(ctx.traceCount, int64_t(std::ceil(v.traceEnd)) + 1);
     int s0 = std::max(0, int(std::floor(v.sampleStart)));
@@ -144,6 +145,7 @@ void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pix
     float rawClip = std::max(std::fabs(ctx.pyramid->globalMin), std::fabs(ctx.pyramid->globalMax));
     float clipPos, clipNeg;
     effectiveClipPosNeg(rawClip, gainDb, manualClip, &clipPos, &clipNeg);
+    const float colorScaleDirection = colorScaleFlipped ? -1.0f : 1.0f;
     double traceSpan = v.traceEnd - v.traceStart;
     double sampleSpan = v.sampleEnd - v.sampleStart;
 
@@ -175,7 +177,7 @@ void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pix
 
                 uint8_t r, g, b;
                 float clip = value >= 0.0f ? clipPos : clipNeg;
-                applyColorScale(colorScale, value / clip, &b, &g, &r);
+                applyColorScale(colorScale, (value / clip) * colorScaleDirection, &b, &g, &r);
                 row[x] = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
             }
         }
@@ -185,12 +187,14 @@ void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pix
 } // namespace
 
 double renderFrame(const RenderContext& ctx, const ViewRange& view, uint32_t* pixels, int width, int height,
-                    double gainDb, ColorScale colorScale, ManualClip manualClip, bool reversePolarity) {
+                    double gainDb, ColorScale colorScale, ManualClip manualClip, bool reversePolarity,
+                    bool colorScaleFlipped) {
     if (width <= 0 || height <= 0 || !ctx.pyramid || !ctx.pool) return 0.0;
     auto start = std::chrono::high_resolution_clock::now();
 
     if (ctx.file && ctx.file->isOpen()) {
-        renderExactPath(ctx, view, pixels, width, height, gainDb, colorScale, manualClip, reversePolarity);
+        renderExactPath(ctx, view, pixels, width, height, gainDb, colorScale, manualClip, reversePolarity,
+                        colorScaleFlipped);
     }
 
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start).count();

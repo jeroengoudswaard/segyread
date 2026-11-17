@@ -171,6 +171,7 @@ struct IdentSettings {
 // which lives on a per-panel AppState and resets with a fresh session.
 enum class ToolbarPosition { Left, Top, Bottom, Right };
 enum class DrawerPosition { Left, Right };
+enum class DatasetLabelPosition { TopLeft, BottomLeft, TopRight, BottomRight, Off };
 struct Preferences {
     ToolbarPosition toolbarPosition = ToolbarPosition::Left;
     // Only independently meaningful when the toolbar is Top/Bottom -- when
@@ -311,9 +312,9 @@ struct HoverInfo {
 // this same legend (also documented in native/README.md). Paints its own
 // semi-transparent dark backing so it stays legible sitting on top of
 // whatever seismic colors happen to be underneath it. Right-clickable (see
-// SegyCanvas's constructor) to change AppState::display.colorScale -- no
-// longer transparent-for-mouse-events like it briefly was as a pure
-// overlay, since it now needs to receive that click itself.
+// SegyCanvas's constructor) to choose a color scale from visual previews or
+// flip it -- no longer transparent-for-mouse-events like it briefly was as
+// a pure overlay, since it now needs to receive that click itself.
 class AmplitudeScaleWidget : public QWidget {
 public:
     explicit AmplitudeScaleWidget(QWidget* parent = nullptr);
@@ -323,7 +324,7 @@ public:
     // they differ, "0" on the gradient sits off-center at the matching
     // fraction and the two end labels show their own distinct values.
     void setClipRange(float posClip, float negClip);
-    void setColorScale(segy::ColorScale scale);
+    void setColorScale(segy::ColorScale scale, bool flipped);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -332,6 +333,7 @@ private:
     float posClip_ = 1.0f;
     float negClip_ = 1.0f;
     segy::ColorScale colorScale_ = segy::ColorScale::RedWhiteBlue;
+    bool colorScaleFlipped_ = false;
 };
 
 // The histogram-with-two-draggable-lines control inside ClipDialog, below.
@@ -622,6 +624,7 @@ public:
     DatasetSlotWidget(const QString& label, QWidget* parent = nullptr);
     void setLabel(const QString& label);
     void setDatasetName(const QString& name);
+    void setSlotWidth(int width);
     void setPickCallback(std::function<void()> callback);
 
 protected:
@@ -862,8 +865,8 @@ private:
     void browseForFile();
 };
 
-// One band's rendered result in the Octave Band Display window -- a small
-// variable-density raster (QImage, same 0x00RRGGBB packing renderFrame()
+// One band's rendered result in the Octave Band Display window -- a
+// higher-resolution variable-density raster (QImage, same 0x00RRGGBB packing renderFrame()
 // itself produces) plus its frequency-range label. `bands[0]` is always the
 // unfiltered source; the rest are octave bands, low frequency first.
 struct OctaveBandResult {
@@ -872,12 +875,18 @@ struct OctaveBandResult {
         QImage image;
     };
     std::vector<Band> bands;
+    double traceStart = 0.0;
+    double traceEnd = 0.0;
+    int sampleStart = 0;
+    int sampleEnd = 0;
+    double sampleIntervalUs = 0.0;
 };
 
 // Spawned from the toolbar: bandpass-filters the *visible* traces/samples of
 // a chosen panel (Left/Right) into a row of octave bands (2^N Hz steps,
-// user-adjustable range), each rendered as its own small variable-density
-// panel with its own auto-scaled clip -- see
+// user-adjustable range), each rendered as its own variable-density panel
+// with its own auto-scaled clip. Cached rasters scale on resize, and a
+// normalized crosshair follows the cursor across every band -- see
 // MainWindow::computeAndShowOctaveBands, which does the actual decode/
 // filter/rasterize work and feeds the result back via setResult(). Like
 // CalculatorDialog/BandpassDialog, holds no AppState reference itself.
@@ -898,6 +907,7 @@ private:
     QComboBox* minFreqCombo_ = nullptr;
     QComboBox* maxFreqCombo_ = nullptr;
     QWidget* bandsRow_ = nullptr;
+    std::vector<std::function<void(double, double, bool)>> bandCrosshairUpdaters_;
     std::function<void(int, int, int)> onApply_;
 
     void emitApply();
@@ -970,11 +980,13 @@ public:
     // that math for the gain control); the canvas owns the overlay widget
     // itself since only it knows the plot's on-screen geometry to position
     // against.
-    void setAmplitudeScale(float posClip, float negClip, bool visible, segy::ColorScale colorScale);
+    void setAmplitudeScale(float posClip, float negClip, bool visible, segy::ColorScale colorScale,
+                           bool colorScaleFlipped);
 
     // "Foreground 1"/"Background 1" vs "...2" etc -- set once, right after
     // construction, since only MainWindow knows which panel this is.
     void setDatasetSlotLabels(const QString& foregroundLabel, const QString& backgroundLabel);
+    void setDatasetLabelPosition(DatasetLabelPosition position);
     // `isForeground` tells MainWindow which of this panel's two slots the
     // click was for (true = Foreground, false = Background); it owns the
     // dataset pool and the picker dialog, this class only owns the boxes.
@@ -1021,12 +1033,13 @@ private:
     // "bound to whichever was active at creation" caveat needed.
     ClipDialog* clipDialog_ = nullptr;
     // Foreground/Background boxes (see native/README.md, "Dataset pool")
-    // -- overlaid on the canvas like amplitudeScale_, top-left of this
-    // panel's own plot area. MainWindow owns the pool/picker dialog and
+    // -- overlaid on this panel's plot area at the selected corner.
+    // MainWindow owns the pool/picker dialog and
     // supplies isForeground's meaning via setDatasetSlotPickCallback;
     // this class only owns the boxes' existence/position/displayed name.
     DatasetSlotWidget* foregroundSlot_ = nullptr;
     DatasetSlotWidget* backgroundSlot_ = nullptr;
+    DatasetLabelPosition datasetLabelPosition_ = DatasetLabelPosition::TopLeft;
     std::function<void(bool isForeground)> onDatasetSlotPick_;
     void repositionDatasetSlots();
     void repositionAmplitudeScale();
@@ -1222,10 +1235,12 @@ private:
     // *Settings struct elsewhere in this file. toolbar_ was a constructor
     // local until this needed to reposition it after the fact.
     Preferences prefs_;
+    DatasetLabelPosition datasetLabelPosition_ = DatasetLabelPosition::TopLeft;
     QToolBar* toolbar_ = nullptr;
     PreferencesDialog* preferencesDialog_ = nullptr;
     void loadPreferences();
     void savePreferences();
+    void applyDatasetLabelPosition(DatasetLabelPosition position);
     void applyToolbarPosition(ToolbarPosition position);
     void applyDrawerPosition(DrawerPosition position);
 

@@ -93,6 +93,6 @@ void panFromAnchor(ViewRange& view, const ViewRange& anchor, int64_t traceCount,
 // so the two display modes never show opposite polarity for the same data.
 double renderFrame(const RenderContext& ctx, const ViewRange& view, uint32_t* pixels, int width, int height,
                     double gainDb = 0.0, ColorScale colorScale = ColorScale::RedWhiteBlue,
-                    ManualClip manualClip = ManualClip{}, bool reversePolarity = false);
+                    ManualClip manualClip = ManualClip{}, bool reversePolarity = false, bool colorScaleFlipped = false);
 
 } // namespace segy
