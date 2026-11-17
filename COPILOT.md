@@ -23,3 +23,5 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 10. **Computed gain** — Support gain defined as time-gain pairs, so gain can vary as a function of time.
 
 11. **Live subsetting and sorting** — Allow data to be subset and sorted on the fly, and provide a way to output the data with the new sort.
+
+12. **Spectral shaping** — Add spectral shaping as a processing step. Discuss the algorithm, controls, and performance needs before implementation.
