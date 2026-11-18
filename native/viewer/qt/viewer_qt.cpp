@@ -417,10 +417,15 @@ std::shared_ptr<const OctaveBandData> makeOctaveBandData(std::vector<std::vector
     size_t total = 0;
     for (const std::vector<float>& tr : traces) total += tr.size();
     magnitudes.reserve(total);
+    double sumSquares = 0.0;
     for (const std::vector<float>& tr : traces) {
-        for (float v : tr) magnitudes.push_back(std::fabs(v));
+        for (float v : tr) {
+            magnitudes.push_back(std::fabs(v));
+            sumSquares += double(v) * double(v);
+        }
     }
     if (!magnitudes.empty()) {
+        data->rms = float(std::sqrt(sumSquares / double(magnitudes.size())));
         size_t k = std::min(magnitudes.size() - 1, size_t(double(magnitudes.size()) * 0.995));
         std::nth_element(magnitudes.begin(), magnitudes.begin() + std::ptrdiff_t(k), magnitudes.end());
         data->clip = std::max(magnitudes[k], 1e-12f);
@@ -440,7 +445,9 @@ std::shared_ptr<const OctaveBandData> makeOctaveBandData(std::vector<std::vector
 // The traces here are a small, evenly spaced sample of the view (not the
 // main canvas's decimated full-res traces), so blending neighbors is the
 // right call for this overview, unlike renderer.cpp's nearest-trace rule.
-QImage rasterizeOctaveBand(const OctaveBandData& data, int width, int height) {
+// `clip` is the |amplitude| mapped to the color scale's ends -- the band's
+// own (per-band scaling) or the Unfiltered band's (common scaling).
+QImage rasterizeOctaveBand(const OctaveBandData& data, int width, int height, float clip) {
     QImage img(std::max(1, width), std::max(1, height), QImage::Format_RGB32);
     const auto& traces = data.traces;
     if (traces.empty() || traces[0].empty() || width <= 0 || height <= 0) {
@@ -476,7 +483,7 @@ QImage rasterizeOctaveBand(const OctaveBandData& data, int width, int height) {
         }
     }
 
-    const float scale = (data.colorScaleFlipped ? -1.0f : 1.0f) / data.clip;
+    const float scale = (data.colorScaleFlipped ? -1.0f : 1.0f) / std::max(clip, 1e-12f);
     const double tracesPerCol = double(nTraces) / double(width);
     for (int x = 0; x < width; ++x) {
         int a = 0, b = 0, i0 = 0, i1 = 0;
@@ -588,6 +595,14 @@ public:
         update();
     }
 
+    // <= 0 means "the band's own clip".
+    void setClip(float clip) {
+        if (clip == clip_) return;
+        clip_ = clip;
+        rasterizeExact();
+        update();
+    }
+
     void setAxisRange(double traceStart, double traceEnd, int sampleStart, int sampleEnd, double sampleIntervalUs) {
         traceStart_ = traceStart;
         traceEnd_ = traceEnd;
@@ -688,6 +703,7 @@ protected:
 
 private:
     std::shared_ptr<const OctaveBandData> data_;
+    float clip_ = 0.0f;
     QImage raster_; // rasterized at plotRect() size x devicePixelRatio
     QTimer* rasterTimer_ = nullptr;
     OctaveBandCrosshairOverlay* crosshairOverlay_ = nullptr;
@@ -711,7 +727,7 @@ private:
         }
         const qreal dpr = devicePixelRatioF();
         raster_ = rasterizeOctaveBand(*data_, int(std::lround(size.width() * dpr)),
-                                      int(std::lround(size.height() * dpr)));
+                                      int(std::lround(size.height() * dpr)), clip_ > 0.0f ? clip_ : data_->clip);
         raster_.setDevicePixelRatio(dpr);
     }
 };
@@ -1899,6 +1915,15 @@ OctaveBandDialog::OctaveBandDialog(QWidget* parent) : QDialog(parent) {
     QPushButton* applyButton = new QPushButton("Apply");
     connect(applyButton, &QPushButton::clicked, this, [this]() { emitApply(); });
     toolbarRow->addWidget(applyButton);
+    toolbarRow->addSpacing(16);
+    toolbarRow->addWidget(new QLabel("Scale:"));
+    scaleCombo_ = new QComboBox();
+    scaleCombo_->addItem("Common (relative to unfiltered)", 0);
+    scaleCombo_->addItem("Per band", 1);
+    scaleCombo_->setToolTip("Common: all bands share the unfiltered clip, so weak bands look weak.\n"
+                            "Per band: each band scaled to itself, to see structure in weak bands.");
+    connect(scaleCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { applyScaling(); });
+    toolbarRow->addWidget(scaleCombo_);
     toolbarRow->addStretch();
     layout->addLayout(toolbarRow);
 
@@ -1938,6 +1963,12 @@ void OctaveBandDialog::setSourcePanel(int panelIndex) {
 void OctaveBandDialog::setResult(const OctaveBandResult& result) {
     QLayout* oldLayout = bandsRow_->layout();
     bandCrosshairUpdaters_.clear();
+    bandClipSetters_.clear();
+    bandOwnClips_.clear();
+    // bands.front() is always "Unfiltered" (see computeAndShowOctaveBands).
+    const OctaveBandData* reference = !result.bands.empty() ? result.bands.front().data.get() : nullptr;
+    commonClip_ = reference ? reference->clip : 1.0f;
+    const float referenceRms = reference ? reference->rms : 0.0f;
     if (oldLayout) {
         while (QLayoutItem* item = oldLayout->takeAt(0)) {
             delete item->widget();
@@ -1955,7 +1986,21 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
         col->setStyleSheet("border-right: 1px solid #3c3f41;");
         QVBoxLayout* colLayout = new QVBoxLayout(col);
         colLayout->setContentsMargins(4, 4, 4, 4);
-        QLabel* labelWidget = new QLabel(band.label);
+        // Each filtered band's RMS level relative to the unfiltered data --
+        // the number behind "how weak is this band", independent of the
+        // Scale choice.
+        QString labelText = band.label;
+        if (band.data.get() != reference && referenceRms > 0.0f) {
+            // QChar, not "\u00b7" literals: the build has no /utf-8, so MSVC
+            // would encode those in the local code page, not UTF-8.
+            const QString dot(QChar(0x00B7));
+            labelText += band.data->rms > 0.0f
+                             ? QString(" %1 %2 dB")
+                                   .arg(dot)
+                                   .arg(20.0 * std::log10(double(band.data->rms) / referenceRms), 0, 'f', 0)
+                             : QString(" %1 -%2 dB").arg(dot, QString(QChar(0x221E)));
+        }
+        QLabel* labelWidget = new QLabel(labelText);
         labelWidget->setAlignment(Qt::AlignCenter);
         labelWidget->setStyleSheet(
             "QLabel { color: #f0f2f5; background-color: #303238; font-size: 12px; font-weight: bold; padding: 2px; "
@@ -1968,6 +2013,8 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
         bandCrosshairUpdaters_.push_back([plotWidget](double x, double y, bool visible) {
             plotWidget->setCrosshair(x, y, visible);
         });
+        bandClipSetters_.push_back([plotWidget](float clip) { plotWidget->setClip(clip); });
+        bandOwnClips_.push_back(band.data->clip);
         plotWidget->setMouseCallbacks(
             [this](double x, double y) {
                 for (const auto& updateCrosshair : bandCrosshairUpdaters_) updateCrosshair(x, y, true);
@@ -1979,6 +2026,14 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
         bandsLayout->addWidget(col);
     }
     bandsRow_->setLayout(bandsLayout);
+    applyScaling();
+}
+
+void OctaveBandDialog::applyScaling() {
+    const bool common = scaleCombo_->currentData().toInt() == 0;
+    for (size_t i = 0; i < bandClipSetters_.size(); ++i) {
+        bandClipSetters_[i](common ? commonClip_ : bandOwnClips_[i]);
+    }
 }
 
 void OctaveBandDialog::setApplyCallback(std::function<void(int, int, int)> callback) { onApply_ = std::move(callback); }

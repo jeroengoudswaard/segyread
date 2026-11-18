@@ -1903,9 +1903,19 @@ that machinery was built once and shared:
   traces/samples (current view) of the chosen Left/Right panel into
   unfiltered + 2^N Hz octave bands (min/max are power-of-2 combos), each with
   a 15% taper past its edges, rendered **variable-density** (per the mockup
-  feedback), each band clipped at its own 99.5th-percentile |amplitude|
-  (it used to be the band's single peak, which let one spike push everything
-  else toward white). Capped at 160 evenly spaced traces per band. Each band
+  feedback). **Scale** (in the window's toolbar) chooses the clip:
+  + **Common** (the default): every band uses the Unfiltered band's
+    99.5th-percentile |amplitude|, so each band's true strength shows. In
+    seismic data a 1-2 Hz or 2-4 Hz band should read near-white.
+  + **Per band**: each band is clipped at its own 99.5th percentile, to see
+    the structure inside a weak band. This was the only behaviour until the
+    user pointed out that it hid how weak the low bands really are.
+
+  Switching only re-rasterizes, without re-filtering. Each filtered band's
+  header also shows its RMS level relative to Unfiltered (for example
+  "2 - 4 Hz · −33 dB"), whichever scale is chosen. The percentile replaced
+  the band's single peak, which let one spike push everything else toward
+  white. Capped at 160 evenly spaced traces per band. Each band
   keeps its filtered traces (`OctaveBandData`) rather than a pre-rendered
   image, and each plot rasterizes them itself at its **exact on-screen size
   in device pixels** (`rasterizeOctaveBand`). Along the time axis it

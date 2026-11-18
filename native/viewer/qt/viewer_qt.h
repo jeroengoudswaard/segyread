@@ -912,6 +912,7 @@ private:
 struct OctaveBandData {
     std::vector<std::vector<float>> traces; // evenly spaced across the visible range, each the visible samples
     float clip = 1.0f;                      // 99.5th percentile |amplitude| of this band
+    float rms = 0.0f;                       // RMS amplitude of this band (for its dB level vs. unfiltered)
     segy::ColorScale colorScale = segy::ColorScale::RedWhiteBlue;
     bool colorScaleFlipped = false;
 };
@@ -953,8 +954,17 @@ private:
     QComboBox* sourceCombo_ = nullptr;
     QComboBox* minFreqCombo_ = nullptr;
     QComboBox* maxFreqCombo_ = nullptr;
+    // Common (default): every band uses the Unfiltered band's clip, so a
+    // band's true strength shows -- a weak 1-2 Hz band reads near-white.
+    // Per band: each band auto-clipped to itself, to see a weak band's
+    // structure. Switching only re-rasterizes (no re-filtering).
+    QComboBox* scaleCombo_ = nullptr;
     QWidget* bandsRow_ = nullptr;
     std::vector<std::function<void(double, double, bool)>> bandCrosshairUpdaters_;
+    std::vector<std::function<void(float)>> bandClipSetters_; // one per band, same order as bandOwnClips_
+    std::vector<float> bandOwnClips_;
+    float commonClip_ = 1.0f;
+    void applyScaling();
     std::function<void(int, int, int)> onApply_;
 
     void emitApply();
