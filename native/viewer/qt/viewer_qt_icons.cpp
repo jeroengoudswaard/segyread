@@ -224,6 +224,20 @@ QIcon iconAgc() {
     return renderSvgIcon(kSvg);
 }
 
+// Autocorrelation toolbar button (hand-drawn): a symmetric wavelet with
+// its peak in the middle, over a zero line -- the shape of an
+// autocorrelation, peak at lag 0.
+QIcon iconAutocorrelation() {
+    static const QString kSvg = QStringLiteral(R"(
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 14l3 0l2 2l2 -4l2 -9l2 9l2 4l2 -2l3 0" />
+          <path d="M12 20l0 1" />
+        </svg>
+    )");
+    return renderSvgIcon(kSvg);
+}
+
 // Tabler Icons "arrows-horizontal" (https://tabler.io/icons/icon/arrows-horizontal),
 // MIT licensed -- Flip Horizontal toolbar button.
 QIcon iconArrowsHorizontal() {

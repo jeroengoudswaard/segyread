@@ -43,4 +43,14 @@ struct SpectrumResult {
 SpectrumResult computeSpectrum(const RenderContext& ctx, int64_t traceStart, int64_t traceEnd, int32_t sampleStart,
                                 int32_t sampleEnd, double sampleIntervalUs, int smoothPoints);
 
+// Normalized autocorrelation of one trace for lags 0..maxLag (in samples):
+//   r[k] = sum_i x[i] * x[i+k] / sum_i x[i]^2
+// so r[0] == 1 and |r[k]| <= 1 -- the "biased" estimate (no 1/(n-k)
+// rescaling), the usual choice for seismic autocorrelograms since it can't
+// blow up at long lags. Negative lags mirror positive ones (r[-k] == r[k]),
+// so callers build the -L..+L display from this. An all-zero trace gives
+// all zeros. maxLag is clamped to n - 1. Direct O(n * maxLag) sum: exact,
+// and cheap at autocorrelogram sizes (a few hundred traces/lags).
+std::vector<float> normalizedAutocorrelation(const float* samples, int count, int maxLag);
+
 } // namespace segy

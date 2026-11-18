@@ -156,4 +156,20 @@ SpectrumResult computeSpectrum(const RenderContext& ctx, int64_t traceStart, int
     return result;
 }
 
+std::vector<float> normalizedAutocorrelation(const float* samples, int count, int maxLag) {
+    if (count <= 0 || maxLag < 0) return {};
+    maxLag = std::min(maxLag, count - 1);
+    std::vector<double> r(size_t(maxLag) + 1, 0.0);
+    for (int k = 0; k <= maxLag; ++k) {
+        double sum = 0.0;
+        for (int i = 0; i + k < count; ++i) sum += double(samples[i]) * double(samples[i + k]);
+        r[size_t(k)] = sum;
+    }
+    std::vector<float> out(r.size(), 0.0f);
+    if (r[0] > 0.0) {
+        for (size_t k = 0; k < r.size(); ++k) out[k] = float(r[k] / r[0]);
+    }
+    return out;
+}
+
 } // namespace segy

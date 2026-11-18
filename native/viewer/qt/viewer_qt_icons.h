@@ -31,6 +31,7 @@ QIcon iconColumns3();
 QIcon iconList();
 QIcon iconIdents();
 QIcon iconAgc();
+QIcon iconAutocorrelation();
 
 // Box-select cursor: a plain arrow with a small rectangle badge, matching
 // "a pointer with a little rectangle."

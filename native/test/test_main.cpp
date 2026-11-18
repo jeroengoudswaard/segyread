@@ -1305,6 +1305,44 @@ void testButterworthCornerGain() {
     CHECK(gainAt(200.0) < 1e-3);
 }
 
+void testNormalizedAutocorrelation() {
+    section("Analysis: normalized autocorrelation -- hand-computed values, spike, dead trace, lag clamp, periodicity");
+    // x = 1,2,3,4: r0 = 30, r1 = 1*2+2*3+3*4 = 20, r2 = 1*3+2*4 = 11, r3 = 1*4 = 4.
+    const float x[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> r = segy::normalizedAutocorrelation(x, 4, 10); // lag clamped to n-1 = 3
+    CHECK(r.size() == 4);
+    CHECK_NEAR(r[0], 1.0, 1e-7);
+    CHECK_NEAR(r[1], 20.0 / 30.0, 1e-7);
+    CHECK_NEAR(r[2], 11.0 / 30.0, 1e-7);
+    CHECK_NEAR(r[3], 4.0 / 30.0, 1e-7);
+
+    // A single spike correlates only with itself: 1 at lag 0, 0 elsewhere.
+    std::vector<float> spike(50, 0.0f);
+    spike[20] = -3.0f;
+    r = segy::normalizedAutocorrelation(spike.data(), 50, 10);
+    CHECK_NEAR(r[0], 1.0, 1e-7);
+    bool restZero = true;
+    for (size_t k = 1; k < r.size(); ++k) restZero = restZero && r[k] == 0.0f;
+    CHECK(restZero);
+
+    // Dead trace: all zeros, no NaN.
+    std::vector<float> dead(30, 0.0f);
+    r = segy::normalizedAutocorrelation(dead.data(), 30, 5);
+    bool allZero = std::all_of(r.begin(), r.end(), [](float v) { return v == 0.0f; });
+    CHECK(allZero);
+
+    // A sine with a 20-sample period peaks again at lag 20 (biased estimate:
+    // (n - 20) / n of lag 0) and dips to about -(n - 10) / n at lag 10.
+    const int n = 400;
+    std::vector<float> sine(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) sine[size_t(i)] = float(std::sin(2.0 * 3.14159265358979323846 * i / 20.0));
+    r = segy::normalizedAutocorrelation(sine.data(), n, 40);
+    CHECK_NEAR(r[20], double(n - 20) / n, 0.01);
+    CHECK_NEAR(r[10], -double(n - 10) / n, 0.01);
+    bool bounded = std::all_of(r.begin(), r.end(), [](float v) { return std::fabs(v) <= 1.0f + 1e-6f; });
+    CHECK(bounded);
+}
+
 void testWriteSegyFileRoundTrips() {
     section("Writer: writeSegyFile round-trips through the normal read path exactly");
     std::filesystem::path path = std::filesystem::temp_directory_path() / "segyread_test_writer_roundtrip.sgy";
@@ -1393,6 +1431,7 @@ int main() {
     testSpectrumPeaksAtKnownFrequency();
     testBandpassFilterIsolatesPassband();
     testWriteSegyFileRoundTrips();
+    testNormalizedAutocorrelation();
     testSosFiltFiltMatchesScipy();
     testButterworthCornerGain();
     testGainCurveInterpolation();

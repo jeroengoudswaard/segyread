@@ -976,6 +976,38 @@ private:
     void emitApply();
 };
 
+// Analysis > Autocorrelation: per-trace normalized autocorrelation of the
+// visible traces/samples, lags -L..+L with lag 0 in the middle, shown as an
+// autocorrelogram (one column per trace, same smooth raster plot as the
+// Octave Band Display) plus the average over all traces as a curve on the
+// same lag axis. L (ms) is the user's one parameter. MainWindow computes it
+// (computeAndShowAutocorrelation) and feeds it back via setResult().
+struct AutocorrelationResult {
+    std::shared_ptr<const OctaveBandData> panel; // traces = per-trace -L..+L autocorrelations, clip 1
+    std::vector<float> average;                  // -L..+L, same length as each panel trace
+    double traceStart = 0.0;
+    double traceEnd = 0.0;
+    int maxLagSamples = 0;
+    double sampleIntervalUs = 0.0;
+    int traceCount = 0;
+};
+
+class AutocorrelationDialog : public QDialog {
+public:
+    explicit AutocorrelationDialog(QWidget* parent = nullptr);
+
+    double lengthMs() const;
+    void setResult(const AutocorrelationResult& result);
+    void setApplyCallback(std::function<void(double lengthMs)> callback);
+
+private:
+    QDoubleSpinBox* lengthSpin_ = nullptr;
+    QLabel* infoLabel_ = nullptr;
+    QWidget* panelPlot_ = nullptr;   // OctaveBandPlotWidget (defined in viewer_qt.cpp)
+    QWidget* averagePlot_ = nullptr; // AutocorrelationAverageWidget (likewise)
+    std::function<void(double)> onApply_;
+};
+
 // The density-plot canvas: owns drawing and mouse/keyboard input. Reuses
 // the exact same shared renderer/chrome calls the removed shells used.
 class SegyCanvas : public QWidget {
@@ -1257,6 +1289,8 @@ private:
     SaveSegyDialog* saveSegyDialog_ = nullptr;
     QAction* octaveBandAction_ = nullptr;
     OctaveBandDialog* octaveBandDialog_ = nullptr;
+    QAction* autocorrelationAction_ = nullptr;
+    AutocorrelationDialog* autocorrelationDialog_ = nullptr;
 
     // Dataset pool: every dataset either panel has ever loaded/computed,
     // kept alive here independent of which panel's Foreground/Background
@@ -1453,6 +1487,10 @@ private:
     // Bandpass-filters the *visible* traces/samples of `sourcePanel` into a
     // row of octave bands and shows them in octaveBandDialog_.
     void computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, int maxFreqHz);
+    // Autocorrelation of `sourcePanel`'s visible traces/samples, lags up to
+    // `lengthMs`, shown in autocorrelationDialog_ (background task).
+    void computeAndShowAutocorrelation(Panel* sourcePanel, double lengthMs);
+    void openAutocorrelationDialog();
 
     void openCalculatorDialog();
     void openBandpassDialog();

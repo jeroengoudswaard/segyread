@@ -2523,6 +2523,39 @@ At the user's request the Octave Band Display filters the way
   band's low edge can't resolve that band reliably with any filter, so read
   the lowest bands on short records with care.
 
+### Autocorrelation (Analysis > Autocorrelation)
+
+Requested by the user. A popup showing the normalized autocorrelation of the
+active panel's **visible** traces and samples (the current view, like
+Octave Bands), with one parameter: the length **L** in ms, 200 ms by
+default. The display runs from lag −L at the top to +L at the bottom, with
+lag 0 in the middle.
+
+- **Autocorrelogram** (left): one column per trace, for up to 240 evenly
+  spaced traces. It reuses `OctaveBandPlotWidget` and its exact-size smooth
+  raster, with a "Lag (ms)" axis, the current colour map, and a fixed clip of
+  1.
+- **Average** (right): the mean over all non-dead traces as a curve. Its
+  plot margins match the autocorrelogram's, so the two line up row for row.
+- **Estimate:** `segy::normalizedAutocorrelation` (`analysis.*`) computes
+  the biased estimate r[k] = Σ x[i]·x[i+k] / Σ x[i]². That makes r[0] = 1
+  and keeps |r[k]| ≤ 1, so long lags can't blow up. Negative lags mirror
+  positive ones.
+- **Cost:** a direct O(n·L) sum per trace, run as a background task.
+- **Tests:** hand-computed values, a spike, a dead trace (zeros, not NaN),
+  lag clamping, and a sine's periodicity.
+- **Starting it:** Analysis > Autocorrelation… or the toolbar button (a
+  customizable item, `autocorrelation`). Apply, or Enter in the length
+  field, recomputes for whichever panel is active at that moment.
+- **Raw data:** it uses the raw data, not the AGC or computed-gain display
+  processing.
+- **Verified by screenshot** on the test file: the peak at lag 0 sits
+  centred, the picture is symmetric, and there is a clear side lobe near
+  ±120 ms.
+
+The time-tick formatter shared with the octave plots now prints "0", not
+"0.0000", for a zero tick.
+
 ### Dark title bars (Windows)
 
 `viewer/qt/dark_titlebar.*` installs one application-wide event filter

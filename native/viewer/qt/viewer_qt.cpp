@@ -597,6 +597,12 @@ public:
         update();
     }
 
+    // "Time (ms)" by default; the autocorrelogram uses "Lag (ms)".
+    void setVerticalTitle(const QString& title) {
+        verticalTitle_ = title;
+        update();
+    }
+
     // <= 0 means "the band's own clip".
     void setClip(float clip) {
         if (clip == clip_) return;
@@ -643,6 +649,7 @@ protected:
         painter.setFont(axisFont);
         auto formatTimeTick = [](double timeMs) {
             double magnitude = std::abs(timeMs);
+            if (magnitude < 1e-9) return QString("0"); // not "0.0000" from the small-value branch below
             if (magnitude > 99999.0) return QString::number(timeMs, 'g', 3);
             int decimals = magnitude < 0.01 ? 4 : magnitude < 0.1 ? 3 : magnitude < 10.0 ? 2 : magnitude < 100.0 ? 1 : 0;
             return QString::number(timeMs, 'f', decimals);
@@ -674,7 +681,7 @@ protected:
         painter.save();
         painter.translate(10, plot.center().y());
         painter.rotate(-90);
-        painter.drawText(QRect(-plot.height() / 2, -9, plot.height(), 18), Qt::AlignCenter, "Time (ms)");
+        painter.drawText(QRect(-plot.height() / 2, -9, plot.height(), 18), Qt::AlignCenter, verticalTitle_);
         painter.restore();
     }
 
@@ -705,6 +712,7 @@ protected:
 
 private:
     std::shared_ptr<const OctaveBandData> data_;
+    QString verticalTitle_ = "Time (ms)";
     float clip_ = 0.0f;
     QImage raster_; // rasterized at plotRect() size x devicePixelRatio
     QTimer* rasterTimer_ = nullptr;
@@ -2066,6 +2074,126 @@ void OctaveBandDialog::applyScaling() {
 }
 
 void OctaveBandDialog::setApplyCallback(std::function<void(int, int, int)> callback) { onApply_ = std::move(callback); }
+
+namespace {
+
+// The average autocorrelation as a curve, lag on the vertical axis so it
+// lines up row-for-row with the autocorrelogram beside it (same top/bottom
+// plot margins as OctaveBandPlotWidget::plotRect()). Horizontal: -1..+1,
+// with the zero line and +/-0.5 guides.
+class AutocorrelationAverageWidget : public QWidget {
+public:
+    explicit AutocorrelationAverageWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setMinimumWidth(160);
+        setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    }
+    void setAverage(std::vector<float> average) {
+        average_ = std::move(average);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
+        QRect plot = rect().adjusted(10, 24, -10, -38);
+        if (plot.width() <= 0 || plot.height() <= 0) return;
+        painter.fillRect(plot, Qt::white);
+        auto xFor = [&](double v) { return plot.left() + (v + 1.0) * 0.5 * (plot.width() - 1); };
+        painter.setPen(QPen(QColor(0xd0, 0xd2, 0xd6), 1, Qt::DashLine));
+        for (double guide : {-0.5, 0.5}) painter.drawLine(QPointF(xFor(guide), plot.top()), QPointF(xFor(guide), plot.bottom()));
+        painter.setPen(QPen(QColor(0x9a, 0x9c, 0xa3), 1));
+        painter.drawLine(QPointF(xFor(0.0), plot.top()), QPointF(xFor(0.0), plot.bottom()));
+        painter.drawLine(QPointF(plot.left(), plot.center().y()), QPointF(plot.right(), plot.center().y()));
+        if (average_.size() >= 2) {
+            painter.setRenderHint(QPainter::Antialiasing, true);
+            QPolygonF line;
+            const int n = int(average_.size());
+            for (int i = 0; i < n; ++i) {
+                // Same row mapping as rasterizeOctaveBand's stretched case:
+                // sample i sits at row (i + 0.5) / n of the plot height.
+                double y = plot.top() + (double(i) + 0.5) / n * plot.height();
+                line << QPointF(xFor(std::clamp(double(average_[size_t(i)]), -1.0, 1.0)), y);
+            }
+            painter.setPen(QPen(QColor(0x1f, 0x4e, 0xd8), 1.6));
+            painter.drawPolyline(line);
+        }
+        painter.setPen(QColor(0xe0, 0xe2, 0xe7));
+        QFont axisFont = painter.font();
+        axisFont.setPixelSize(8);
+        painter.setFont(axisFont);
+        painter.drawText(QRect(plot.left() - 10, plot.bottom() + 3, 20, 14), Qt::AlignCenter, "-1");
+        painter.drawText(QRect(int(xFor(0.0)) - 10, plot.bottom() + 3, 20, 14), Qt::AlignCenter, "0");
+        painter.drawText(QRect(plot.right() - 10, plot.bottom() + 3, 20, 14), Qt::AlignCenter, "1");
+        painter.setFont(font());
+        painter.drawText(QRect(plot.left(), plot.bottom() + 18, plot.width(), 16), Qt::AlignCenter, "Average");
+    }
+
+private:
+    std::vector<float> average_;
+};
+
+} // namespace
+
+AutocorrelationDialog::AutocorrelationDialog(QWidget* parent) : QDialog(parent) {
+    setWindowTitle("Autocorrelation");
+    setModal(false);
+    QVBoxLayout* layout = new QVBoxLayout(this);
+
+    QHBoxLayout* toolbarRow = new QHBoxLayout();
+    toolbarRow->addWidget(new QLabel("Length:"));
+    lengthSpin_ = new QDoubleSpinBox();
+    lengthSpin_->setRange(4.0, 10000.0);
+    lengthSpin_->setDecimals(0);
+    lengthSpin_->setSingleStep(20.0);
+    lengthSpin_->setSuffix(" ms");
+    lengthSpin_->setValue(200.0);
+    lengthSpin_->setToolTip("Maximum lag L: the display runs from -L to +L, lag 0 in the middle");
+    toolbarRow->addWidget(lengthSpin_);
+    QPushButton* applyButton = new QPushButton("Apply");
+    toolbarRow->addWidget(applyButton);
+    toolbarRow->addSpacing(16);
+    infoLabel_ = new QLabel();
+    infoLabel_->setStyleSheet("color: #9a9ca3;");
+    toolbarRow->addWidget(infoLabel_);
+    toolbarRow->addStretch();
+    layout->addLayout(toolbarRow);
+    auto apply = [this]() {
+        if (onApply_) onApply_(lengthSpin_->value());
+    };
+    connect(applyButton, &QPushButton::clicked, this, apply);
+    connect(lengthSpin_, &QDoubleSpinBox::editingFinished, this, apply);
+
+    QHBoxLayout* plots = new QHBoxLayout();
+    plots->setSpacing(0);
+    auto* panelPlot = new OctaveBandPlotWidget();
+    panelPlot->setVerticalTitle("Lag (ms)");
+    panelPlot_ = panelPlot;
+    auto* averagePlot = new AutocorrelationAverageWidget();
+    averagePlot_ = averagePlot;
+    plots->addWidget(panelPlot, 3);
+    plots->addWidget(averagePlot, 1);
+    layout->addLayout(plots, 1);
+    resize(820, 680);
+}
+
+double AutocorrelationDialog::lengthMs() const { return lengthSpin_->value(); }
+
+void AutocorrelationDialog::setResult(const AutocorrelationResult& result) {
+    auto* panelPlot = static_cast<OctaveBandPlotWidget*>(panelPlot_);
+    panelPlot->setBandData(result.panel);
+    panelPlot->setClip(1.0f); // normalized: lag 0 is exactly 1
+    panelPlot->setAxisRange(result.traceStart, result.traceEnd, -result.maxLagSamples, result.maxLagSamples,
+                            result.sampleIntervalUs);
+    static_cast<AutocorrelationAverageWidget*>(averagePlot_)->setAverage(result.average);
+    const double lagMs = result.maxLagSamples * result.sampleIntervalUs / 1000.0;
+    infoLabel_->setText(QString("%1 traces, lags %2 to +%3 ms, normalized to 1 at lag 0")
+                            .arg(result.traceCount)
+                            .arg(-lagMs, 0, 'f', 0)
+                            .arg(lagMs, 0, 'f', 0));
+}
+
+void AutocorrelationDialog::setApplyCallback(std::function<void(double)> callback) { onApply_ = std::move(callback); }
 
 void OctaveBandDialog::emitApply() {
     if (!onApply_ || sourceCombo_->count() == 0) return;
@@ -4432,6 +4560,19 @@ MainWindow::MainWindow() : QMainWindow() {
         computeAndShowOctaveBands(activePanel_, 2, 128);
     });
 
+    // Autocorrelation: opens on the active panel's visible data with the
+    // dialog's current length (200 ms the first time).
+    autocorrelationAction_ = toolbar->addAction(iconAutocorrelation(), "Autocorrelation");
+    autocorrelationAction_->setToolTip("Autocorrelation of the visible data (lags -L..+L)");
+    connect(autocorrelationAction_, &QAction::triggered, this, [this]() {
+        if (!activePanel_->app.loaded) {
+            flashStatusMessage("No data selected");
+            return;
+        }
+        openAutocorrelationDialog();
+        computeAndShowAutocorrelation(activePanel_, autocorrelationDialog_->lengthMs());
+    });
+
     // Text/Binary header viewers: no settings to keep sticky, so these just
     // re-populate from whichever panel is active on every click, unlike
     // Histogram/Spectrum/Display Parameters above.
@@ -4535,6 +4676,7 @@ MainWindow::MainWindow() : QMainWindow() {
         zoomAction_,          moozAction_,         panAction_,         boxSelectAction_,
         seismicModeToolbarAction_, flipHorizontalAction_, identsAction_,  gainDetailAction_, gainUpAction_,
         gainDownAction_,      agcAction_,          spectrumAction_,     histogramAction_,   octaveBandAction_,
+        autocorrelationAction_,
         ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_,
         sidebarToggleAction_,
     };
@@ -4592,6 +4734,7 @@ MainWindow::MainWindow() : QMainWindow() {
         {"spectrum", "Spectrum", 4, {spectrumAction_}},
         {"histogram", "Histogram", 4, {histogramAction_}},
         {"octaveBands", "Octave Bands", 4, {octaveBandAction_}},
+        {"autocorrelation", "Autocorrelation", 4, {autocorrelationAction_}},
         {"textHeader", "Text Header", 4, {ebcdicHeaderAction_}},
         {"binaryHeader", "Binary Header", 4, {binaryHeaderAction_}},
         {"splitView", "Split View", 4, {splitViewAction_}},
@@ -4696,6 +4839,7 @@ MainWindow::MainWindow() : QMainWindow() {
     addMenuMirror(analysisMenu, spectrumAction_, "&Spectrum...");
     addMenuMirror(analysisMenu, histogramAction_, "&Histogram...");
     addMenuMirror(analysisMenu, octaveBandAction_, "&Octave Bands");
+    addMenuMirror(analysisMenu, autocorrelationAction_, "&Autocorrelation...");
 
     // Right dock: relocated color bar (Amplitude Scale) and hover readout
     // (Trace Info), plus a QC Notes placeholder -- see native/README.md
@@ -5852,6 +5996,98 @@ void MainWindow::openOctaveBandDialog() {
     }
     octaveBandDialog_->refreshPanels(QString::fromStdString(panelA_.app.foreground->filePath.stem().string()), panelA_.app.loaded,
                                       QString::fromStdString(panelB_.app.foreground->filePath.stem().string()), panelB_.app.loaded);
+}
+
+void MainWindow::openAutocorrelationDialog() {
+    if (!autocorrelationDialog_) {
+        autocorrelationDialog_ = new AutocorrelationDialog(this);
+        // Recomputes from whichever panel is active at Apply time (non-modal).
+        autocorrelationDialog_->setApplyCallback(
+            [this](double lengthMs) { computeAndShowAutocorrelation(activePanel_, lengthMs); });
+    }
+}
+
+void MainWindow::computeAndShowAutocorrelation(Panel* sourcePanel, double lengthMs) {
+    AppState& app = sourcePanel->app;
+    if (!app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    // The panel's current view, same as Octave Bands: the user picks what
+    // to analyze by zooming/panning to it.
+    int64_t t0 = std::max<int64_t>(0, int64_t(std::floor(app.view.traceStart)));
+    int64_t t1 = std::min<int64_t>(app.foreground->traceCount, int64_t(std::ceil(app.view.traceEnd)));
+    int s0 = std::max(0, int(std::floor(app.view.sampleStart)));
+    int s1 = std::min<int>(app.foreground->binHeader.samplesPerTrace, int(std::ceil(app.view.sampleEnd)));
+    int64_t visibleTraces = t1 - t0;
+    int visibleSamples = s1 - s0;
+    double intervalUs = app.foreground->binHeader.sampleIntervalUs;
+    if (visibleTraces <= 0 || visibleSamples < 2 || intervalUs <= 0) return;
+    int maxLag = int(std::lround(lengthMs * 1000.0 / intervalUs));
+    maxLag = std::clamp(maxLag, 1, visibleSamples - 1);
+
+    std::shared_ptr<Dataset> ds = app.foreground;
+    segy::ColorScale colorScale = app.display.colorScale;
+    bool colorScaleFlipped = app.display.colorScaleFlipped;
+    // Evenly spaced traces across the view, like the octave panels.
+    constexpr int kMaxAutocorrelationTraces = 240;
+    int decodeCount = int(std::min<int64_t>(visibleTraces, kMaxAutocorrelationTraces));
+    auto result = std::make_shared<AutocorrelationResult>();
+    result->traceStart = double(t0);
+    result->traceEnd = double(t1 - 1);
+    result->maxLagSamples = maxLag;
+    result->sampleIntervalUs = intervalUs;
+    result->traceCount = decodeCount;
+
+    runBackgroundTask(
+        QString("Autocorrelation: %1 ms").arg(lengthMs, 0, 'f', 0),
+        [this, ds, t0, t1, s0, visibleSamples, decodeCount, maxLag, colorScale, colorScaleFlipped, result]() {
+            backgroundTaskTotal_ = decodeCount;
+            const int width = 2 * maxLag + 1; // -L..+L
+            std::vector<std::vector<float>> panel(size_t(decodeCount), std::vector<float>(size_t(width), 0.0f));
+            std::vector<double> sum(size_t(width), 0.0);
+            int contributing = 0;
+            double step = double(t1 - t0) / double(decodeCount);
+            int sampleSize = segy::sampleFormatSizeBytes(ds->binHeader.formatCode);
+            std::vector<float> samples(static_cast<size_t>(visibleSamples));
+            for (int i = 0; i < decodeCount; ++i) {
+                int64_t traceIdx = std::min<int64_t>(t0 + int64_t((double(i) + 0.5) * step), t1 - 1);
+                const uint8_t* traceBase =
+                    ds->file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * ds->traceStrideBytes;
+                segy::decodeSamples(traceBase + segy::kTraceHeaderSize + size_t(s0) * size_t(sampleSize),
+                                    samples.data(), size_t(visibleSamples), ds->binHeader.formatCode);
+                std::vector<float> r = segy::normalizedAutocorrelation(samples.data(), visibleSamples, maxLag);
+                std::vector<float>& out = panel[size_t(i)];
+                for (int k = 0; k <= maxLag; ++k) {
+                    out[size_t(maxLag + k)] = r[size_t(k)];
+                    out[size_t(maxLag - k)] = r[size_t(k)];
+                }
+                // Dead traces (r[0] == 0 -> all zero) don't drag the average down.
+                if (r[0] > 0.0f) {
+                    ++contributing;
+                    for (int j = 0; j < width; ++j) sum[size_t(j)] += out[size_t(j)];
+                }
+                backgroundTaskDone_ = i + 1;
+            }
+            result->average.assign(size_t(width), 0.0f);
+            if (contributing > 0) {
+                for (int j = 0; j < width; ++j) result->average[size_t(j)] = float(sum[size_t(j)] / contributing);
+            }
+            auto data = std::make_shared<OctaveBandData>();
+            data->traces = std::move(panel);
+            data->clip = 1.0f;
+            data->colorScale = colorScale;
+            data->colorScaleFlipped = colorScaleFlipped;
+            result->panel = std::move(data);
+        },
+        [this, sourcePanel, result]() {
+            openAutocorrelationDialog();
+            autocorrelationDialog_->setResult(*result);
+            autocorrelationDialog_->setWindowTitle(QString("Autocorrelation") + datasetTitleSuffix(sourcePanel->app));
+            autocorrelationDialog_->show();
+            autocorrelationDialog_->raise();
+            autocorrelationDialog_->activateWindow();
+        });
 }
 
 void MainWindow::registerDataset(std::shared_ptr<Dataset> dataset) {

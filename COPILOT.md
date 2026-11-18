@@ -25,3 +25,5 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 11. **Live subsetting and sorting** — Allow data to be subset and sorted on the fly, and provide a way to output the data with the new sort.
 
 12. **Spectral shaping** — Add spectral shaping as a processing step. Discuss the algorithm, controls, and performance needs before implementation.
+
+13. **Autocorrelation** — Show the autocorrelation of the data in a popup window. The user parameter is the filter length L; the display runs from -L to +L, with the peak at t=0 in the middle. *Status: done — Analysis > Autocorrelation (autocorrelogram per trace plus average curve).*
