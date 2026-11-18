@@ -52,7 +52,11 @@ constexpr int kMinPixelsPerTrace = 3;
 // "loud" the data looks. `reversePolarity` flips every sample's sign
 // before it's mapped to a pixel offset -- see DisplaySettings::
 // reversePolarity (chrome.h), the same flag the Variable Density path reads.
+// `processing` (optional) applies computed gain/AGC to each trace before
+// layout -- see amplitude.h; with AGC on, the clip becomes
+// processedBaseClip(), same as the variable-density path.
 WiggleLayout computeWiggleLayout(const RenderContext& ctx, const ViewRange& view, int plotWidth, int plotHeight,
-                                  double gainDb = 0.0, bool reversePolarity = false);
+                                  double gainDb = 0.0, bool reversePolarity = false,
+                                  const AmplitudeProcessing* processing = nullptr);
 
 } // namespace segy

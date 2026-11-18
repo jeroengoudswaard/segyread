@@ -28,6 +28,7 @@
 #include "analysis.h"
 #include "bandpass.h"
 #include "segy_writer.h"
+#include "amplitude.h"
 
 namespace {
 
@@ -1123,6 +1124,117 @@ void testBandpassFilterIsolatesPassband() {
 // SEG-Y's generated-dataset output. Round-trips a small synthetic file
 // through the app's own normal read path (MappedFile + parse* + decode*)
 // rather than re-deriving the on-disk layout by hand a second time here.
+void testGainCurveInterpolation() {
+    section("Amplitude: computed gain interpolates in dB, holds ends, accepts unsorted pairs");
+    std::vector<segy::GainPoint> curve = {{2000.0, 12.0}, {0.0, 0.0}, {1000.0, 6.0}}; // deliberately unsorted
+    CHECK_NEAR(segy::gainCurveDbAt(curve, -50.0), 0.0, 1e-12);
+    CHECK_NEAR(segy::gainCurveDbAt(curve, 0.0), 0.0, 1e-12);
+    CHECK_NEAR(segy::gainCurveDbAt(curve, 500.0), 3.0, 1e-12);
+    CHECK_NEAR(segy::gainCurveDbAt(curve, 1500.0), 9.0, 1e-12);
+    CHECK_NEAR(segy::gainCurveDbAt(curve, 9999.0), 12.0, 1e-12);
+    CHECK_NEAR(segy::gainCurveDbAt({}, 123.0), 0.0, 1e-12);
+
+    // The per-frame table must agree with the single-point lookup at every
+    // sample time, including a range starting mid-trace.
+    segy::AmplitudeProcessing p;
+    p.gainCurveEnabled = true;
+    p.gainCurve = curve;
+    const double dtMs = 4.0;
+    const int first = 100, count = 600; // 400 ms .. 2796 ms: crosses both segments and the held end
+    segy::AmplitudeProcessor proc(p, first, count, dtMs);
+    CHECK(proc.active());
+    std::vector<float> samples(size_t(count), 1.0f);
+    proc.apply(samples.data());
+    for (int i = 0; i < count; i += 37) {
+        double expected = std::pow(10.0, segy::gainCurveDbAt(curve, double(first + i) * dtMs) / 20.0);
+        CHECK_NEAR(samples[size_t(i)], expected, 1e-5 * expected);
+    }
+}
+
+double windowRms(const std::vector<float>& v, int center, int half) {
+    int lo = std::max(0, center - half), hi = std::min(int(v.size()) - 1, center + half);
+    double sum = 0.0;
+    for (int i = lo; i <= hi; ++i) sum += double(v[size_t(i)]) * v[size_t(i)];
+    return std::sqrt(sum / double(hi - lo + 1));
+}
+
+void testAgcEqualizesAmplitude() {
+    section("Amplitude: AGC brings a weak and a strong stretch to the same RMS, leaves dead traces at zero");
+    const double dtMs = 2.0;
+    const int n = 2000;
+    std::vector<float> trace(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        double amp = i < n / 2 ? 0.01 : 100.0; // 80 dB jump halfway down
+        trace[size_t(i)] = float(amp * std::sin(2.0 * 3.14159265358979 * 25.0 * i * dtMs / 1000.0));
+    }
+    segy::AmplitudeProcessing p;
+    p.agcEnabled = true;
+    p.agcWindowMs = 200.0;
+    int half = segy::AmplitudeProcessor::paddingSamples(p, dtMs);
+    CHECK(half == 50);
+    segy::AmplitudeProcessor proc(p, 0, n, dtMs);
+    proc.apply(trace.data());
+    // Away from the jump and the trace ends, every window's RMS is ~1.
+    for (int c : {200, 400, 1400, 1700}) CHECK_NEAR(windowRms(trace, c, half), 1.0, 0.05);
+
+    std::vector<float> dead(500, 0.0f);
+    segy::AmplitudeProcessor deadProc(p, 0, 500, dtMs);
+    deadProc.apply(dead.data());
+    bool allZero = std::all_of(dead.begin(), dead.end(), [](float v) { return v == 0.0f; });
+    CHECK(allZero);
+}
+
+void testAgcIsViewIndependent() {
+    section("Amplitude: AGC on a padded sub-range matches AGC on the whole trace (panning doesn't shift values)");
+    const double dtMs = 4.0;
+    const int n = 1500;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> noise(0.0f, 1.0f);
+    std::vector<float> full(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) full[size_t(i)] = noise(rng) * float(1.0 + i * 0.05); // growing amplitude
+    std::vector<float> raw = full;
+
+    segy::AmplitudeProcessing p;
+    p.agcEnabled = true;
+    p.agcWindowMs = 300.0;
+    p.gainCurveEnabled = true;
+    p.gainCurve = {{0.0, 0.0}, {6000.0, 20.0}};
+    segy::AmplitudeProcessor(p, 0, n, dtMs).apply(full.data());
+
+    // What renderer.cpp/wiggle.cpp do for a view showing samples [s0, s1).
+    const int s0 = 600, s1 = 900;
+    const int pad = segy::AmplitudeProcessor::paddingSamples(p, dtMs);
+    const int ps0 = std::max(0, s0 - pad), ps1 = std::min(n, s1 + pad);
+    std::vector<float> part(raw.begin() + ps0, raw.begin() + ps1);
+    segy::AmplitudeProcessor(p, ps0, ps1 - ps0, dtMs).apply(part.data());
+    for (int s = s0; s < s1; s += 7) {
+        float a = full[size_t(s)], b = part[size_t(s - ps0)];
+        CHECK_NEAR(b, a, 1e-4 * std::max(1.0f, std::fabs(a)));
+    }
+}
+
+void testAgcClipReplacesRawAndManualClip() {
+    section("Amplitude: with AGC on, the display clip is 100/level (gain on top), manual clip ignored");
+    segy::AmplitudeProcessing p;
+    CHECK_NEAR(segy::processedBaseClip(1234.0f, p), 1234.0, 1e-3); // AGC off: untouched
+    p.agcEnabled = true;
+    p.agcLevelPercent = 25.0;
+    CHECK_NEAR(segy::processedBaseClip(1234.0f, p), 4.0, 1e-6);
+
+    segy::ManualClip manual;
+    manual.enabled = true;
+    manual.posMagnitude = 50.0f;
+    manual.negMagnitude = 70.0f;
+    float pos = 0.0f, neg = 0.0f;
+    segy::displayClipPosNeg(1234.0f, 6.0, manual, &p, &pos, &neg);
+    double g = std::pow(10.0, 6.0 / 20.0);
+    CHECK_NEAR(pos, 4.0 / g, 1e-5);
+    CHECK_NEAR(neg, 4.0 / g, 1e-5);
+    segy::displayClipPosNeg(1234.0f, 0.0, manual, nullptr, &pos, &neg); // no processing: manual clip wins
+    CHECK_NEAR(pos, 50.0, 1e-5);
+    CHECK_NEAR(neg, 70.0, 1e-5);
+}
+
 void testWriteSegyFileRoundTrips() {
     section("Writer: writeSegyFile round-trips through the normal read path exactly");
     std::filesystem::path path = std::filesystem::temp_directory_path() / "segyread_test_writer_roundtrip.sgy";
@@ -1211,6 +1323,10 @@ int main() {
     testSpectrumPeaksAtKnownFrequency();
     testBandpassFilterIsolatesPassband();
     testWriteSegyFileRoundTrips();
+    testGainCurveInterpolation();
+    testAgcEqualizesAmplitude();
+    testAgcIsViewIndependent();
+    testAgcClipReplacesRawAndManualClip();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures;

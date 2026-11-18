@@ -62,6 +62,7 @@ class QPainter;
 class QProgressBar;
 class QTimer;
 class QToolButton;
+class QGroupBox;
 
 namespace segyqt {
 
@@ -772,6 +773,39 @@ private:
     void applySettings();
 };
 
+// View > Amplitude Processing: computed gain (time-gain pairs) and AGC
+// (COPILOT.md items 9/10) -- display-time processing, see
+// viewer/amplitude.h. Non-modal, and every edit applies immediately (a
+// re-render is cheap: one O(samples) pass per visible trace) through the
+// changed callback, which MainWindow routes to targetPanels() so Lock
+// applies it to both panels. Holds no AppState reference -- MainWindow
+// pushes the active panel's settings in via setProcessing(), same loose
+// coupling as CalculatorDialog.
+class AmplitudeProcessingDialog : public QDialog {
+public:
+    explicit AmplitudeProcessingDialog(QWidget* parent = nullptr);
+
+    // Loads `processing` into the controls without firing the callback.
+    // `recordLengthMs` seeds the default curve the first time computed
+    // gain is switched on with no points yet.
+    void setProcessing(const segy::AmplitudeProcessing& processing, double recordLengthMs);
+    void setChangedCallback(std::function<void(const segy::AmplitudeProcessing&)> callback);
+
+private:
+    QGroupBox* gainGroup_ = nullptr;
+    QTableWidget* gainTable_ = nullptr;
+    QGroupBox* agcGroup_ = nullptr;
+    QDoubleSpinBox* agcWindowSpin_ = nullptr;
+    QDoubleSpinBox* agcLevelSpin_ = nullptr;
+    double recordLengthMs_ = 1000.0;
+    bool loading_ = false; // suppresses the callback while setProcessing() fills the controls
+    std::function<void(const segy::AmplitudeProcessing&)> onChanged_;
+
+    void addGainRow(double timeMs, double gainDb);
+    segy::AmplitudeProcessing collect() const;
+    void emitChanged();
+};
+
 // Edit > Calculator: combines two currently-loaded panels' datasets
 // (Add/Subtract) into a new one, auto-named and auto-displayed in the left
 // panel (see MainWindow::runCalculator). Holds no AppState/Panel reference
@@ -870,10 +904,22 @@ private:
 // higher-resolution variable-density raster (QImage, same 0x00RRGGBB packing renderFrame()
 // itself produces) plus its frequency-range label. `bands[0]` is always the
 // unfiltered source; the rest are octave bands, low frequency first.
+// One band's filtered traces, kept (rather than a pre-rendered image) so
+// each OctaveBandPlotWidget can rasterize at its own exact pixel size on
+// resize -- stretching one fixed-size raster with nearest-neighbor scaling
+// is what made the panels look gritty. Immutable once built; shared, not
+// copied, between the background task and the widget.
+struct OctaveBandData {
+    std::vector<std::vector<float>> traces; // evenly spaced across the visible range, each the visible samples
+    float clip = 1.0f;                      // 99.5th percentile |amplitude| of this band
+    segy::ColorScale colorScale = segy::ColorScale::RedWhiteBlue;
+    bool colorScaleFlipped = false;
+};
+
 struct OctaveBandResult {
     struct Band {
         QString label;
-        QImage image;
+        std::shared_ptr<const OctaveBandData> data;
     };
     std::vector<Band> bands;
     double traceStart = 0.0;
@@ -1160,6 +1206,18 @@ private:
     QAction* gainUpAction_ = nullptr;
     QLabel* gainValueLabel_ = nullptr;
     QAction* gainDownAction_ = nullptr;
+
+    // Computed gain + AGC (display-time, see viewer/amplitude.h). agcAction_
+    // is a quick on/off toggle for AGC alone; the full controls (window,
+    // level, time-gain pairs) live in amplitudeProcessingDialog_.
+    QAction* agcAction_ = nullptr;
+    AmplitudeProcessingDialog* amplitudeProcessingDialog_ = nullptr;
+    // Applies `processing` to targetPanels() (Lock-aware), then refreshes
+    // the legend, canvases, and the AGC toggle's checked state.
+    void setAmplitudeProcessing(const segy::AmplitudeProcessing& processing);
+    void openAmplitudeProcessingDialog();
+    // Re-syncs agcAction_ and an open dialog to the active panel's settings.
+    void refreshAmplitudeProcessingControls();
 
     // Spectrum and Histogram open a parameters dialog plus, on Apply/OK, a
     // real computed result plot -- see native/README.md and

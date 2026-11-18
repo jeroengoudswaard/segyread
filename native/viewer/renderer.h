@@ -7,6 +7,7 @@
 // pump events, and call into this.
 #pragma once
 #include <cstdint>
+#include "amplitude.h"
 #include "colormap.h"
 #include "segy_format.h"
 #include "segy_pyramid.h"
@@ -58,6 +59,16 @@ struct ManualClip {
     float negMagnitude = 1.0f;
 };
 
+// The clip magnitudes (positive and negative) a display maps to the color
+// scale's +/-1 endpoints: the pyramid's raw clip, replaced by manualClip's
+// magnitudes when set, then divided by gainDb's linear gain. With AGC on,
+// the base is processedBaseClip() instead and manualClip is ignored -- its
+// magnitudes are in raw data units, which AGC output no longer is. Shared by
+// the render path and the amplitude-scale legend (viewer_qt.cpp) so the
+// legend can never show a range the seismic isn't using.
+void displayClipPosNeg(float rawClip, double gainDb, const ManualClip& manualClip,
+                       const AmplitudeProcessing* processing, float* clipPos, float* clipNeg);
+
 void resetView(ViewRange& view, int64_t traceCount, int samplesPerTrace);
 void clampView(ViewRange& view, int64_t traceCount, int samplesPerTrace);
 
@@ -86,6 +97,8 @@ void panFromAnchor(ViewRange& view, const ViewRange& anchor, int64_t traceCount,
 // clip (0 = trust auto-scaling as-is); see DisplaySettings::gainDb in
 // chrome.h for why it's a multiplier on the clip rather than a separate
 // scaling mode.
+// `processing` (optional) applies computed gain/AGC to each decoded trace
+// before color mapping -- see amplitude.h.
 // `reversePolarity` flips the sign of every displayed sample -- applied
 // after gain/clip magnitude is computed (which stays symmetric either way),
 // only the color each value maps to changes. Wiggle mode applies the same
@@ -93,6 +106,7 @@ void panFromAnchor(ViewRange& view, const ViewRange& anchor, int64_t traceCount,
 // so the two display modes never show opposite polarity for the same data.
 double renderFrame(const RenderContext& ctx, const ViewRange& view, uint32_t* pixels, int width, int height,
                     double gainDb = 0.0, ColorScale colorScale = ColorScale::RedWhiteBlue,
-                    ManualClip manualClip = ManualClip{}, bool reversePolarity = false, bool colorScaleFlipped = false);
+                    ManualClip manualClip = ManualClip{}, bool reversePolarity = false, bool colorScaleFlipped = false,
+                    const AmplitudeProcessing* processing = nullptr);
 
 } // namespace segy

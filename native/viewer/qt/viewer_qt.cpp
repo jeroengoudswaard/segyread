@@ -12,6 +12,7 @@
 #include <QComboBox>
 #include <QCursor>
 #include <QDate>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -19,6 +20,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFont>
+#include <QFormLayout>
 #include <QFontMetrics>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -404,34 +406,105 @@ std::filesystem::path scratchSegyPath(const QString& outputName) {
     return dir / (safe.toStdString() + ".sgy");
 }
 
-// Renders one octave-band panel for the Octave Band Display window: one
-// column per trace in `traces` (nearest-neighbor, not blended -- see
-// native/README.md's reasoning for the main canvas's own trace decimation,
-// which applies identically here), auto-clipped to that band's own peak
-// magnitude since amplitude varies wildly band-to-band. `Format_RGB32` packs
-// 0x00RRGGBB, matching renderFrame()'s own convention.
-QImage rasterizeOctaveBand(const std::vector<std::vector<float>>& traces, int width, int height,
-                            segy::ColorScale colorScale, bool colorScaleFlipped) {
-    QImage img(width, height, QImage::Format_RGB32);
-    if (traces.empty() || traces[0].empty()) {
+// Builds one octave band's display data: the traces plus a robust clip --
+// the 99.5th percentile of |amplitude| rather than the single peak, so one
+// spike can't push the rest of the band toward white (amplitude varies
+// wildly band-to-band, hence a clip per band at all).
+std::shared_ptr<const OctaveBandData> makeOctaveBandData(std::vector<std::vector<float>> traces,
+                                                         segy::ColorScale colorScale, bool colorScaleFlipped) {
+    auto data = std::make_shared<OctaveBandData>();
+    std::vector<float> magnitudes;
+    size_t total = 0;
+    for (const std::vector<float>& tr : traces) total += tr.size();
+    magnitudes.reserve(total);
+    for (const std::vector<float>& tr : traces) {
+        for (float v : tr) magnitudes.push_back(std::fabs(v));
+    }
+    if (!magnitudes.empty()) {
+        size_t k = std::min(magnitudes.size() - 1, size_t(double(magnitudes.size()) * 0.995));
+        std::nth_element(magnitudes.begin(), magnitudes.begin() + std::ptrdiff_t(k), magnitudes.end());
+        data->clip = std::max(magnitudes[k], 1e-12f);
+    }
+    data->traces = std::move(traces);
+    data->colorScale = colorScale;
+    data->colorScaleFlipped = colorScaleFlipped;
+    return data;
+}
+
+// Rasterizes one octave band at exactly width x height pixels:
+//   - time axis: linear interpolation between samples when stretching,
+//     box-averaging the covered samples when shrinking (no dropped rows);
+//   - trace axis: linear interpolation between neighboring traces when
+//     there are more columns than traces (even, smooth trace widths instead
+//     of a mix of 1- and 2-pixel columns), box-averaging when fewer.
+// The traces here are a small, evenly spaced sample of the view (not the
+// main canvas's decimated full-res traces), so blending neighbors is the
+// right call for this overview, unlike renderer.cpp's nearest-trace rule.
+QImage rasterizeOctaveBand(const OctaveBandData& data, int width, int height) {
+    QImage img(std::max(1, width), std::max(1, height), QImage::Format_RGB32);
+    const auto& traces = data.traces;
+    if (traces.empty() || traces[0].empty() || width <= 0 || height <= 0) {
         img.fill(Qt::white);
         return img;
     }
-    float clip = 1e-6f;
-    for (const std::vector<float>& tr : traces) {
-        for (float v : tr) clip = std::max(clip, std::fabs(v));
+    const int nTraces = int(traces.size());
+    const int nSamples = int(traces[0].size());
+
+    // Resample every trace to `height` rows first (one pass per trace), then
+    // resample across traces per pixel -- O(traces*height + width*height).
+    std::vector<float> columns(size_t(nTraces) * size_t(height));
+    const double samplesPerRow = double(nSamples) / double(height);
+    for (int t = 0; t < nTraces; ++t) {
+        const std::vector<float>& tr = traces[size_t(t)];
+        float* out = columns.data() + size_t(t) * size_t(height);
+        for (int y = 0; y < height; ++y) {
+            if (samplesPerRow > 1.0) {
+                int a = std::clamp(int(std::floor(y * samplesPerRow)), 0, nSamples - 1);
+                int b = std::clamp(int(std::ceil((y + 1) * samplesPerRow)), a + 1, nSamples);
+                double sum = 0.0;
+                for (int i = a; i < b; ++i) sum += tr[size_t(i)];
+                out[y] = float(sum / double(b - a));
+            } else {
+                // Samples sit at their integer positions; row centers map onto that axis.
+                double coord = (y + 0.5) * samplesPerRow - 0.5;
+                int i0 = std::clamp(int(std::floor(coord)), 0, nSamples - 1);
+                int i1 = std::min(i0 + 1, nSamples - 1);
+                float f = float(std::clamp(coord - std::floor(coord), 0.0, 1.0));
+                if (coord < 0.0) f = 0.0f;
+                out[y] = tr[size_t(i0)] + (tr[size_t(i1)] - tr[size_t(i0)]) * f;
+            }
+        }
     }
-    int samplesPerTrace = int(traces[0].size());
-    const float colorScaleDirection = colorScaleFlipped ? -1.0f : 1.0f;
-    for (int y = 0; y < height; ++y) {
-        int s = std::clamp(int((double(y) + 0.5) / height * samplesPerTrace), 0, samplesPerTrace - 1);
-        uint32_t* row = reinterpret_cast<uint32_t*>(img.scanLine(y));
-        for (int x = 0; x < width; ++x) {
-            int t = std::clamp(int((double(x) + 0.5) / width * traces.size()), 0, int(traces.size()) - 1);
-            float value = traces[size_t(t)][size_t(s)];
-            uint8_t r, g, b;
-            segy::applyColorScale(colorScale, (value / clip) * colorScaleDirection, &b, &g, &r);
-            row[x] = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(b);
+
+    const float scale = (data.colorScaleFlipped ? -1.0f : 1.0f) / data.clip;
+    const double tracesPerCol = double(nTraces) / double(width);
+    for (int x = 0; x < width; ++x) {
+        int a = 0, b = 0, i0 = 0, i1 = 0;
+        float f = 0.0f;
+        const bool average = tracesPerCol > 1.0;
+        if (average) {
+            a = std::clamp(int(std::floor(x * tracesPerCol)), 0, nTraces - 1);
+            b = std::clamp(int(std::ceil((x + 1) * tracesPerCol)), a + 1, nTraces);
+        } else {
+            double coord = (x + 0.5) * tracesPerCol - 0.5;
+            i0 = std::clamp(int(std::floor(coord)), 0, nTraces - 1);
+            i1 = std::min(i0 + 1, nTraces - 1);
+            f = coord < 0.0 ? 0.0f : float(std::clamp(coord - std::floor(coord), 0.0, 1.0));
+        }
+        for (int y = 0; y < height; ++y) {
+            float value;
+            if (average) {
+                float sum = 0.0f;
+                for (int t = a; t < b; ++t) sum += columns[size_t(t) * size_t(height) + size_t(y)];
+                value = sum / float(b - a);
+            } else {
+                float v0 = columns[size_t(i0) * size_t(height) + size_t(y)];
+                float v1 = columns[size_t(i1) * size_t(height) + size_t(y)];
+                value = v0 + (v1 - v0) * f;
+            }
+            uint8_t r, g, bl;
+            segy::applyColorScale(data.colorScale, value * scale, &bl, &g, &r);
+            reinterpret_cast<uint32_t*>(img.scanLine(y))[x] = (uint32_t(r) << 16) | (uint32_t(g) << 8) | uint32_t(bl);
         }
     }
     return img;
@@ -498,11 +571,20 @@ public:
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         setMouseTracking(true);
         crosshairOverlay_ = new OctaveBandCrosshairOverlay(this);
+        // Exact re-rasterize once a resize settles; until then a cheap
+        // stretch of the last exact raster keeps live resizing responsive.
+        rasterTimer_ = new QTimer(this);
+        rasterTimer_->setSingleShot(true);
+        rasterTimer_->setInterval(80);
+        connect(rasterTimer_, &QTimer::timeout, this, [this]() {
+            rasterizeExact();
+            update();
+        });
     }
 
-    void setImage(const QImage& image) {
-        image_ = image;
-        rebuildScaledImage();
+    void setBandData(std::shared_ptr<const OctaveBandData> bandData) {
+        data_ = std::move(bandData);
+        rasterizeExact();
         update();
     }
 
@@ -528,7 +610,12 @@ protected:
         painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
         QRect plot = plotRect();
         if (plot.width() <= 0 || plot.height() <= 0) return;
-        if (!scaledImage_.isNull()) painter.drawImage(plot, scaledImage_);
+        if (!raster_.isNull()) {
+            // Exact-size raster: a 1:1 blit. A stale one mid-resize gets a
+            // smooth stretch until rasterTimer_ fires.
+            painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            painter.drawImage(plot, raster_);
+        }
 
         painter.setPen(QColor(0x9a, 0x9c, 0xa3));
         painter.drawLine(plot.topLeft(), plot.bottomLeft());
@@ -576,7 +663,11 @@ protected:
 
     void resizeEvent(QResizeEvent* event) override {
         QWidget::resizeEvent(event);
-        rebuildScaledImage();
+        if (raster_.isNull()) {
+            rasterizeExact(); // first layout: nothing to stretch yet
+        } else {
+            rasterTimer_->start();
+        }
         crosshairOverlay_->setGeometry(plotRect());
         crosshairOverlay_->raise();
     }
@@ -596,8 +687,9 @@ protected:
     }
 
 private:
-    QImage image_;
-    QImage scaledImage_;
+    std::shared_ptr<const OctaveBandData> data_;
+    QImage raster_; // rasterized at plotRect() size x devicePixelRatio
+    QTimer* rasterTimer_ = nullptr;
     OctaveBandCrosshairOverlay* crosshairOverlay_ = nullptr;
     double traceStart_ = 0.0;
     double traceEnd_ = 0.0;
@@ -609,13 +701,18 @@ private:
 
     QRect plotRect() const { return rect().adjusted(42, 24, -6, -38); }
 
-    void rebuildScaledImage() {
+    // Device pixels, not logical ones, so HiDPI screens get a sharp image
+    // rather than a 2x-upscaled one.
+    void rasterizeExact() {
         QSize size = plotRect().size();
-        if (!image_.isNull() && size.width() > 0 && size.height() > 0) {
-            scaledImage_ = image_.scaled(size, Qt::IgnoreAspectRatio, Qt::FastTransformation);
-        } else {
-            scaledImage_ = QImage();
+        if (!data_ || size.width() <= 0 || size.height() <= 0) {
+            raster_ = QImage();
+            return;
         }
+        const qreal dpr = devicePixelRatioF();
+        raster_ = rasterizeOctaveBand(*data_, int(std::lround(size.width() * dpr)),
+                                      int(std::lround(size.height() * dpr)));
+        raster_.setDevicePixelRatio(dpr);
     }
 };
 
@@ -1366,6 +1463,155 @@ void DisplayParametersDialog::applySettings() {
     w.varMinimumSpacing = varMinSpacingSpin_->value();
 }
 
+AmplitudeProcessingDialog::AmplitudeProcessingDialog(QWidget* parent) : QDialog(parent) {
+    setWindowTitle("Amplitude Processing");
+    QVBoxLayout* layout = new QVBoxLayout(this);
+
+    QLabel* hint = new QLabel("Display only: the data itself, Spectrum, Histogram and Save SEG-Y are unaffected.");
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color: #9a9ca3;");
+    layout->addWidget(hint);
+
+    // --- Computed gain: time-gain pairs ---
+    gainGroup_ = new QGroupBox("Computed Gain (time-gain pairs)");
+    gainGroup_->setCheckable(true);
+    gainGroup_->setChecked(false);
+    QVBoxLayout* gainLayout = new QVBoxLayout(gainGroup_);
+    QLabel* gainHint = new QLabel("Gain in dB, interpolated linearly in dB between pairs and held "
+                                  "constant before the first and after the last.");
+    gainHint->setWordWrap(true);
+    gainLayout->addWidget(gainHint);
+    gainTable_ = new QTableWidget(0, 2);
+    gainTable_->setHorizontalHeaderLabels({"Time (ms)", "Gain (dB)"});
+    gainTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    gainTable_->verticalHeader()->setVisible(false);
+    gainTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    gainTable_->setMinimumHeight(160);
+    gainLayout->addWidget(gainTable_);
+    QHBoxLayout* rowButtons = new QHBoxLayout;
+    QPushButton* addButton = new QPushButton("Add Pair");
+    QPushButton* removeButton = new QPushButton("Remove Pair");
+    rowButtons->addWidget(addButton);
+    rowButtons->addWidget(removeButton);
+    rowButtons->addStretch();
+    gainLayout->addLayout(rowButtons);
+    layout->addWidget(gainGroup_);
+
+    connect(addButton, &QPushButton::clicked, this, [this]() {
+        // Continue the curve: 500 ms past the last pair, same gain.
+        double t = 0.0, db = 0.0;
+        if (const segy::AmplitudeProcessing p = collect(); !p.gainCurve.empty()) {
+            t = p.gainCurve.back().timeMs + 500.0;
+            db = p.gainCurve.back().gainDb;
+        }
+        addGainRow(t, db);
+        emitChanged();
+    });
+    connect(removeButton, &QPushButton::clicked, this, [this]() {
+        int row = gainTable_->currentRow();
+        if (row < 0) row = gainTable_->rowCount() - 1;
+        if (row < 0) return;
+        gainTable_->removeRow(row);
+        emitChanged();
+    });
+    connect(gainGroup_, &QGroupBox::toggled, this, [this](bool on) {
+        // A sensible starting curve the first time it's switched on:
+        // flat at the top, +12 dB by the end of the record.
+        if (on && gainTable_->rowCount() == 0) {
+            addGainRow(0.0, 0.0);
+            addGainRow(recordLengthMs_, 12.0);
+        }
+        emitChanged();
+    });
+
+    // --- AGC ---
+    agcGroup_ = new QGroupBox("Automatic Gain Control (AGC)");
+    agcGroup_->setCheckable(true);
+    agcGroup_->setChecked(false);
+    QFormLayout* agcLayout = new QFormLayout(agcGroup_);
+    agcWindowSpin_ = new QDoubleSpinBox;
+    agcWindowSpin_->setRange(4.0, 20000.0);
+    agcWindowSpin_->setDecimals(0);
+    agcWindowSpin_->setSingleStep(50.0);
+    agcWindowSpin_->setSuffix(" ms");
+    agcWindowSpin_->setValue(500.0);
+    agcWindowSpin_->setKeyboardTracking(false);
+    agcWindowSpin_->setToolTip("Length of the RMS window centered on each sample");
+    agcLayout->addRow("Window:", agcWindowSpin_);
+    agcLevelSpin_ = new QDoubleSpinBox;
+    agcLevelSpin_->setRange(1.0, 100.0);
+    agcLevelSpin_->setDecimals(0);
+    agcLevelSpin_->setSingleStep(5.0);
+    agcLevelSpin_->setSuffix(" %");
+    agcLevelSpin_->setValue(25.0);
+    agcLevelSpin_->setKeyboardTracking(false);
+    agcLevelSpin_->setToolTip("Where each window's RMS lands on the color scale / wiggle excursion "
+                              "(the toolbar gain still applies on top)");
+    agcLayout->addRow("Level (of full scale):", agcLevelSpin_);
+    layout->addWidget(agcGroup_);
+
+    connect(agcGroup_, &QGroupBox::toggled, this, [this]() { emitChanged(); });
+    connect(agcWindowSpin_, &QDoubleSpinBox::valueChanged, this, [this]() { emitChanged(); });
+    connect(agcLevelSpin_, &QDoubleSpinBox::valueChanged, this, [this]() { emitChanged(); });
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::close);
+    layout->addWidget(buttons);
+}
+
+void AmplitudeProcessingDialog::addGainRow(double timeMs, double gainDb) {
+    int row = gainTable_->rowCount();
+    gainTable_->insertRow(row);
+    auto makeSpin = [this](double min, double max, double step, double value) {
+        QDoubleSpinBox* spin = new QDoubleSpinBox;
+        spin->setRange(min, max);
+        spin->setDecimals(1);
+        spin->setSingleStep(step);
+        spin->setValue(value);
+        spin->setKeyboardTracking(false); // apply on Enter/focus-out, not every keystroke
+        spin->setFrame(false);
+        connect(spin, &QDoubleSpinBox::valueChanged, this, [this]() { emitChanged(); });
+        return spin;
+    };
+    gainTable_->setCellWidget(row, 0, makeSpin(0.0, 1e6, 100.0, timeMs));
+    gainTable_->setCellWidget(row, 1, makeSpin(-60.0, 60.0, 1.0, gainDb));
+}
+
+segy::AmplitudeProcessing AmplitudeProcessingDialog::collect() const {
+    segy::AmplitudeProcessing p;
+    p.gainCurveEnabled = gainGroup_->isChecked();
+    for (int row = 0; row < gainTable_->rowCount(); ++row) {
+        auto* t = qobject_cast<QDoubleSpinBox*>(gainTable_->cellWidget(row, 0));
+        auto* g = qobject_cast<QDoubleSpinBox*>(gainTable_->cellWidget(row, 1));
+        if (t && g) p.gainCurve.push_back({t->value(), g->value()});
+    }
+    p.agcEnabled = agcGroup_->isChecked();
+    p.agcWindowMs = agcWindowSpin_->value();
+    p.agcLevelPercent = agcLevelSpin_->value();
+    return p;
+}
+
+void AmplitudeProcessingDialog::emitChanged() {
+    if (loading_ || !onChanged_) return;
+    onChanged_(collect());
+}
+
+void AmplitudeProcessingDialog::setProcessing(const segy::AmplitudeProcessing& processing, double recordLengthMs) {
+    loading_ = true;
+    if (recordLengthMs > 0.0) recordLengthMs_ = recordLengthMs;
+    gainTable_->setRowCount(0);
+    for (const segy::GainPoint& point : processing.gainCurve) addGainRow(point.timeMs, point.gainDb);
+    gainGroup_->setChecked(processing.gainCurveEnabled);
+    agcGroup_->setChecked(processing.agcEnabled);
+    agcWindowSpin_->setValue(processing.agcWindowMs);
+    agcLevelSpin_->setValue(processing.agcLevelPercent);
+    loading_ = false;
+}
+
+void AmplitudeProcessingDialog::setChangedCallback(std::function<void(const segy::AmplitudeProcessing&)> callback) {
+    onChanged_ = std::move(callback);
+}
+
 CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
     setWindowTitle("Calculator");
     setModal(false);
@@ -1716,7 +1962,7 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
             "border: none; }");
         colLayout->addWidget(labelWidget);
         OctaveBandPlotWidget* plotWidget = new OctaveBandPlotWidget();
-        plotWidget->setImage(band.image);
+        plotWidget->setBandData(band.data);
         plotWidget->setAxisRange(result.traceStart, result.traceEnd, result.sampleStart, result.sampleEnd,
                                 result.sampleIntervalUs);
         bandCrosshairUpdaters_.push_back([plotWidget](double x, double y, bool visible) {
@@ -3360,7 +3606,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             auto wiggleStart = std::chrono::high_resolution_clock::now();
             segy::WiggleLayout wiggle = segy::computeWiggleLayout(
                 makeRenderContext(), app_.view, chrome.plotWidth, insetHeight,
-                app_.display.gainDb + kWiggleGainBoostDb, app_.display.reversePolarity);
+                app_.display.gainDb + kWiggleGainBoostDb, app_.display.reversePolarity, &app_.display.processing);
             app_.lastRenderMs =
                 std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - wiggleStart)
                     .count();
@@ -4057,6 +4303,18 @@ MainWindow::MainWindow() : QMainWindow() {
     connect(gainDownAction_, &QAction::triggered, this,
             [this]() { setGainDb(std::clamp(app_->display.gainDb - 3.0, -6.0, 24.0)); });
 
+    // AGC quick toggle (window/level and computed gain: View > Amplitude
+    // Processing, or right-click this button). Keeps whatever window/level
+    // the panel already had -- it only flips agcEnabled.
+    agcAction_ = toolbar->addAction(iconAgc(), "AGC");
+    agcAction_->setCheckable(true);
+    agcAction_->setToolTip("Automatic Gain Control (right-click for window/level and computed gain)");
+    connect(agcAction_, &QAction::triggered, this, [this](bool checked) {
+        segy::AmplitudeProcessing processing = app_->display.processing;
+        processing.agcEnabled = checked;
+        setAmplitudeProcessing(processing);
+    });
+
     toolbarSeparators_.push_back(toolbar->addSeparator());
 
     // Spectrum/Histogram both open real parameters dialogs (see
@@ -4192,7 +4450,7 @@ MainWindow::MainWindow() : QMainWindow() {
     toolbarOverflowCandidates_ = {
         zoomAction_,          moozAction_,         panAction_,         boxSelectAction_,
         seismicModeToolbarAction_, flipHorizontalAction_, identsAction_,  gainDetailAction_, gainUpAction_,
-        gainDownAction_,      spectrumAction_,     histogramAction_,   octaveBandAction_,
+        gainDownAction_,      agcAction_,          spectrumAction_,     histogramAction_,   octaveBandAction_,
         ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_,
         sidebarToggleAction_,
     };
@@ -4246,6 +4504,7 @@ MainWindow::MainWindow() : QMainWindow() {
         {"idents", "Idents", 2, {identsAction_}},
         {"displayParameters", "Display Parameters", 3, {gainDetailAction_}},
         {"gain", "Gain", 3, {gainSliderAction_, gainUpAction_, gainValueLabelAction_, gainDownAction_}},
+        {"agc", "AGC", 3, {agcAction_}},
         {"spectrum", "Spectrum", 4, {spectrumAction_}},
         {"histogram", "Histogram", 4, {histogramAction_}},
         {"octaveBands", "Octave Bands", 4, {octaveBandAction_}},
@@ -4264,6 +4523,11 @@ MainWindow::MainWindow() : QMainWindow() {
     toolbar_->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(toolbar_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
         QMenu menu(this);
+        if (toolbar_->actionAt(pos) == agcAction_) {
+            QAction* params = menu.addAction("Amplitude Processing...");
+            connect(params, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
+            menu.addSeparator();
+        }
         if (QAction* hit = toolbar_->actionAt(pos)) {
             for (const ToolbarItem& item : toolbarItems_) {
                 if (std::find(item.actions.begin(), item.actions.end(), hit) == item.actions.end()) continue;
@@ -4305,6 +4569,9 @@ MainWindow::MainWindow() : QMainWindow() {
     gainMenu->addSeparator();
     QAction* setGainMenuAction = gainMenu->addAction("&Set Gain...");
     connect(setGainMenuAction, &QAction::triggered, this, &MainWindow::promptForGainDb);
+    addMenuMirror(viewMenu, agcAction_, "&AGC");
+    QAction* amplitudeProcessingMenuAction = viewMenu->addAction("A&mplitude Processing...");
+    connect(amplitudeProcessingMenuAction, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
 
     // Rebuilt on every open, from whichever panel is active right then.
     QMenu* identsMenu = viewMenu->addMenu("I&dents");
@@ -4881,7 +5148,43 @@ void MainWindow::setActivePanel(Panel* panel) {
     variableDensityMenuAction_->setChecked(!isWiggle);
     wiggleMenuAction_->setChecked(isWiggle);
     refreshSeismicModeToolbarIcon();
+    refreshAmplitudeProcessingControls();
     refreshToolChrome();
+}
+
+void MainWindow::setAmplitudeProcessing(const segy::AmplitudeProcessing& processing) {
+    for (Panel* p : targetPanels()) p->app.display.processing = processing;
+    refreshAmplitudeProcessingControls();
+    refreshAmplitudeScale();
+    for (Panel* p : {&panelA_, &panelB_}) p->canvas->update();
+}
+
+void MainWindow::refreshAmplitudeProcessingControls() {
+    agcAction_->setChecked(app_->display.processing.agcEnabled);
+    if (amplitudeProcessingDialog_ && amplitudeProcessingDialog_->isVisible()) {
+        double recordLengthMs = 0.0;
+        if (app_->loaded) {
+            recordLengthMs = double(app_->foreground->binHeader.samplesPerTrace) *
+                             app_->foreground->binHeader.sampleIntervalUs / 1000.0;
+        }
+        amplitudeProcessingDialog_->setProcessing(app_->display.processing, recordLengthMs);
+        amplitudeProcessingDialog_->setWindowTitle(QString("Amplitude Processing") + datasetTitleSuffix(*app_));
+    }
+}
+
+void MainWindow::openAmplitudeProcessingDialog() {
+    if (!amplitudeProcessingDialog_) {
+        amplitudeProcessingDialog_ = new AmplitudeProcessingDialog(this);
+        // Only this dialog's own edits come through here; its controls are
+        // re-filled by refreshAmplitudeProcessingControls() with the
+        // callback suppressed, so there's no feedback loop.
+        amplitudeProcessingDialog_->setChangedCallback(
+            [this](const segy::AmplitudeProcessing& processing) { setAmplitudeProcessing(processing); });
+    }
+    amplitudeProcessingDialog_->show();
+    refreshAmplitudeProcessingControls(); // after show(): it only refreshes a visible dialog
+    amplitudeProcessingDialog_->raise();
+    amplitudeProcessingDialog_->activateWindow();
 }
 
 void MainWindow::zoomToBox() {
@@ -4969,19 +5272,17 @@ void MainWindow::refreshAmplitudeScale() {
     for (Panel* p : {&panelA_, &panelB_}) {
         bool visible = p->app.loaded && p->app.display.showColorBar &&
                         p->app.display.seismicMode == segy::SeismicDisplayMode::VariableDensity;
-        // Same effectiveClipPosNeg/clipForGain math as renderer.cpp -- small
-        // enough to duplicate here rather than export from the shared
-        // renderer for this one caller. Respects the manual clip override
-        // (ClipDialog) the same way the actual render does, so the legend
-        // never shows a range the seismic itself isn't using.
-        float rawClip = std::max(std::fabs(p->app.foreground->pyramid.globalMin), std::fabs(p->app.foreground->pyramid.globalMax));
-        float basePos = p->app.display.manualClip.enabled ? p->app.display.manualClip.posMagnitude : rawClip;
-        float baseNeg = p->app.display.manualClip.enabled ? p->app.display.manualClip.negMagnitude : rawClip;
-        double linearGain = std::pow(10.0, p->app.display.gainDb / 20.0);
-        float posClip = float(double(basePos) / linearGain);
-        float negClip = float(double(baseNeg) / linearGain);
-        if (posClip <= 0.0f) posClip = 1.0f;
-        if (negClip <= 0.0f) negClip = 1.0f;
+        // The renderer's own clip math (segy::displayClipPosNeg), so the
+        // legend never shows a range the seismic itself isn't using --
+        // manual clip (ClipDialog), gain, and AGC's normalized units all
+        // included. Guarded on `loaded`: foreground is null before a load.
+        float posClip = 1.0f, negClip = 1.0f;
+        if (p->app.loaded) {
+            float rawClip = std::max(std::fabs(p->app.foreground->pyramid.globalMin),
+                                     std::fabs(p->app.foreground->pyramid.globalMax));
+            segy::displayClipPosNeg(rawClip, p->app.display.gainDb, p->app.display.manualClip,
+                                    &p->app.display.processing, &posClip, &negClip);
+        }
         p->canvas->setAmplitudeScale(posClip, negClip, visible, p->app.display.colorScale,
                                      p->app.display.colorScaleFlipped);
     }
@@ -5312,10 +5613,10 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
     bool colorScaleFlipped = app.display.colorScaleFlipped;
 
     // Sample enough evenly-spaced traces to fill a panel at native raster
-    // resolution, without filtering every trace in a large view.
+    // resolution, without filtering every trace in a large view. Each band
+    // panel rasterizes these itself at its exact on-screen size (see
+    // rasterizeOctaveBand).
     constexpr int kMaxTracesPerBand = 160;
-    constexpr int kPanelWidth = 200;
-    constexpr int kPanelHeight = 960;
     int decodeCount = int(std::min<int64_t>(visibleTraces, kMaxTracesPerBand));
 
     auto result = std::make_shared<OctaveBandResult>();
@@ -5344,8 +5645,7 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
                                     rawTraces[size_t(i)].data(), size_t(visibleSamples), ds->binHeader.formatCode);
             }
 
-            result->bands.push_back(
-                {"Unfiltered", rasterizeOctaveBand(rawTraces, kPanelWidth, kPanelHeight, colorScale, colorScaleFlipped)});
+            result->bands.push_back({"Unfiltered", makeOctaveBandData(rawTraces, colorScale, colorScaleFlipped)});
             backgroundTaskDone_ = 1;
             int bandsDone = 1;
             for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) {
@@ -5365,8 +5665,7 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
                     segy::applyBandpassFilter(tr, ds->binHeader.sampleIntervalUs, params);
                 }
                 result->bands.push_back({QString("%1 - %2 Hz").arg(lo).arg(hi),
-                                         rasterizeOctaveBand(filtered, kPanelWidth, kPanelHeight, colorScale,
-                                                             colorScaleFlipped)});
+                                         makeOctaveBandData(std::move(filtered), colorScale, colorScaleFlipped)});
                 backgroundTaskDone_ = ++bandsDone;
             }
         },

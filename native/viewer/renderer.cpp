@@ -89,22 +89,9 @@ float clipForGain(float rawClip, double gainDb) {
     return clip > 0.0f ? clip : 1.0f;
 }
 
-// The base clip for each sign, before gainDb: the pyramid's own symmetric
-// global-extremes clip normally, or the manual override's two independent
-// magnitudes when set -- gainDb still applies as a multiplier on top of
-// either, via clipForGain, so the toolbar gain slider works identically
-// either way. Shared by both render paths so they can't drift apart.
-void effectiveClipPosNeg(float rawClip, double gainDb, const ManualClip& manualClip, float* clipPos,
-                          float* clipNeg) {
-    float basePos = manualClip.enabled ? manualClip.posMagnitude : rawClip;
-    float baseNeg = manualClip.enabled ? manualClip.negMagnitude : rawClip;
-    *clipPos = clipForGain(basePos, gainDb);
-    *clipNeg = clipForGain(baseNeg, gainDb);
-}
-
 void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pixels, int width, int height,
                       double gainDb, ColorScale colorScale, const ManualClip& manualClip, bool reversePolarity,
-                      bool colorScaleFlipped) {
+                      bool colorScaleFlipped, const AmplitudeProcessing* processing) {
     int64_t t0 = std::max<int64_t>(0, int64_t(std::floor(v.traceStart)));
     int64_t t1 = std::min<int64_t>(ctx.traceCount, int64_t(std::ceil(v.traceEnd)) + 1);
     int s0 = std::max(0, int(std::floor(v.sampleStart)));
@@ -132,19 +119,41 @@ void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pix
     const uint8_t* fileBase = ctx.file->data();
     int sampleSize = sampleFormatSizeBytes(ctx.binHeader.formatCode);
 
+    // Computed gain/AGC (amplitude.h): decode a padded range so AGC sees
+    // the same neighborhood no matter where the view starts, process it,
+    // then keep only the visible part. Built once per frame, shared by all
+    // workers.
+    const bool processingOn = processing && processing->active();
+    const double sampleIntervalMs = ctx.binHeader.sampleIntervalUs / 1000.0;
+    const int pad = processingOn ? AmplitudeProcessor::paddingSamples(*processing, sampleIntervalMs) : 0;
+    const int ps0 = std::max(0, s0 - pad);
+    const int ps1 = std::min(int(ctx.binHeader.samplesPerTrace), s1 + pad);
+    const int paddedHeight = ps1 - ps0;
+    const AmplitudeProcessor processor =
+        processingOn ? AmplitudeProcessor(*processing, ps0, paddedHeight, sampleIntervalMs)
+                     : AmplitudeProcessor(AmplitudeProcessing{}, 0, 0, sampleIntervalMs);
+
     ctx.pool->parallelFor(size_t(decodedWidth), 4, [&](size_t ltBegin, size_t ltEnd) {
+        std::vector<float> padded(processingOn ? size_t(paddedHeight) : 0);
         for (size_t lt = ltBegin; lt < ltEnd; ++lt) {
             int64_t absTrace = std::min<int64_t>(t0 + int64_t(lt) * stride, t1 - 1);
             const uint8_t* traceBase = fileBase + kHeaderTotalSize + size_t(absTrace) * ctx.traceStrideBytes;
-            const uint8_t* sampleBase = traceBase + kTraceHeaderSize + size_t(s0) * size_t(sampleSize);
-            decodeSamples(sampleBase, decoded.data() + lt * size_t(decodedHeight), size_t(decodedHeight),
-                          ctx.binHeader.formatCode);
+            float* out = decoded.data() + lt * size_t(decodedHeight);
+            if (!processingOn) {
+                const uint8_t* sampleBase = traceBase + kTraceHeaderSize + size_t(s0) * size_t(sampleSize);
+                decodeSamples(sampleBase, out, size_t(decodedHeight), ctx.binHeader.formatCode);
+                continue;
+            }
+            const uint8_t* sampleBase = traceBase + kTraceHeaderSize + size_t(ps0) * size_t(sampleSize);
+            decodeSamples(sampleBase, padded.data(), size_t(paddedHeight), ctx.binHeader.formatCode);
+            processor.apply(padded.data());
+            std::copy_n(padded.data() + (s0 - ps0), size_t(decodedHeight), out);
         }
     });
 
     float rawClip = std::max(std::fabs(ctx.pyramid->globalMin), std::fabs(ctx.pyramid->globalMax));
     float clipPos, clipNeg;
-    effectiveClipPosNeg(rawClip, gainDb, manualClip, &clipPos, &clipNeg);
+    displayClipPosNeg(rawClip, gainDb, manualClip, processing, &clipPos, &clipNeg);
     const float colorScaleDirection = colorScaleFlipped ? -1.0f : 1.0f;
     double traceSpan = v.traceEnd - v.traceStart;
     double sampleSpan = v.sampleEnd - v.sampleStart;
@@ -186,15 +195,29 @@ void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pix
 
 } // namespace
 
+void displayClipPosNeg(float rawClip, double gainDb, const ManualClip& manualClip,
+                       const AmplitudeProcessing* processing, float* clipPos, float* clipNeg) {
+    if (processing && processing->agcEnabled) {
+        float base = processedBaseClip(rawClip, *processing);
+        *clipPos = clipForGain(base, gainDb);
+        *clipNeg = *clipPos;
+        return;
+    }
+    float basePos = manualClip.enabled ? manualClip.posMagnitude : rawClip;
+    float baseNeg = manualClip.enabled ? manualClip.negMagnitude : rawClip;
+    *clipPos = clipForGain(basePos, gainDb);
+    *clipNeg = clipForGain(baseNeg, gainDb);
+}
+
 double renderFrame(const RenderContext& ctx, const ViewRange& view, uint32_t* pixels, int width, int height,
                     double gainDb, ColorScale colorScale, ManualClip manualClip, bool reversePolarity,
-                    bool colorScaleFlipped) {
+                    bool colorScaleFlipped, const AmplitudeProcessing* processing) {
     if (width <= 0 || height <= 0 || !ctx.pyramid || !ctx.pool) return 0.0;
     auto start = std::chrono::high_resolution_clock::now();
 
     if (ctx.file && ctx.file->isOpen()) {
         renderExactPath(ctx, view, pixels, width, height, gainDb, colorScale, manualClip, reversePolarity,
-                        colorScaleFlipped);
+                        colorScaleFlipped, processing);
     }
 
     return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start).count();

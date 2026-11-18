@@ -1903,10 +1903,21 @@ that machinery was built once and shared:
   traces/samples (current view) of the chosen Left/Right panel into
   unfiltered + 2^N Hz octave bands (min/max are power-of-2 combos), each with
   a 15% taper past its edges, rendered **variable-density** (per the mockup
-  feedback), each band auto-clipped to its own peak. Capped at 160 evenly
-  spaced traces per band and rendered into a 200 x 960 cached raster to
-  preserve detail without filtering every visible trace. Resizing scales the
-  cached raster to each plot without re-running the filters. A
+  feedback), each band clipped at its own 99.5th-percentile |amplitude|
+  (it used to be the band's single peak, which let one spike push everything
+  else toward white). Capped at 160 evenly spaced traces per band. Each band
+  keeps its filtered traces (`OctaveBandData`) rather than a pre-rendered
+  image, and each plot rasterizes them itself at its **exact on-screen size
+  in device pixels** (`rasterizeOctaveBand`). Along the time axis it
+  interpolates linearly between samples, or box-averages them when there
+  are more samples than rows. Across traces it interpolates linearly
+  between neighbours, or box-averages when there are more traces than
+  columns. This replaced a fixed 200 x 960 raster that was
+  nearest-neighbour stretched to each plot. That raster dropped rows and
+  gave traces uneven 1-px and 2-px widths, which the user reported as a
+  "gritty" look. On resize, the last raster is shown smooth-stretched, and
+  an exact re-rasterize runs 80 ms after resizing stops. That keeps live
+  resizing responsive, and the filters are never re-run. A
   crosshair follows the cursor in every band at the same normalized
   trace/time position, spanning each plot to its labeled Trace/Time axes
   with endpoint trace labels and rotated time tick values (fixed notation
@@ -2445,6 +2456,71 @@ settings file (restored afterward):
 The new menu entries and the right-click menu were not clicked through
 interactively; see "Trade-offs".
 
+### Computed gain and AGC (display-time amplitude processing)
+
+COPILOT.md items 9 and 10. Both are **display-time** processing, like
+`gainDb` and `reversePolarity`. The two render paths (`renderer.cpp` for
+variable density, `wiggle.cpp` for wiggle) apply them to each trace's
+freshly decoded samples every frame. Nothing is written back to a dataset
+or a file, and Spectrum, Histogram, Octave Bands, Bandpass and Save SEG-Y
+still see the raw data. The settings live per panel in
+`DisplaySettings::processing` (`segy::AmplitudeProcessing`,
+`viewer/amplitude.h`) and are not persisted between sessions.
+
+- **Computed gain**: time-gain pairs in dB, interpolated linearly in dB and
+  held constant before the first pair and after the last. The pairs don't
+  need to be in order.
+- **AGC**: each sample is divided by the RMS of a window of `agcWindowMs`
+  centred on it. The window shrinks at the trace ends, and dead stretches
+  stay zero. **Level** (% of full scale) sets where each window's RMS falls
+  on the colour scale or wiggle excursion. With AGC on, the display clip
+  becomes `100 / level`, in place of the data's raw clip, and the toolbar
+  gain still applies on top. The manual clip (ClipDialog) is ignored while
+  AGC is on, because its magnitudes are in raw data units.
+  `segy::displayClipPosNeg()` is the one place this clip rule lives. The
+  render path and the amplitude legend both call it, which replaced a
+  duplicated copy of the clip maths in `viewer_qt.cpp`.
+- **Order**: computed gain first, then AGC (the usual gain-recovery-then-AGC
+  order). With both on, AGC largely normalizes the curve away beyond one
+  window. That is expected.
+
+**Performance.** An `AmplitudeProcessor` is built once per frame for that
+frame's sample range. It turns the gain curve into a per-sample multiplier
+table, so there is no `pow()` per sample. `apply()` is O(samples) per trace
+whatever the AGC window length, because it uses prefix sums of squares (in
+`double`, since a float running sum loses the weak late-time energy AGC
+exists to bring up). It is const and uses thread-local scratch, so render
+workers share it. On the test file the variable-density render went from
+about 4.3 ms to 4.4 ms with AGC on.
+
+**View independence.** AGC needs data outside the visible range. Both paths
+decode `AmplitudeProcessor::paddingSamples()` (half a window) extra samples
+on each side, clamped to the trace, then process and drop the padding. A
+sample's AGC value therefore doesn't change as you pan or zoom; a unit test
+checks the padded sub-range against whole-trace processing.
+
+**UI**:
+- **AGC** toolbar toggle: hand-drawn `iconAgc()`, its own customizable
+  toolbar item `agc`, mirrored as View > AGC. It only flips `agcEnabled`
+  and keeps the panel's window and level.
+- **View > Amplitude Processing...**: also reached by right-clicking the
+  AGC button. It opens `AmplitudeProcessingDialog`, which is non-modal and
+  applies every edit immediately; a re-render is cheap. It has two
+  checkable groups:
+  - Computed Gain: a table of Time (ms) / Gain (dB) spin boxes with
+    Add/Remove Pair. The first time it is switched on it seeds 0 ms → 0 dB
+    and end of record → +12 dB.
+  - AGC: Window (ms) and Level (%).
+
+  Its spin boxes apply on Enter or focus-out, not on every keystroke. Edits
+  go to `targetPanels()`, so Lock applies them to both panels. Switching
+  the active panel re-syncs the toggle and an open dialog.
+
+Verified by screenshot with AGC temporarily defaulted on (reverted): weak
+deeper events came up to the same visual strength as shallow ones, and the
+legend read ±4 (25% level). The dialog's controls were not click-tested
+interactively; see "Trade-offs".
+
 ### Idents: trace-header reference rows/plot/overlay lines
 
 Modeled on a reference seismic tool's own Idents submenu (two screenshots:
@@ -2645,5 +2721,18 @@ the layout pixel-for-pixel to the pre-feature baseline.
   sense for data where a field was deliberately repurposed to carry a
   pick/marker time (a real legacy workflow this was modeled on, but not
   something this app's own synthetic test fixture demonstrates).
+- **Computed gain/AGC are display-only and not persisted** — they don't
+  feed Spectrum/Histogram/Octave Bands/Save SEG-Y, and reset every session.
+  Writing processed data out (e.g. via Save SEG-Y) or remembering settings
+  would be natural follow-ups. The Amplitude Processing dialog itself was
+  not interactively click-tested (the rendering was verified by
+  screenshot, the maths by unit tests).
+- **Octave Band Display decimates traces at wide zoom** — at full zoom-out
+  on a large line, its 160 traces are hundreds of traces apart, so
+  neighbouring columns are uncorrelated and the bands show vertical
+  streaks. That is spatial aliasing in what's sampled, not a drawing
+  artifact; averaging each column's traces (a spatial anti-alias filter)
+  would smooth it at the cost of suppressing incoherent energy, and is an
+  open design choice.
 - **No bottom ident plot** (only top) — per the user's own call ("can be
   regretted"), not an oversight.

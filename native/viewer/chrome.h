@@ -60,6 +60,10 @@ struct DisplaySettings {
     // settings) because it applies identically to both Variable Density
     // and Wiggle, both of which read DisplaySettings fresh every frame.
     bool reversePolarity = false;
+    // Computed gain and AGC (COPILOT.md items 9/10) -- display-time only,
+    // applied by both render paths to each decoded trace; see amplitude.h.
+    // Set from View > Amplitude Processing / the toolbar's AGC toggle.
+    AmplitudeProcessing processing;
 };
 
 struct TimeTick {

@@ -209,6 +209,21 @@ QIcon iconIdents() {
     return renderSvgIcon(kSvg);
 }
 
+// AGC toolbar toggle (hand-drawn, nothing in Tabler covers it): a wave of
+// constant amplitude between two flat envelope lines -- AGC's whole point
+// is evening amplitude out along the trace.
+QIcon iconAgc() {
+    static const QString kSvg = QStringLiteral(R"(
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 4l18 0" />
+          <path d="M3 20l18 0" />
+          <path d="M3 12c1.5 -6 3 -6 4.5 0s3 6 4.5 0s3 -6 4.5 0s3 6 4.5 0" />
+        </svg>
+    )");
+    return renderSvgIcon(kSvg);
+}
+
 // Tabler Icons "arrows-horizontal" (https://tabler.io/icons/icon/arrows-horizontal),
 // MIT licensed -- Flip Horizontal toolbar button.
 QIcon iconArrowsHorizontal() {

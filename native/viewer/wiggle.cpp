@@ -35,7 +35,7 @@ std::vector<int64_t> selectTraces(const ViewRange& view, int64_t traceCount, int
 } // namespace
 
 WiggleLayout computeWiggleLayout(const RenderContext& ctx, const ViewRange& view, int plotWidth, int plotHeight,
-                                  double gainDb, bool reversePolarity) {
+                                  double gainDb, bool reversePolarity, const AmplitudeProcessing* processing) {
     WiggleLayout layout;
     if (plotWidth <= 0 || plotHeight <= 0 || !ctx.file || !ctx.file->isOpen() || ctx.traceCount <= 0) return layout;
 
@@ -61,6 +61,8 @@ WiggleLayout computeWiggleLayout(const RenderContext& ctx, const ViewRange& view
     float rawClip = 0.0f;
     if (ctx.pyramid) rawClip = std::max(std::fabs(ctx.pyramid->globalMin), std::fabs(ctx.pyramid->globalMax));
     if (rawClip <= 0.0f) rawClip = 1.0f;
+    const bool processingOn = processing && processing->active();
+    if (processingOn) rawClip = processedBaseClip(rawClip, *processing);
     double linearGain = std::pow(10.0, gainDb / 20.0);
     float clip = float(double(rawClip) / linearGain);
     if (clip <= 0.0f) clip = 1.0f;
@@ -78,14 +80,34 @@ WiggleLayout computeWiggleLayout(const RenderContext& ctx, const ViewRange& view
     // regardless of how many raw samples are actually in view.
     bool useEnvelope = decodedCount > plotHeight * 2;
 
+    // Computed gain/AGC: same padded-decode approach as renderer.cpp, so
+    // AGC values don't shift as the view pans.
+    const double sampleIntervalMs = ctx.binHeader.sampleIntervalUs / 1000.0;
+    const int pad = processingOn ? AmplitudeProcessor::paddingSamples(*processing, sampleIntervalMs) : 0;
+    const int ps0 = std::max(0, s0 - pad);
+    const int ps1 = std::min(samplesPerTrace, s1 + pad);
+    const int paddedCount = ps1 - ps0;
+    const AmplitudeProcessor processor = processingOn
+                                             ? AmplitudeProcessor(*processing, ps0, paddedCount, sampleIntervalMs)
+                                             : AmplitudeProcessor(AmplitudeProcessing{}, 0, 0, sampleIntervalMs);
+
     size_t decodedCountSz = size_t(decodedCount);
     auto worker = [&](size_t begin, size_t end) {
         std::vector<float> decoded(decodedCountSz);
+        std::vector<float> padded(processingOn ? size_t(paddedCount) : 0);
         for (size_t i = begin; i < end; ++i) {
             int64_t absTrace = traceIndices[i];
             const uint8_t* traceBase = fileBase + kHeaderTotalSize + size_t(absTrace) * ctx.traceStrideBytes;
-            const uint8_t* sampleBase = traceBase + kTraceHeaderSize + size_t(s0) * size_t(sampleFormatSize);
-            decodeSamples(sampleBase, decoded.data(), size_t(decodedCount), ctx.binHeader.formatCode);
+            if (processingOn) {
+                const uint8_t* paddedBase =
+                    traceBase + kTraceHeaderSize + size_t(ps0) * size_t(sampleFormatSize);
+                decodeSamples(paddedBase, padded.data(), size_t(paddedCount), ctx.binHeader.formatCode);
+                processor.apply(padded.data());
+                std::copy_n(padded.data() + (s0 - ps0), decodedCountSz, decoded.data());
+            } else {
+                const uint8_t* sampleBase = traceBase + kTraceHeaderSize + size_t(s0) * size_t(sampleFormatSize);
+                decodeSamples(sampleBase, decoded.data(), size_t(decodedCount), ctx.binHeader.formatCode);
+            }
 
             float baselineX = float((double(absTrace) + 0.5 - view.traceStart) / traceSpan * plotWidth);
 

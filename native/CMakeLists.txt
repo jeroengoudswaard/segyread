@@ -84,6 +84,7 @@ add_library(segyviewercore STATIC
     viewer/axis_ticks.cpp
     viewer/fft.cpp
     viewer/bandpass.cpp
+    viewer/amplitude.cpp
 )
 target_include_directories(segyviewercore PUBLIC viewer)
 target_link_libraries(segyviewercore PUBLIC segycore)

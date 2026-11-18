@@ -85,7 +85,7 @@ ChromeLayout renderFrameWithChrome(const RenderContext& ctx, const ViewRange& vi
             result.lastRenderMs =
                 renderFrame(ctx, view, scratch.data(), result.plotWidth, canvasHeight, settings.gainDb,
                             settings.colorScale, settings.manualClip, settings.reversePolarity,
-                            settings.colorScaleFlipped);
+                            settings.colorScaleFlipped, &settings.processing);
         } else {
             std::fill(scratch.begin(), scratch.end(), 0x00FFFFFFu);
         }

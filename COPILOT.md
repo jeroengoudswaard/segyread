@@ -18,9 +18,9 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 8. **Linear-event slope measurement** — Let the user draw a line on a panel and calculate its velocity from time and the x-axis in meters (for example, water velocity is commonly 1500 m/s). Show the slope value at the bottom of the trace information panel, in a separate section divided by a horizontal line.
 
-9. **Automatic Gain Control (AGC)** — Add AGC with controls for window and level.
+9. **Automatic Gain Control (AGC)** — Add AGC with controls for window and level. *Status: done — toolbar toggle + View > Amplitude Processing (window ms, level % of full scale); display-time, not persisted.*
 
-10. **Computed gain** — Support gain defined as time-gain pairs, so gain can vary as a function of time.
+10. **Computed gain** — Support gain defined as time-gain pairs, so gain can vary as a function of time. *Status: done — time (ms) / gain (dB) pairs in View > Amplitude Processing, interpolated in dB.*
 
 11. **Live subsetting and sorting** — Allow data to be subset and sorted on the fly, and provide a way to output the data with the new sort.
 
