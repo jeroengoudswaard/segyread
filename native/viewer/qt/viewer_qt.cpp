@@ -3,6 +3,7 @@
 #include "axis_ticks.h"
 #include "segy_decode.h"
 #include "viewer_qt_icons.h"
+#include "dark_titlebar.h"
 
 #include <QAction>
 #include <QActionGroup>
@@ -49,6 +50,7 @@
 #include <QPushButton>
 #include <QRadioButton>
 #include <QResizeEvent>
+#include <QScreen>
 #include <QScrollArea>
 #include <QShowEvent>
 #include <QSlider>
@@ -1927,14 +1929,14 @@ OctaveBandDialog::OctaveBandDialog(QWidget* parent) : QDialog(parent) {
     toolbarRow->addStretch();
     layout->addLayout(toolbarRow);
 
-    QScrollArea* scroll = new QScrollArea();
-    scroll->setWidgetResizable(true);
+    scroll_ = new QScrollArea();
+    scroll_->setWidgetResizable(true);
     bandsRow_ = new QWidget();
     QHBoxLayout* bandsLayout = new QHBoxLayout(bandsRow_);
     bandsLayout->setSpacing(0);
     bandsLayout->setContentsMargins(0, 0, 0, 0);
-    scroll->setWidget(bandsRow_);
-    layout->addWidget(scroll, 1);
+    scroll_->setWidget(bandsRow_);
+    layout->addWidget(scroll_, 1);
 
     connect(sourceCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { emitApply(); });
 
@@ -1991,14 +1993,17 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
         // Scale choice.
         QString labelText = band.label;
         if (band.data.get() != reference && referenceRms > 0.0f) {
-            // QChar, not "\u00b7" literals: the build has no /utf-8, so MSVC
-            // would encode those in the local code page, not UTF-8.
-            const QString dot(QChar(0x00B7));
+            // On its own line, so the dB text never widens the column (it
+            // used to make the band row wider than the window). QChar, not
+            // a "\u221e" literal: the build has no /utf-8, so MSVC would
+            // encode that in the local code page, not UTF-8.
             labelText += band.data->rms > 0.0f
-                             ? QString(" %1 %2 dB")
-                                   .arg(dot)
-                                   .arg(20.0 * std::log10(double(band.data->rms) / referenceRms), 0, 'f', 0)
-                             : QString(" %1 -%2 dB").arg(dot, QString(QChar(0x221E)));
+                             ? QString("\n%1 dB").arg(20.0 * std::log10(double(band.data->rms) / referenceRms), 0, 'f', 0)
+                             : QString("\n-%1 dB").arg(QString(QChar(0x221E)));
+        } else if (band.data.get() == reference) {
+            // The reference itself: a second line too, so every header is
+            // the same height and all plots line up.
+            labelText += "\n0 dB (reference)";
         }
         QLabel* labelWidget = new QLabel(labelText);
         labelWidget->setAlignment(Qt::AlignCenter);
@@ -2027,6 +2032,30 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
     }
     bandsRow_->setLayout(bandsLayout);
     applyScaling();
+    fitWidthToBands();
+}
+
+void OctaveBandDialog::fitWidthToBands() {
+    // Content width the band row needs, plus everything around the scroll
+    // area's viewport: the dialog's layout margins and the scroll frame.
+    const int needed = bandsRow_->minimumSizeHint().width();
+    const QMargins margins = layout()->contentsMargins();
+    const int chrome = margins.left() + margins.right() + 2 * scroll_->frameWidth() + 2;
+    int wanted = needed + chrome;
+    if (wanted <= width()) return; // never shrink what the user chose
+    const QScreen* screen = this->screen() ? this->screen() : QGuiApplication::primaryScreen();
+    const QRect available = screen ? screen->availableGeometry() : QRect(0, 0, wanted, height());
+    // The frame (title bar/borders) is outside width(); leave room for it.
+    const int frameExtra = frameGeometry().width() - width();
+    wanted = std::min(wanted, available.width() - std::max(0, frameExtra) - 16);
+    resize(wanted, height());
+    // Keep a visible window fully on screen after growing.
+    if (isVisible()) {
+        QRect frame = frameGeometry();
+        if (frame.right() > available.right()) frame.moveRight(available.right());
+        if (frame.left() < available.left()) frame.moveLeft(available.left());
+        move(frame.topLeft());
+    }
 }
 
 void OctaveBandDialog::applyScaling() {
@@ -5685,9 +5714,29 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
         QString("Octave Bands: %1-%2 Hz").arg(minFreqHz).arg(maxFreqHz),
         [this, ds, t0, t1, s0, visibleSamples, decodeCount, minFreqHz, maxFreqHz, colorScale, colorScaleFlipped,
          result]() {
-            int bandCount = 1;
-            for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) ++bandCount;
-            backgroundTaskTotal_ = bandCount;
+            // Bands as scipy users would build them: Butterworth, order
+            // kOctaveButterworthOrder, applied zero-phase with sosfiltfilt
+            // (odd-reflection padding + steady-state initial conditions, so
+            // no edge transients) -- see viewer/iirfilter.h. A band reaching
+            // Nyquist becomes a highpass (a bandpass edge at/above Nyquist
+            // is undefined; scipy would refuse it); bands entirely above
+            // Nyquist are dropped rather than shown blank.
+            constexpr int kOctaveButterworthOrder = 4;
+            const double sampleRateHz = 1'000'000.0 / ds->binHeader.sampleIntervalUs;
+            const double nyquistHz = sampleRateHz / 2.0;
+            struct BandSpec {
+                int lo, hi;
+                bool highpass;
+            };
+            std::vector<BandSpec> specs;
+            for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) {
+                if (lo >= nyquistHz * 0.999) break;
+                int hi = std::min(lo * 2, maxFreqHz);
+                bool highpass = hi >= nyquistHz * 0.999;
+                specs.push_back({lo, hi, highpass});
+                if (highpass) break;
+            }
+            backgroundTaskTotal_ = int64_t(specs.size()) + 1;
 
             double step = double(t1 - t0) / double(decodeCount);
             std::vector<std::vector<float>> rawTraces(static_cast<size_t>(decodeCount));
@@ -5703,24 +5752,15 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
             result->bands.push_back({"Unfiltered", makeOctaveBandData(rawTraces, colorScale, colorScaleFlipped)});
             backgroundTaskDone_ = 1;
             int bandsDone = 1;
-            for (int lo = minFreqHz; lo < maxFreqHz; lo *= 2) {
-                int hi = std::min(lo * 2, maxFreqHz);
-                // A small taper past each edge (15% of the band's own
-                // width) instead of a hard wall at exactly lo/hi, so
-                // adjacent bands overlap smoothly rather than ringing --
-                // same reasoning as Bandpass's Hanning taper.
-                double taper = double(hi - lo) * 0.15;
-                segy::BandpassParams params;
-                params.lowCut = std::max(0.0, double(lo) - taper);
-                params.lowPass = double(lo);
-                params.highPass = double(hi);
-                params.highCut = double(hi) + taper;
+            for (const BandSpec& spec : specs) {
+                const std::vector<segy::Biquad> sos =
+                    spec.highpass ? segy::butterworthHighpass(kOctaveButterworthOrder, spec.lo, sampleRateHz)
+                                  : segy::butterworthBandpass(kOctaveButterworthOrder, spec.lo, spec.hi, sampleRateHz);
                 std::vector<std::vector<float>> filtered = rawTraces;
-                for (std::vector<float>& tr : filtered) {
-                    segy::applyBandpassFilter(tr, ds->binHeader.sampleIntervalUs, params);
-                }
-                result->bands.push_back({QString("%1 - %2 Hz").arg(lo).arg(hi),
-                                         makeOctaveBandData(std::move(filtered), colorScale, colorScaleFlipped)});
+                for (std::vector<float>& tr : filtered) segy::sosFiltFilt(sos, tr);
+                QString label = spec.highpass ? QString("%1 Hz - Nyquist").arg(spec.lo)
+                                              : QString("%1 - %2 Hz").arg(spec.lo).arg(spec.hi);
+                result->bands.push_back({label, makeOctaveBandData(std::move(filtered), colorScale, colorScaleFlipped)});
                 backgroundTaskDone_ = ++bandsDone;
             }
         },
@@ -6038,6 +6078,7 @@ int main(int argc, char** argv) {
     // app.rc.
     app.setWindowIcon(QIcon(QStringLiteral(":/app_icon.png")));
     app.setStyleSheet(darkStyleSheet());
+    segyqt::installDarkTitleBars(app); // Windows: black title bars on every window, matching the theme
     segyqt::MainWindow window;
     window.show();
     if (argc > 1) window.openInitialFile(std::filesystem::path(argv[1]));

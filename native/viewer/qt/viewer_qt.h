@@ -23,6 +23,7 @@
 
 #include "analysis.h"
 #include "bandpass.h"
+#include "iirfilter.h"
 #include "chrome.h"
 #include "colormap.h"
 #include "loader.h"
@@ -63,6 +64,7 @@ class QProgressBar;
 class QTimer;
 class QToolButton;
 class QGroupBox;
+class QScrollArea;
 
 namespace segyqt {
 
@@ -959,7 +961,11 @@ private:
     // Per band: each band auto-clipped to itself, to see a weak band's
     // structure. Switching only re-rasterizes (no re-filtering).
     QComboBox* scaleCombo_ = nullptr;
+    QScrollArea* scroll_ = nullptr;
     QWidget* bandsRow_ = nullptr;
+    // Widens the window (never narrows it) so every band column fits without
+    // horizontal scrolling, capped to the screen -- called per new result.
+    void fitWidthToBands();
     std::vector<std::function<void(double, double, bool)>> bandCrosshairUpdaters_;
     std::vector<std::function<void(float)>> bandClipSetters_; // one per band, same order as bandOwnClips_
     std::vector<float> bandOwnClips_;

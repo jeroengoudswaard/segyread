@@ -29,6 +29,8 @@
 #include "bandpass.h"
 #include "segy_writer.h"
 #include "amplitude.h"
+#include "iirfilter.h"
+#include <complex>
 
 namespace {
 
@@ -1235,6 +1237,74 @@ void testAgcClipReplacesRawAndManualClip() {
     CHECK_NEAR(neg, 70.0, 1e-5);
 }
 
+// Reference values from scipy 1.18.1:
+//   sos = signal.butter(4, [lo, hi], btype='band', fs=250, output='sos')   (or btype='high')
+//   y = signal.sosfiltfilt(sos, x)   # defaults: padtype='odd', default padlen
+// for the x defined in testSosFiltFiltMatchesScipy, sampled at these indices
+// (both trace ends included, since edge handling is the point of filtfilt).
+struct ScipyFiltFiltCase {
+    const char* kind;
+    double lo, hi;
+    double expected[17];
+};
+const int kScipyIndices[17] = {0, 1, 2, 5, 13, 27, 60, 125, 250, 375, 440, 470, 486, 494, 497, 498, 499};
+const ScipyFiltFiltCase kScipyCases[] = {
+{"band", 1, 2, {0.223853612, 0.25079602, 0.277742311, 0.358223342, 0.563344698, 0.83939747, 0.681321106, -1.13790195, 0.118475304, 0.272789323, -0.0582243464, -0.0238738653, -0.00665632873, -0.00256012338, -0.00165162308, -0.00140998938, -0.0011956568}},
+{"band", 8, 16, {-0.00363811356, 0.142572771, 0.274892792, 0.468906538, -0.3908038, 0.393420316, -0.228708124, 0.146747123, 0.147859751, 0.149945831, 0.433211376, -0.316598708, 0.306313543, -0.239707554, -0.152498661, -0.101800991, -0.0498335606}},
+{"band", 32, 64, {-0.000530618592, 0.290142002, 0.180675348, -0.00236031703, -0.176995792, 0.176181038, -1.51855983e-05, 8.91103116e-07, 8.90360125e-07, 9.28771652e-07, -5.34064135e-05, 0.000146975442, 0.275856213, -0.322850113, 0.193522307, 0.090948682, 0.00224788324}},
+{"high", 64, 0, {-0.000137877059, 0.170126863, -0.186690923, -0.189460771, -0.189951842, -0.18624516, -0.117176204, 3.10563479e-08, 3.10563589e-08, 3.10563711e-08, 0.11717625, 0.189594116, -0.0347458244, -0.199685509, -0.113783845, 0.102983317, 0.000112874669}},
+};
+
+void testSosFiltFiltMatchesScipy() {
+    section("IIR: Butterworth sos + sosfiltfilt (odd padding, steady-state zi) matches scipy, edges included");
+    const double fs = 250.0;
+    const int n = 500;
+    std::vector<float> x(static_cast<size_t>(n));
+    const double twoPi = 2.0 * 3.14159265358979323846;
+    for (int i = 0; i < n; ++i) {
+        double t = i / fs;
+        x[size_t(i)] = float(std::sin(twoPi * 1.5 * t) + 0.5 * std::sin(twoPi * 12.0 * t + 0.3) +
+                             0.3 * std::sin(twoPi * 50.0 * t) + 0.2 * std::sin(twoPi * 90.0 * t) + 0.002 * i + 0.7);
+    }
+    for (const ScipyFiltFiltCase& c : kScipyCases) {
+        std::vector<segy::Biquad> sos = std::string(c.kind) == "band" ? segy::butterworthBandpass(4, c.lo, c.hi, fs)
+                                                                      : segy::butterworthHighpass(4, c.lo, fs);
+        CHECK(int(sos.size()) == (std::string(c.kind) == "band" ? 4 : 2));
+        std::vector<float> y = x;
+        segy::sosFiltFilt(sos, y);
+        double maxError = 0.0;
+        for (int k = 0; k < 17; ++k) {
+            double expected = c.expected[k];
+            maxError = std::max(maxError, std::fabs(double(y[size_t(kScipyIndices[k])]) - expected));
+            // float in/out vs. scipy's float64 throughout: allow float
+            // rounding of the input (~1e-7 relative) carried through.
+            CHECK_NEAR(y[size_t(kScipyIndices[k])], expected, 2e-6 + 2e-6 * std::fabs(expected));
+        }
+        std::printf("   %s %g-%g Hz: max |C++ - scipy| = %.2g\n", c.kind, c.lo, c.hi, maxError);
+    }
+    // Default padlen matches scipy's formula for these filters (4 full biquads -> 27).
+    CHECK(segy::sosFiltFiltDefaultPadlen(segy::butterworthBandpass(4, 8, 16, fs)) == 27);
+}
+
+void testButterworthCornerGain() {
+    section("IIR: Butterworth corners at -3 dB (|H| = 1/sqrt 2), unity in the passband");
+    const double fs = 500.0;
+    std::vector<segy::Biquad> sos = segy::butterworthBandpass(4, 10.0, 40.0, fs);
+    auto gainAt = [&](double hz) {
+        std::complex<double> z = std::exp(std::complex<double>(0.0, -2.0 * 3.14159265358979323846 * hz / fs));
+        std::complex<double> h(1.0, 0.0);
+        for (const segy::Biquad& q : sos) {
+            h *= (q.b0 + q.b1 * z + q.b2 * z * z) / (1.0 + q.a1 * z + q.a2 * z * z);
+        }
+        return std::abs(h);
+    };
+    CHECK_NEAR(gainAt(10.0), 1.0 / std::sqrt(2.0), 1e-9);
+    CHECK_NEAR(gainAt(40.0), 1.0 / std::sqrt(2.0), 1e-9);
+    CHECK_NEAR(gainAt(20.0), 1.0, 1e-3);
+    CHECK(gainAt(1.0) < 1e-3);
+    CHECK(gainAt(200.0) < 1e-3);
+}
+
 void testWriteSegyFileRoundTrips() {
     section("Writer: writeSegyFile round-trips through the normal read path exactly");
     std::filesystem::path path = std::filesystem::temp_directory_path() / "segyread_test_writer_roundtrip.sgy";
@@ -1323,6 +1393,8 @@ int main() {
     testSpectrumPeaksAtKnownFrequency();
     testBandpassFilterIsolatesPassband();
     testWriteSegyFileRoundTrips();
+    testSosFiltFiltMatchesScipy();
+    testButterworthCornerGain();
     testGainCurveInterpolation();
     testAgcEqualizesAmplitude();
     testAgcIsViewIndependent();

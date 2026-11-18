@@ -1901,9 +1901,11 @@ that machinery was built once and shared:
   The dialog previews that exact text.
 - **Octave Band Display** (toolbar, `columns-3` icon): filters the *visible*
   traces/samples (current view) of the chosen Left/Right panel into
-  unfiltered + 2^N Hz octave bands (min/max are power-of-2 combos), each with
-  a 15% taper past its edges, rendered **variable-density** (per the mockup
-  feedback). **Scale** (in the window's toolbar) chooses the clip:
+  unfiltered + 2^N Hz octave bands (min/max are power-of-2 combos), rendered
+  **variable-density** (per the mockup feedback). Each band is filtered the
+  way scipy users do it, using `viewer/iirfilter.*` (see "Octave-band
+  filtering: Butterworth + sosfiltfilt" below), not the FFT trapezoid
+  filter used by Edit > Processing > Bandpass. **Scale** (in the window's toolbar) chooses the clip:
   + **Common** (the default): every band uses the Unfiltered band's
     99.5th-percentile |amplitude|, so each band's true strength shows. In
     seismic data a 1-2 Hz or 2-4 Hz band should read near-white.
@@ -1912,8 +1914,13 @@ that machinery was built once and shared:
     user pointed out that it hid how weak the low bands really are.
 
   Switching only re-rasterizes, without re-filtering. Each filtered band's
-  header also shows its RMS level relative to Unfiltered (for example
-  "2 - 4 Hz · −33 dB"), whichever scale is chosen. The percentile replaced
+  header also shows, on a second line, its RMS level relative to Unfiltered
+  (for example "2 - 4 Hz" over "-17 dB"), whichever scale is chosen.
+  Unfiltered's own header reads "0 dB (reference)", so all headers are the
+  same height and the plots line up. The dB used to sit on the same line,
+  which widened every column until the band row no longer fit the window.
+  `fitWidthToBands()` now also widens the window (never narrows it) to fit
+  every band, capped to the screen's available width, on each new result. The percentile replaced
   the band's single peak, which let one spike push everything else toward
   white. Capped at 160 evenly spaced traces per band. Each band
   keeps its filtered traces (`OctaveBandData`) rather than a pre-rendered
@@ -2465,6 +2472,66 @@ settings file (restored afterward):
 
 The new menu entries and the right-click menu were not clicked through
 interactively; see "Trade-offs".
+
+### Octave-band filtering: Butterworth + sosfiltfilt
+
+At the user's request the Octave Band Display filters the way
+`scipy.signal` users do, since that is the industry standard:
+`butter(4, [lo, hi], btype='band', output='sos')` applied with
+`sosfiltfilt`, using its defaults. `viewer/iirfilter.*` ports exactly that:
+
+- `butterworthBandpass` / `butterworthHighpass` follow scipy's own chain:
+  - `buttap` prototype poles;
+  - prewarping with fs = 2;
+  - `lp2bp_zpk` / `lp2hp_zpk`;
+  - `bilinear_zpk`.
+
+  The result is second-order sections, which stay numerically stable for
+  narrow low bands such as 1-2 Hz, where a single high-order polynomial
+  would not. Poles are grouped into sections by conjugate pairs. The pairing
+  differs from scipy's `zpk2sos`, but the cascade's transfer function is
+  identical.
+- `sosFiltFilt` runs a forward and a backward pass (zero phase). Edge
+  handling is the reason filtfilt is the standard:
+  - **Odd padding** (`padtype='odd'`): the trace is extended at both ends by
+    a point reflection about its end sample (2·x[0] − x[k]), with scipy's
+    default length of 3·(2·sections + 1) samples.
+  - **Steady-state start** (`sosfilt_zi`): each pass starts from the
+    filter's steady state for its first sample.
+
+  So neither end gets a start-up transient or a step to zero. The old
+  FFT-trapezoid filter zero-padded instead, which put an artificial step at
+  both trace ends and wrapped the trace's end around into its start. The
+  maths runs in double precision; float is used only at the interface.
+  Where scipy would refuse a trace too short for the padding, the padding is
+  shortened to len − 1 instead.
+- **Verification:** reference values from scipy 1.18.1 for four filters
+  (1-2, 8-16 and 32-64 Hz bandpasses, and a 64 Hz highpass) are in
+  `test_main.cpp`, at 17 sample positions including both trace ends. The
+  largest deviation is 7·10⁻⁸, which is float32 rounding. A second test
+  checks that the corners sit at exactly −3 dB. On real data, scipy's
+  octave-band dB levels for the same 160 traces of the test file matched the
+  app's to the rounded dB.
+- **Bands at Nyquist:** a band reaching Nyquist becomes a highpass labelled
+  "N Hz - Nyquist", because scipy refuses a bandpass edge at or above
+  Nyquist. Bands entirely above Nyquist are dropped instead of shown blank.
+- **Order:** 4, a fixed constant (`kOctaveButterworthOrder`). With filtfilt
+  the response is squared, so the corners end up at −6 dB.
+- **Changed dB levels.** On the 0.704 s test file the levels changed from
+  the FFT-trapezoid values, most visibly at 2-4 Hz: from −33 dB to −17 dB.
+  scipy gives the same −17 dB. Traces shorter than about one period of a
+  band's low edge can't resolve that band reliably with any filter, so read
+  the lowest bands on short records with care.
+
+### Dark title bars (Windows)
+
+`viewer/qt/dark_titlebar.*` installs one application-wide event filter
+that sets `DWMWA_USE_IMMERSIVE_DARK_MODE` on every top-level window and
+dialog. It does this at Polish time, so the bar is dark from the first
+frame. New dialogs therefore never need to opt in. It is kept in its own
+file so that `<windows.h>` and its min/max macros stay out of
+`viewer_qt.cpp`. It links `dwmapi` on Windows, and does nothing on other
+platforms, where the window manager owns the title bar.
 
 ### Computed gain and AGC (display-time amplitude processing)
 

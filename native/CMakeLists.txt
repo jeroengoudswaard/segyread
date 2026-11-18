@@ -85,6 +85,7 @@ add_library(segyviewercore STATIC
     viewer/fft.cpp
     viewer/bandpass.cpp
     viewer/amplitude.cpp
+    viewer/iirfilter.cpp
 )
 target_include_directories(segyviewercore PUBLIC viewer)
 target_link_libraries(segyviewercore PUBLIC segycore)
@@ -95,6 +96,8 @@ set(SEGY_VIEWER_SOURCES
     viewer/qt/viewer_qt.cpp
     viewer/qt/viewer_qt_icons.h
     viewer/qt/viewer_qt_icons.cpp
+    viewer/qt/dark_titlebar.h
+    viewer/qt/dark_titlebar.cpp
     viewer/qt/app_icon.qrc # app window/taskbar icon, both platforms -- see app_icon.qrc
     $<$<PLATFORM_ID:Windows>:viewer/qt/app.manifest>
     $<$<PLATFORM_ID:Windows>:viewer/qt/app.rc> # Windows exe icon -- see app.rc
@@ -108,6 +111,9 @@ else()
     add_executable(segyviewer WIN32 ${SEGY_VIEWER_SOURCES})
 endif()
 target_link_libraries(segyviewer PRIVATE segyviewercore Qt${SEGY_QT_USED}::Widgets Qt${SEGY_QT_USED}::Svg)
+if(WIN32)
+    target_link_libraries(segyviewer PRIVATE dwmapi) # dark title bars, see viewer/qt/dark_titlebar.cpp
+endif()
 
 # vcpkg's own post-build DLL copy (VCPKG_APPLOCAL_DEPS) only walks PE import
 # dependencies, so it copies Qt Core/Gui/Widgets DLLs etc. but not the
