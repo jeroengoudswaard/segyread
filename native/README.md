@@ -2396,22 +2396,31 @@ technique this file already uses for `DatasetSlotWidget`/
 
 COPILOT.md item 1. Every toolbar button can be removed from or added back
 to the toolbar; the order stays fixed (show/hide only, no drag-reordering
-yet). Two ways in:
+yet). **This is edited only in Edit > Preferences > Toolbar Buttons**: one
+checkbox per item in two columns, plus *Show All*, applied with OK/Apply
+like the rest of Preferences.
 
-- **Right-click the toolbar** (on a button or on empty space): a quick
-  *Remove "<item>" from Toolbar* for the button under the cursor, then a
-  checkable list of every item plus *Reset Toolbar*. `QToolButton`
-  ignores context-menu events, so they propagate to the toolbar's own
-  `customContextMenuRequested` handler. The Split View button and the gain
-  value label keep their own, older right-click menus.
-- **View > Toolbar**: the same checkable list plus Reset, rebuilt on every
-  `aboutToShow`.
+Two other ways in existed at first and were removed at the user's request:
+- right-clicking the toolbar (a "Remove … from Toolbar" item plus the full
+  list);
+- a View > Toolbar submenu.
+
+Mixing toolbar layout into a button's right-click menu made that menu too
+big. A button's right-click menu should be about the button alone. The
+toolbar is now `Qt::PreventContextMenu`, not `NoContextMenu`, so a
+right-click isn't handed to `QMainWindow` either, whose default menu would
+offer to hide the whole toolbar. Buttons with a menu of their own attach it
+to their own widget:
+- Split View: 50% and split orientation;
+- the gain value label: an exact value;
+- AGC: Amplitude Processing….
 
 The list is `MainWindow::toolbarItems_`, one `ToolbarItem` per item:
 a stable persisted id, a label, a separator group, and the `QAction`s it
 covers. **Gain** is one item covering all four of its widgets (slider,
 +/- arrows, dB label), because only some of them are ever shown at once.
-Hidden ids persist to `$HOME/.segyread_settings` as `toolbarHiddenItems`;
+Hidden ids live in `Preferences::hiddenToolbarItems` (`prefs_`) and
+persist to `$HOME/.segyread_settings` as `toolbarHiddenItems`;
 unknown ids are ignored, so renaming an id would just silently un-hide
 that item for existing users. Don't rename them.
 
@@ -2434,7 +2443,7 @@ strands a feature:
 |---|---|
 | File | Text Header, Binary Header |
 | Selection | Box Select Tool, Zoom to Selection, Undo Zoom (Mooz) |
-| View | Pan Tool, Flip Horizontal, Display Parameters..., Gain (Increase / Decrease / Set Gain...), Idents, Split View, Split Layout (Set Split 50% / Side by Side / Stacked), Lock Panels, Sidebar, Toolbar |
+| View | Pan Tool, Flip Horizontal, Display Parameters..., Gain (Increase / Decrease / Set Gain...), Idents, Split View, Split Layout (Set Split 50% / Side by Side / Stacked), Lock Panels, Sidebar |
 | Analysis (new) | Spectrum..., Histogram..., Octave Bands |
 
 The seismic-mode toggle was already covered by View > Seismic Display.
@@ -2547,6 +2556,18 @@ lag 0 in the middle.
 - **Starting it:** Analysis > Autocorrelation… or the toolbar button (a
   customizable item, `autocorrelation`). Apply, or Enter in the length
   field, recomputes for whichever panel is active at that moment.
+- **Closing it:** Enter only recomputes while the window is visible and
+  the length really changed. `editingFinished` also fires when the field
+  loses focus because the window is closing, and since a recompute's
+  completion shows the window, it used to reappear on every close
+  (user-reported). This was reproduced with a scripted focus-then-close
+  check: "REOPENED" without the guard, "STAYED CLOSED" with it.
+- **Axes:** the lag axis (and the octave plots' time axis) uses the same
+  "nice" 1-2-5 ticks as the seismic canvas (`computeNiceAxisTicks`, at most
+  11, coarsened until the labels don't overlap). The ticks map exactly
+  onto the raster's sample rows. Horizontal grid lines in the canvas's
+  style (50% blend with #202020) run across the plot and continue through
+  the average curve, which computes the same ticks so the lines line up.
 - **Raw data:** it uses the raw data, not the AGC or computed-gain display
   processing.
 - **Verified by screenshot** on the test file: the peak at lag 0 sits
@@ -2806,11 +2827,11 @@ the layout pixel-for-pixel to the pre-feature baseline.
   "Customizable toolbar") but not reordered, and overflow isn't based on
   usage frequency. Drag-reordering would be the natural next step if
   wanted.
-- **The customizable toolbar's menus weren't interactively click-tested**
-  (right-click Remove/Reset, View > Toolbar, and the new File/Selection/
-  View/Analysis entries) — the visible result of a hidden-items list was
-  verified by screenshot in both orientations, and the menu entries are
-  thin mirrors that call the same toolbar actions' existing handlers.
+- **Preferences > Toolbar Buttons and the File/Selection/View/Analysis
+  menu entries weren't interactively click-tested** — the dialog was
+  verified by screenshot, the visible result of a hidden-items list by
+  screenshot in both orientations, and the menu entries are thin mirrors
+  that call the same toolbar actions' existing handlers.
 - **A second background task (Calculator/Bandpass/Save SEG-Y/Octave
   Bands) while one's already running is refused with a flashed status
   message**, not queued — simple and safe, but means starting a second

@@ -23,6 +23,7 @@
 #include <QFont>
 #include <QFormLayout>
 #include <QFontMetrics>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -573,6 +574,35 @@ private:
     bool crosshairVisible_ = false;
 };
 
+// Vertical time/lag axis for the octave-band and autocorrelation plots: the
+// same "nice" 1-2-5 intervals (at most 11 lines, coarsened until labels
+// don't overlap) as the seismic canvas's Time axis, via computeNiceAxisTicks.
+// Mapped exactly the way rasterizeOctaveBand places samples -- sample s's row
+// centre at (s - sampleStart + 0.5) / n of the height -- so ticks and grid
+// lines sit on the data, not half a sample off. Both plot widgets call this
+// with the same 8 px axis font and plot height, so their lines coincide.
+QFont plotAxisFont(const QWidget* widget) {
+    QFont f = widget->font();
+    f.setPixelSize(8);
+    return f;
+}
+
+std::vector<segy::AxisTick> plotTimeTicks(int sampleStart, int sampleEnd, double sampleIntervalUs, int height,
+                                          const QFont& axisFont) {
+    if (height <= 0 || sampleIntervalUs <= 0.0 || sampleEnd < sampleStart) return {};
+    const double dtMs = sampleIntervalUs / 1000.0;
+    QFontMetrics metrics(axisFont);
+    return segy::computeNiceAxisTicks((sampleStart - 0.5) * dtMs, (sampleEnd + 0.5) * dtMs, height, 11,
+                                      [&metrics](const std::string& label) {
+                                          // Rotated labels: their width runs along this axis; a few px gap.
+                                          return metrics.horizontalAdvance(QString::fromStdString(label)) + 6;
+                                      });
+}
+
+// Horizontal grid line, matching the seismic canvas's (chrome.cpp blends
+// each grid row 50% with #202020).
+const QColor kPlotGridColor(0x20, 0x20, 0x20, 128);
+
 class OctaveBandPlotWidget : public QWidget {
 public:
     explicit OctaveBandPlotWidget(QWidget* parent = nullptr) : QWidget(parent) {
@@ -640,27 +670,35 @@ protected:
             painter.drawImage(plot, raster_);
         }
 
+        const QFont axisFont = plotAxisFont(this);
+        const std::vector<segy::AxisTick> timeTicks =
+            plotTimeTicks(sampleStart_, sampleEnd_, sampleIntervalUs_, plot.height(), axisFont);
+        // Grid lines across the data, like the seismic canvas.
+        painter.setPen(QPen(kPlotGridColor, 1));
+        for (const segy::AxisTick& tick : timeTicks) {
+            int y = plot.top() + tick.pixelPos;
+            if (y > plot.top() && y < plot.bottom()) painter.drawLine(plot.left(), y, plot.right(), y);
+        }
+
         painter.setPen(QColor(0x9a, 0x9c, 0xa3));
         painter.drawLine(plot.topLeft(), plot.bottomLeft());
         painter.drawLine(plot.bottomLeft(), plot.bottomRight());
         painter.setPen(QColor(0xe0, 0xe2, 0xe7));
-        QFont axisFont = painter.font();
-        axisFont.setPixelSize(8);
         painter.setFont(axisFont);
-        auto formatTimeTick = [](double timeMs) {
-            double magnitude = std::abs(timeMs);
-            if (magnitude < 1e-9) return QString("0"); // not "0.0000" from the small-value branch below
-            if (magnitude > 99999.0) return QString::number(timeMs, 'g', 3);
-            int decimals = magnitude < 0.01 ? 4 : magnitude < 0.1 ? 3 : magnitude < 10.0 ? 2 : magnitude < 100.0 ? 1 : 0;
-            return QString::number(timeMs, 'f', decimals);
-        };
+        for (const segy::AxisTick& tick : timeTicks) {
+            int y = plot.top() + tick.pixelPos;
+            painter.drawLine(plot.left() - 4, y, plot.left(), y);
+            painter.save();
+            painter.translate(plot.left() - 12, y);
+            painter.rotate(-90);
+            painter.drawText(QRect(-24, -8, 48, 16), Qt::AlignCenter, QString::fromStdString(tick.label));
+            painter.restore();
+        }
+        // Trace axis: first, middle, last (labels at the two ends).
         for (int i = 0; i <= 2; ++i) {
             double fraction = double(i) / 2.0;
             int x = plot.left() + int(std::round(fraction * (plot.width() - 1)));
-            int y = plot.top() + int(std::round(fraction * (plot.height() - 1)));
             double trace = traceStart_ + fraction * (traceEnd_ - traceStart_);
-            double sample = sampleStart_ + fraction * (sampleEnd_ - sampleStart_);
-            double timeMs = sample * sampleIntervalUs_ / 1000.0;
             painter.drawLine(x, plot.bottom(), x, plot.bottom() + 4);
             if (i == 0) {
                 painter.drawText(QRect(plot.left(), plot.bottom() + 3, 48, 15), Qt::AlignLeft | Qt::AlignVCenter,
@@ -669,12 +707,6 @@ protected:
                 painter.drawText(QRect(plot.right() - 47, plot.bottom() + 3, 48, 15),
                                  Qt::AlignRight | Qt::AlignVCenter, QString::number(std::round(trace), 'g', 4));
             }
-            painter.drawLine(plot.left() - 4, y, plot.left(), y);
-            painter.save();
-            painter.translate(plot.left() - 12, y);
-            painter.rotate(-90);
-            painter.drawText(QRect(-24, -8, 48, 16), Qt::AlignCenter, formatTimeTick(timeMs));
-            painter.restore();
         }
         painter.setFont(font());
         painter.drawText(QRect(plot.left(), plot.bottom() + 18, plot.width(), 16), Qt::AlignCenter, "Trace");
@@ -2087,8 +2119,13 @@ public:
         setMinimumWidth(160);
         setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
     }
-    void setAverage(std::vector<float> average) {
+    // `sampleStart`..`sampleEnd` (lags in samples) and the interval give it
+    // the same tick/grid positions as the autocorrelogram beside it.
+    void setAverage(std::vector<float> average, int sampleStart, int sampleEnd, double sampleIntervalUs) {
         average_ = std::move(average);
+        sampleStart_ = sampleStart;
+        sampleEnd_ = sampleEnd;
+        sampleIntervalUs_ = sampleIntervalUs;
         update();
     }
 
@@ -2099,6 +2136,12 @@ protected:
         QRect plot = rect().adjusted(10, 24, -10, -38);
         if (plot.width() <= 0 || plot.height() <= 0) return;
         painter.fillRect(plot, Qt::white);
+        painter.setPen(QPen(kPlotGridColor, 1));
+        for (const segy::AxisTick& tick :
+             plotTimeTicks(sampleStart_, sampleEnd_, sampleIntervalUs_, plot.height(), plotAxisFont(this))) {
+            int y = plot.top() + tick.pixelPos;
+            if (y > plot.top() && y < plot.bottom()) painter.drawLine(plot.left(), y, plot.right(), y);
+        }
         auto xFor = [&](double v) { return plot.left() + (v + 1.0) * 0.5 * (plot.width() - 1); };
         painter.setPen(QPen(QColor(0xd0, 0xd2, 0xd6), 1, Qt::DashLine));
         for (double guide : {-0.5, 0.5}) painter.drawLine(QPointF(xFor(guide), plot.top()), QPointF(xFor(guide), plot.bottom()));
@@ -2131,6 +2174,9 @@ protected:
 
 private:
     std::vector<float> average_;
+    int sampleStart_ = 0;
+    int sampleEnd_ = 0;
+    double sampleIntervalUs_ = 0.0;
 };
 
 } // namespace
@@ -2158,11 +2204,18 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent) : QDialog(parent) 
     toolbarRow->addWidget(infoLabel_);
     toolbarRow->addStretch();
     layout->addLayout(toolbarRow);
-    auto apply = [this]() {
+    connect(applyButton, &QPushButton::clicked, this, [this]() {
         if (onApply_) onApply_(lengthSpin_->value());
-    };
-    connect(applyButton, &QPushButton::clicked, this, apply);
-    connect(lengthSpin_, &QDoubleSpinBox::editingFinished, this, apply);
+    });
+    // Enter in the length field recomputes too -- but only for a real edit
+    // while the window is open. editingFinished also fires when the field
+    // loses focus because the window is closing; recomputing then re-opened
+    // the window (the compute's completion shows it), so it couldn't be
+    // closed.
+    connect(lengthSpin_, &QDoubleSpinBox::editingFinished, this, [this]() {
+        if (!isVisible() || lengthSpin_->value() == lastAppliedLengthMs_) return;
+        if (onApply_) onApply_(lengthSpin_->value());
+    });
 
     QHBoxLayout* plots = new QHBoxLayout();
     plots->setSpacing(0);
@@ -2185,8 +2238,10 @@ void AutocorrelationDialog::setResult(const AutocorrelationResult& result) {
     panelPlot->setClip(1.0f); // normalized: lag 0 is exactly 1
     panelPlot->setAxisRange(result.traceStart, result.traceEnd, -result.maxLagSamples, result.maxLagSamples,
                             result.sampleIntervalUs);
-    static_cast<AutocorrelationAverageWidget*>(averagePlot_)->setAverage(result.average);
+    static_cast<AutocorrelationAverageWidget*>(averagePlot_)
+        ->setAverage(result.average, -result.maxLagSamples, result.maxLagSamples, result.sampleIntervalUs);
     const double lagMs = result.maxLagSamples * result.sampleIntervalUs / 1000.0;
+    lastAppliedLengthMs_ = lengthSpin_->value();
     infoLabel_->setText(QString("%1 traces, lags %2 to +%3 ms, normalized to 1 at lag 0")
                             .arg(result.traceCount)
                             .arg(-lagMs, 0, 'f', 0)
@@ -2650,7 +2705,7 @@ void DatasetSlotWidget::paintEvent(QPaintEvent*) {
     nameFont.setPixelSize(11);
     painter.setFont(nameFont);
     painter.setPen(QColor(0xd4, 0xd4, 0xd8));
-    QString shown = datasetName_.isEmpty() ? QStringLiteral("—") : datasetName_;
+    QString shown = datasetName_.isEmpty() ? QStringLiteral("â€”") : datasetName_;
     QRect nameRect(4, 15, width() - 8 - 20, 16);
     painter.drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter,
                       painter.fontMetrics().elidedText(shown, Qt::ElideRight, nameRect.width()));
@@ -2802,7 +2857,9 @@ void SegyOpenDialog::tryAccept() {
     }
 }
 
-PreferencesDialog::PreferencesDialog(const Preferences& initial, QWidget* parent) : QDialog(parent) {
+PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vector<ToolbarItemInfo>& toolbarItems,
+                                     QWidget* parent)
+    : QDialog(parent) {
     setWindowTitle("Preferences");
     setModal(false);
 
@@ -2835,6 +2892,32 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, QWidget* parent
     connect(toolbarPositionCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) { updateDrawerControlState(); });
     updateDrawerControlState();
+
+    // Which buttons the toolbar shows -- the one place this is edited.
+    // Every function stays reachable from the menus either way.
+    QGroupBox* buttonsGroup = new QGroupBox("Toolbar Buttons");
+    QVBoxLayout* buttonsLayout = new QVBoxLayout(buttonsGroup);
+    QGridLayout* grid = new QGridLayout();
+    const int rows = int((toolbarItems.size() + 1) / 2); // two columns, filled top to bottom
+    for (size_t i = 0; i < toolbarItems.size(); ++i) {
+        QCheckBox* check = new QCheckBox(toolbarItems[i].label);
+        check->setChecked(!initial.hiddenToolbarItems.contains(toolbarItems[i].id));
+        grid->addWidget(check, int(i) % std::max(1, rows), int(i) / std::max(1, rows));
+        toolbarItemChecks_.push_back({toolbarItems[i].id, check});
+    }
+    buttonsLayout->addLayout(grid);
+    QHBoxLayout* buttonsRow = new QHBoxLayout();
+    QPushButton* showAll = new QPushButton("Show All");
+    connect(showAll, &QPushButton::clicked, this, [this]() {
+        for (auto& entry : toolbarItemChecks_) entry.second->setChecked(true);
+    });
+    buttonsRow->addWidget(showAll);
+    buttonsRow->addStretch();
+    QLabel* buttonsHint = new QLabel("Hidden buttons stay available from the menus.");
+    buttonsHint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    buttonsRow->addWidget(buttonsHint);
+    buttonsLayout->addLayout(buttonsRow);
+    layout->addWidget(buttonsGroup);
 
     QHBoxLayout* scaleRow = new QHBoxLayout();
     scaleRow->addWidget(new QLabel("UI Scaling:"));
@@ -2900,6 +2983,9 @@ Preferences PreferencesDialog::currentPreferences() const {
 #else
     prefs.uiScalePercent = uiScaleSpin_->value();
 #endif
+    for (const auto& entry : toolbarItemChecks_) {
+        if (!entry.second->isChecked()) prefs.hiddenToolbarItems.append(entry.first);
+    }
     return prefs;
 }
 
@@ -4243,7 +4329,9 @@ MainWindow::MainWindow() : QMainWindow() {
     QAction* preferencesAction = editMenu->addAction("&Preferences...");
     connect(preferencesAction, &QAction::triggered, this, [this]() {
         if (!preferencesDialog_) {
-            preferencesDialog_ = new PreferencesDialog(prefs_, this);
+            std::vector<ToolbarItemInfo> items;
+            for (const ToolbarItem& item : toolbarItems_) items.push_back({item.id, item.label});
+            preferencesDialog_ = new PreferencesDialog(prefs_, items, this);
             preferencesDialog_->setAppliedCallback([this](const Preferences& newPrefs) {
                 prefs_ = newPrefs;
                 applyToolbarPosition(prefs_.toolbarPosition); // also applies prefs_.drawerPosition
@@ -4742,32 +4830,22 @@ MainWindow::MainWindow() : QMainWindow() {
         {"sidebar", "Sidebar Toggle", 5, {sidebarToggleAction_}},
     };
 
-    // Right-click anywhere on the toolbar (buttons included -- a
-    // QToolButton ignores context-menu events, so they propagate here;
-    // the Split View button and gain value label keep their own menus):
-    // a quick "Remove <item>" for the button under the cursor, then the
-    // full show/hide list.
-    toolbar_->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(toolbar_, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
-        QMenu menu(this);
-        if (toolbar_->actionAt(pos) == agcAction_) {
+    // Right-clicking the toolbar does nothing by itself: which buttons
+    // show is set only in Edit > Preferences (the user's call -- a button's
+    // right-click menu should be about that button alone). PreventContextMenu,
+    // not NoContextMenu, so the event isn't passed on to QMainWindow, whose
+    // default menu would offer to hide the whole toolbar. Buttons with a
+    // menu of their own keep it: Split View, the gain value label, and AGC.
+    toolbar_->setContextMenuPolicy(Qt::PreventContextMenu);
+    if (QWidget* agcButton = toolbar_->widgetForAction(agcAction_)) {
+        agcButton->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(agcButton, &QWidget::customContextMenuRequested, this, [this, agcButton](const QPoint& pos) {
+            QMenu menu(this);
             QAction* params = menu.addAction("Amplitude Processing...");
             connect(params, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
-            menu.addSeparator();
-        }
-        if (QAction* hit = toolbar_->actionAt(pos)) {
-            for (const ToolbarItem& item : toolbarItems_) {
-                if (std::find(item.actions.begin(), item.actions.end(), hit) == item.actions.end()) continue;
-                QString id = item.id;
-                QAction* remove = menu.addAction(QString("Remove \"%1\" from Toolbar").arg(item.label));
-                connect(remove, &QAction::triggered, this, [this, id]() { setToolbarItemShown(id, false); });
-                menu.addSeparator();
-                break;
-            }
-        }
-        populateToolbarCustomizeMenu(&menu);
-        menu.exec(toolbar_->mapToGlobal(pos));
-    });
+            menu.exec(agcButton->mapToGlobal(pos));
+        });
+    }
 
     // Every toolbar function in a menu too (COPILOT.md item 1), so hiding
     // a button never strands its feature -- mirrors, not the toolbar
@@ -4830,11 +4908,6 @@ MainWindow::MainWindow() : QMainWindow() {
 
     viewMenu->addSeparator();
     addMenuMirror(viewMenu, sidebarToggleAction_, "Side&bar");
-    QMenu* toolbarMenu = viewMenu->addMenu("&Toolbar");
-    connect(toolbarMenu, &QMenu::aboutToShow, this, [this, toolbarMenu]() {
-        toolbarMenu->clear();
-        populateToolbarCustomizeMenu(toolbarMenu);
-    });
 
     addMenuMirror(analysisMenu, spectrumAction_, "&Spectrum...");
     addMenuMirror(analysisMenu, histogramAction_, "&Histogram...");
@@ -4969,7 +5042,7 @@ bool MainWindow::isToolbarActionWanted(QAction* action) const {
     if ((action == gainUpAction_ || action == gainDownAction_) && !vertical) return false;
     for (const ToolbarItem& item : toolbarItems_) {
         if (std::find(item.actions.begin(), item.actions.end(), action) != item.actions.end()) {
-            return !hiddenToolbarItems_.contains(item.id);
+            return !prefs_.hiddenToolbarItems.contains(item.id);
         }
     }
     return true;
@@ -4990,7 +5063,7 @@ void MainWindow::applyToolbarCustomization() {
     const int lastSeparatedGroup = int(toolbarSeparators_.size());
     auto groupHasShownItem = [this](int group) {
         for (const ToolbarItem& item : toolbarItems_) {
-            if (item.group == group && !hiddenToolbarItems_.contains(item.id)) return true;
+            if (item.group == group && !prefs_.hiddenToolbarItems.contains(item.id)) return true;
         }
         return false;
     };
@@ -5000,31 +5073,6 @@ void MainWindow::applyToolbarCustomization() {
         toolbarSeparators_[g]->setVisible(groupHasShownItem(g) && laterShown);
     }
     updateToolbarOverflow();
-}
-
-void MainWindow::setToolbarItemShown(const QString& id, bool shown) {
-    hiddenToolbarItems_.removeAll(id);
-    if (!shown) hiddenToolbarItems_.append(id);
-    applyToolbarCustomization();
-    savePreferences();
-}
-
-void MainWindow::populateToolbarCustomizeMenu(QMenu* menu) {
-    for (const ToolbarItem& item : toolbarItems_) {
-        QAction* a = menu->addAction(item.label);
-        a->setCheckable(true);
-        a->setChecked(!hiddenToolbarItems_.contains(item.id));
-        QString id = item.id;
-        connect(a, &QAction::triggered, this, [this, id](bool checked) { setToolbarItemShown(id, checked); });
-    }
-    menu->addSeparator();
-    QAction* reset = menu->addAction("Reset Toolbar");
-    reset->setEnabled(!hiddenToolbarItems_.isEmpty());
-    connect(reset, &QAction::triggered, this, [this]() {
-        hiddenToolbarItems_.clear();
-        applyToolbarCustomization();
-        savePreferences();
-    });
 }
 
 // The Idents menu (Display at Top/Bottom, Ident Plot, Display on Seismic),
@@ -5105,8 +5153,8 @@ void MainWindow::loadPreferences() {
     if (labelPosition >= int(DatasetLabelPosition::TopLeft) && labelPosition <= int(DatasetLabelPosition::Off)) {
         datasetLabelPosition_ = DatasetLabelPosition(labelPosition);
     }
-    hiddenToolbarItems_ = settings.value("toolbarHiddenItems").toStringList();
-    hiddenToolbarItems_.removeAll(QString()); // an empty list can read back as {""}
+    prefs_.hiddenToolbarItems = settings.value("toolbarHiddenItems").toStringList();
+    prefs_.hiddenToolbarItems.removeAll(QString()); // an empty list can read back as {""}
 }
 
 void MainWindow::savePreferences() {
@@ -5115,7 +5163,7 @@ void MainWindow::savePreferences() {
     settings.setValue("drawerPosition", int(prefs_.drawerPosition));
     settings.setValue("uiScalePercent", prefs_.uiScalePercent);
     settings.setValue("datasetLabelPosition", int(datasetLabelPosition_));
-    settings.setValue("toolbarHiddenItems", hiddenToolbarItems_);
+    settings.setValue("toolbarHiddenItems", prefs_.hiddenToolbarItems);
 }
 
 void MainWindow::applyDatasetLabelPosition(DatasetLabelPosition position) {

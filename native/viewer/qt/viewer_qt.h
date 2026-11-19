@@ -192,6 +192,15 @@ struct Preferences {
     // QT_SCALE_FACTOR, which Qt only reads at QApplication construction, so
     // a changed value takes effect on next launch, not live.
     double uiScalePercent = 100.0;
+    // Toolbar buttons the user switched off (MainWindow::ToolbarItem ids),
+    // edited only in Edit > Preferences > Toolbar Buttons.
+    QStringList hiddenToolbarItems;
+};
+
+// One toolbar button as Preferences lists it: stable id + display label.
+struct ToolbarItemInfo {
+    QString id;
+    QString label;
 };
 
 // One loaded SEG-Y dataset's data -- kept alive independent of which
@@ -668,11 +677,15 @@ private:
 
 class PreferencesDialog : public QDialog {
 public:
-    explicit PreferencesDialog(const Preferences& initial, QWidget* parent = nullptr);
+    // `toolbarItems`: every toolbar button, in toolbar order, for the
+    // Toolbar Buttons checkboxes.
+    PreferencesDialog(const Preferences& initial, const std::vector<ToolbarItemInfo>& toolbarItems,
+                      QWidget* parent = nullptr);
     void setAppliedCallback(std::function<void(const Preferences&)> callback);
 
 private:
     QComboBox* toolbarPositionCombo_ = nullptr;
+    std::vector<std::pair<QString, QCheckBox*>> toolbarItemChecks_; // id -> "show this button"
     QRadioButton* drawerLeftRadio_ = nullptr;
     QRadioButton* drawerRightRadio_ = nullptr;
     QSpinBox* uiScaleSpin_ = nullptr;
@@ -1005,6 +1018,7 @@ private:
     QLabel* infoLabel_ = nullptr;
     QWidget* panelPlot_ = nullptr;   // OctaveBandPlotWidget (defined in viewer_qt.cpp)
     QWidget* averagePlot_ = nullptr; // AutocorrelationAverageWidget (likewise)
+    double lastAppliedLengthMs_ = -1.0; // length of the result on screen; see the editingFinished guard
     std::function<void(double)> onApply_;
 };
 
@@ -1402,11 +1416,13 @@ private:
     void updateToolbarOverflow();
 
     // Customizable toolbar (COPILOT.md item 1): every toolbar button is one
-    // ToolbarItem the user can show or hide -- right-click the toolbar, or
-    // View > Toolbar. "Gain" is a single item covering all four of its
+    // ToolbarItem the user can show or hide -- only in Edit > Preferences >
+    // Toolbar Buttons (per the user: right-click menus stay about the button
+    // itself, not toolbar layout). "Gain" is a single item covering all four of its
     // widgets (slider, +/- arrows, value label), since only some of them
     // are ever shown at once anyway (see applyToolbarPosition). Hidden item
-    // ids persist to $HOME/.segyread_settings ("toolbarHiddenItems").
+    // ids live in prefs_.hiddenToolbarItems, persisted to
+    // $HOME/.segyread_settings ("toolbarHiddenItems").
     // Every item's function is also reachable from a menu, so hiding a
     // button never makes a feature unreachable -- see addMenuMirror.
     struct ToolbarItem {
@@ -1420,7 +1436,6 @@ private:
     // while group g and some later (pre-spacer) group both have a shown
     // item, so hiding a whole group never leaves doubled/dangling dividers.
     std::vector<QAction*> toolbarSeparators_;
-    QStringList hiddenToolbarItems_;
     QAction* gainValueLabelAction_ = nullptr;
     // False if `action` belongs to a user-hidden item, or is the gain
     // control for the other toolbar orientation (slider: horizontal only;
@@ -1428,8 +1443,6 @@ private:
     // shows wanted actions, and its More menu never lists unwanted ones.
     bool isToolbarActionWanted(QAction* action) const;
     void applyToolbarCustomization();
-    void setToolbarItemShown(const QString& id, bool shown);
-    void populateToolbarCustomizeMenu(QMenu* menu);
     // A menu entry that triggers `source` (a toolbar action) and tracks its
     // enabled/checked state. A separate QAction rather than `source`
     // itself added to the menu: QAction visibility is shared by every
