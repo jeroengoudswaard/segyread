@@ -22,7 +22,6 @@
 #include <vector>
 
 #include "analysis.h"
-#include "bandpass.h"
 #include "iirfilter.h"
 #include "chrome.h"
 #include "colormap.h"
@@ -201,6 +200,7 @@ struct Preferences {
 struct ToolbarItemInfo {
     QString id;
     QString label;
+    QString category; // Preferences groups consecutive items of one category under one heading
 };
 
 // One loaded SEG-Y dataset's data -- kept alive independent of which
@@ -854,9 +854,10 @@ private:
     void emitApply();
 };
 
-// Edit > Processing > Bandpass: Hanning-tapered trapezoidal bandpass filter
-// (segy::BandpassParams/applyBandpassFilter) applied to every trace of the
-// active panel's dataset, auto-named and auto-displayed in the left panel
+// Edit > Processing > Bandpass: Butterworth filter (low/high corner, order),
+// applied zero-phase with sosfiltfilt -- mirrored (odd) padding at both trace
+// ends, see viewer/iirfilter.h -- to every trace of the active panel's
+// dataset, auto-named and auto-displayed in the left panel
 // (see MainWindow::runBandpass). Same loose-coupling shape as
 // CalculatorDialog -- no AppState reference, just a name in and a callback
 // out.
@@ -867,23 +868,21 @@ public:
     // Called right before each show() with the active panel's dataset name
     // (for the default output name) and whether one is even loaded.
     void refreshSource(const QString& sourceName, bool loaded);
-    void setApplyCallback(std::function<void(segy::BandpassParams params, QString outputName)> callback);
+    void setApplyCallback(std::function<void(segy::ButterworthBandParams params, QString outputName)> callback);
 
 private:
-    QDoubleSpinBox* lowCutSpin_ = nullptr;
-    QDoubleSpinBox* lowPassSpin_ = nullptr;
-    QDoubleSpinBox* highPassSpin_ = nullptr;
-    QDoubleSpinBox* highCutSpin_ = nullptr;
+    QDoubleSpinBox* lowSpin_ = nullptr;  // 0 = no low cut (lowpass)
+    QDoubleSpinBox* highSpin_ = nullptr; // at/above Nyquist = no high cut (highpass)
+    QSpinBox* orderSpin_ = nullptr;
+    QComboBox* edgesCombo_ = nullptr; // segy::EdgePadding
     QLineEdit* outputNameEdit_ = nullptr;
     QString sourceName_;
     bool outputNameEdited_ = false;
-    std::function<void(segy::BandpassParams, QString)> onApply_;
+    std::function<void(segy::ButterworthBandParams, QString)> onApply_;
 
-    // Keeps lowCut <= lowPass <= highPass <= highCut as the user drags any
-    // one of the four -- pushes the others out of the way just enough
-    // rather than rejecting the edit, so the four spin boxes never need a
-    // separate validation error state.
-    void enforceOrdering();
+    // Keeps low < high as the user edits either: pushes the other corner
+    // out of the way rather than rejecting the edit.
+    void enforceOrdering(QDoubleSpinBox* edited);
     void updateDefaultOutputName();
     void emitApply();
 };
@@ -1492,7 +1491,7 @@ private:
     void runCalculator(AppState& a, AppState& b, bool subtract, const QString& outputName);
     // Bandpass-filters every trace of `source`'s full sample range, writes
     // the result to a temp SEG-Y file, and loads it into panelA_.
-    void runBandpass(AppState& source, const segy::BandpassParams& params, const QString& outputName);
+    void runBandpass(AppState& source, const segy::ButterworthBandParams& params, const QString& outputName);
     // Writes `source`'s current dataset to `filePath` with a synthesized
     // EBCDIC header recording its processing history (see
     // buildSegyTextHeader in viewer_qt.cpp).

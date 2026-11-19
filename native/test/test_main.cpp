@@ -26,7 +26,6 @@
 #include "colormap.h"
 #include "wiggle.h"
 #include "analysis.h"
-#include "bandpass.h"
 #include "segy_writer.h"
 #include "amplitude.h"
 #include "iirfilter.h"
@@ -1067,8 +1066,9 @@ void testSpectrumPeaksAtKnownFrequency() {
 }
 
 // ---------------------------------------------------------------------
-// Bandpass filter (viewer/bandpass.cpp), backing Edit > Processing >
-// Bandpass and the Octave Band Display window.
+// Edit > Processing > Bandpass's filter (viewer/iirfilter.cpp, Butterworth +
+// sosfiltfilt) on a two-tone signal -- an end-to-end check alongside the
+// scipy reference values above.
 void testBandpassFilterIsolatesPassband() {
     section("Bandpass: isolates the passband, rejects a strong out-of-band component");
     int n = 512;
@@ -1089,36 +1089,47 @@ void testBandpassFilterIsolatesPassband() {
         expectedPassOnly[size_t(s)] = passComponent;
     }
 
-    segy::BandpassParams params;
-    params.lowCut = 10.0;
-    params.lowPass = 15.0;
-    params.highPass = 30.0;
-    params.highCut = 40.0;
+    const double fs = 1'000'000.0 / sampleIntervalUs;
+    // A wide band around the 19.5 Hz tone (its gain there is ~1), far below
+    // the 156 Hz tone.
+    std::vector<segy::Biquad> sos = segy::designButterworthBand({8.0, 50.0, 4}, fs);
     std::vector<float> filtered = inputTrace;
-    segy::applyBandpassFilter(filtered, sampleIntervalUs, params);
+    segy::sosFiltFilt(sos, filtered);
 
     CHECK(filtered.size() == inputTrace.size());
-    // Both components sit exactly on FFT bins (no spectral leakage), and the
-    // strong component is entirely outside [lowCut, highCut] -- the filtered
-    // trace should reconstruct essentially exactly the passband-only signal.
-    float maxAbsDiff = 0.0f;
+    // Zero phase: no shift, so in the middle of the trace the passband tone
+    // comes back on top of the original. The ends are a different matter:
+    // no filter knows the data past them, and with only 512 samples an
+    // 8 Hz corner's ringing reaches well inside (scipy gives the same edge
+    // error -- this is the filter, not the port; see native/README.md). So
+    // the middle half is held to a tight bound and the whole trace only to
+    // "no blow-up".
+    float middleDiff = 0.0f, wholeDiff = 0.0f;
     for (int s = 0; s < n; ++s) {
-        maxAbsDiff = std::max(maxAbsDiff, std::abs(filtered[size_t(s)] - expectedPassOnly[size_t(s)]));
+        float d = std::abs(filtered[size_t(s)] - expectedPassOnly[size_t(s)]);
+        wholeDiff = std::max(wholeDiff, d);
+        if (s >= n / 4 && s < 3 * n / 4) middleDiff = std::max(middleDiff, d);
     }
-    CHECK(maxAbsDiff < 0.01f);
+    std::printf("   two-tone bandpass: max |filtered - pass-only| middle half %.3g, whole trace %.3g\n", middleDiff,
+                wholeDiff);
+    // Bounds sit just above what scipy itself gives for this exact case
+    // (sosfiltfilt, padtype='even': middle 0.0492, whole 0.637).
+    CHECK(middleDiff < 0.06f);
+    CHECK(wholeDiff < 0.7f);
 
     // A passband well above both components should suppress the trace to
-    // near-silence, not leave it mostly unfiltered.
-    segy::BandpassParams stopAll;
-    stopAll.lowCut = 200.0;
-    stopAll.lowPass = 210.0;
-    stopAll.highPass = 220.0;
-    stopAll.highCut = 230.0;
+    // near-silence, not leave it mostly unfiltered. Again the middle is
+    // what's well-defined (scipy: 0.0000 there, 0.233 at the ends).
     std::vector<float> silenced = inputTrace;
-    segy::applyBandpassFilter(silenced, sampleIntervalUs, stopAll);
-    float maxAbs = 0.0f;
-    for (float v : silenced) maxAbs = std::max(maxAbs, std::abs(v));
-    CHECK(maxAbs < 0.01f);
+    segy::sosFiltFilt(segy::designButterworthBand({300.0, 450.0, 6}, fs), silenced);
+    float middleAbs = 0.0f, wholeAbs = 0.0f;
+    for (int s = 0; s < n; ++s) {
+        float v = std::abs(silenced[size_t(s)]);
+        wholeAbs = std::max(wholeAbs, v);
+        if (s >= n / 4 && s < 3 * n / 4) middleAbs = std::max(middleAbs, v);
+    }
+    CHECK(middleAbs < 0.001f);
+    CHECK(wholeAbs < 0.3f);
 }
 
 // ---------------------------------------------------------------------
@@ -1244,15 +1255,23 @@ void testAgcClipReplacesRawAndManualClip() {
 // (both trace ends included, since edge handling is the point of filtfilt).
 struct ScipyFiltFiltCase {
     const char* kind;
+    int order;
     double lo, hi;
+    int sections;
+    int padlen; // scipy's default padlen for these sections
     double expected[17];
 };
 const int kScipyIndices[17] = {0, 1, 2, 5, 13, 27, 60, 125, 250, 375, 440, 470, 486, 494, 497, 498, 499};
 const ScipyFiltFiltCase kScipyCases[] = {
-{"band", 1, 2, {0.223853612, 0.25079602, 0.277742311, 0.358223342, 0.563344698, 0.83939747, 0.681321106, -1.13790195, 0.118475304, 0.272789323, -0.0582243464, -0.0238738653, -0.00665632873, -0.00256012338, -0.00165162308, -0.00140998938, -0.0011956568}},
-{"band", 8, 16, {-0.00363811356, 0.142572771, 0.274892792, 0.468906538, -0.3908038, 0.393420316, -0.228708124, 0.146747123, 0.147859751, 0.149945831, 0.433211376, -0.316598708, 0.306313543, -0.239707554, -0.152498661, -0.101800991, -0.0498335606}},
-{"band", 32, 64, {-0.000530618592, 0.290142002, 0.180675348, -0.00236031703, -0.176995792, 0.176181038, -1.51855983e-05, 8.91103116e-07, 8.90360125e-07, 9.28771652e-07, -5.34064135e-05, 0.000146975442, 0.275856213, -0.322850113, 0.193522307, 0.090948682, 0.00224788324}},
-{"high", 64, 0, {-0.000137877059, 0.170126863, -0.186690923, -0.189460771, -0.189951842, -0.18624516, -0.117176204, 3.10563479e-08, 3.10563589e-08, 3.10563711e-08, 0.11717625, 0.189594116, -0.0347458244, -0.199685509, -0.113783845, 0.102983317, 0.000112874669}},
+{"band", 4, 1, 2, 4, 27, {0.223853612, 0.25079602, 0.277742311, 0.358223342, 0.563344698, 0.83939747, 0.681321106, -1.13790195, 0.118475304, 0.272789323, -0.0582243464, -0.0238738653, -0.00665632873, -0.00256012338, -0.00165162308, -0.00140998938, -0.0011956568}},
+{"band", 4, 8, 16, 4, 27, {-0.00363811356, 0.142572771, 0.274892792, 0.468906538, -0.3908038, 0.393420316, -0.228708124, 0.146747123, 0.147859751, 0.149945831, 0.433211376, -0.316598708, 0.306313543, -0.239707554, -0.152498661, -0.101800991, -0.0498335606}},
+{"band", 4, 32, 64, 4, 27, {-0.000530618592, 0.290142002, 0.180675348, -0.00236031703, -0.176995792, 0.176181038, -1.51855983e-05, 8.91103116e-07, 8.90360125e-07, 9.28771652e-07, -5.34064135e-05, 0.000146975442, 0.275856213, -0.322850113, 0.193522307, 0.090948682, 0.00224788324}},
+{"high", 4, 64, 0, 2, 15, {-0.000137877059, 0.170126863, -0.186690923, -0.189460771, -0.189951842, -0.18624516, -0.117176204, 3.10563479e-08, 3.10563589e-08, 3.10563711e-08, 0.11717625, 0.189594116, -0.0347458244, -0.199685509, -0.113783845, 0.102983317, 0.000112874669}},
+// Lowpass, and odd orders (a first-order section, which changes scipy's padlen):
+{"low", 4, 30, 0, 2, 15, {0.847754508, 1.01796082, 1.1673849, 1.38581197, 0.75496796, 2.02189264, 1.37134229, 0.0976905965, 1.3476906, 2.5976906, 1.24398134, 0.422144885, 1.53007597, 1.01831364, 1.27442346, 1.26740922, 1.21756888}},
+{"band", 3, 10, 50, 3, 21, {0.00862475078, 0.295811509, 0.365163299, 0.420058315, -0.438414846, 0.435291751, -0.185182261, 0.124940497, 0.124944732, 0.124948555, 0.367775998, -0.252060972, 0.390362596, -0.453563758, 0.258124144, 0.200595474, -0.0453726968}},
+{"high", 5, 20, 0, 3, 18, {0.00764032967, 0.459284692, 0.00127990247, -0.189115319, -0.356170043, -0.0174173143, -0.118710361, 0.000774583256, 0.000774583483, 0.000774581868, 0.119808336, 0.188979343, 0.264620754, -0.520561198, 0.24573382, 0.3195586, 0.00569829046}},
+{"low", 1, 5, 0, 1, 6, {0.699277213, 0.760554959, 0.814355361, 0.940999982, 1.08760375, 1.59612174, 1.49482799, 0.0540116337, 1.22162426, 2.3892368, 0.936425068, 0.752563243, 1.17723602, 1.17067784, 1.20533731, 1.21287556, 1.21751893}},
 };
 
 void testSosFiltFiltMatchesScipy() {
@@ -1267,11 +1286,14 @@ void testSosFiltFiltMatchesScipy() {
                              0.3 * std::sin(twoPi * 50.0 * t) + 0.2 * std::sin(twoPi * 90.0 * t) + 0.002 * i + 0.7);
     }
     for (const ScipyFiltFiltCase& c : kScipyCases) {
-        std::vector<segy::Biquad> sos = std::string(c.kind) == "band" ? segy::butterworthBandpass(4, c.lo, c.hi, fs)
-                                                                      : segy::butterworthHighpass(4, c.lo, fs);
-        CHECK(int(sos.size()) == (std::string(c.kind) == "band" ? 4 : 2));
+        const std::string kind = c.kind;
+        std::vector<segy::Biquad> sos = kind == "band"   ? segy::butterworthBandpass(c.order, c.lo, c.hi, fs)
+                                        : kind == "high" ? segy::butterworthHighpass(c.order, c.lo, fs)
+                                                         : segy::butterworthLowpass(c.order, c.lo, fs);
+        CHECK(int(sos.size()) == c.sections);
+        CHECK(segy::sosFiltFiltDefaultPadlen(sos) == c.padlen);
         std::vector<float> y = x;
-        segy::sosFiltFilt(sos, y);
+        segy::sosFiltFilt(sos, y, -1, segy::EdgePadding::Odd); // these references use scipy's default padtype
         double maxError = 0.0;
         for (int k = 0; k < 17; ++k) {
             double expected = c.expected[k];
@@ -1280,10 +1302,78 @@ void testSosFiltFiltMatchesScipy() {
             // rounding of the input (~1e-7 relative) carried through.
             CHECK_NEAR(y[size_t(kScipyIndices[k])], expected, 2e-6 + 2e-6 * std::fabs(expected));
         }
-        std::printf("   %s %g-%g Hz: max |C++ - scipy| = %.2g\n", c.kind, c.lo, c.hi, maxError);
+        std::printf("   %s order %d, %g-%g Hz: max |C++ - scipy| = %.2g\n", c.kind, c.order, c.lo, c.hi, maxError);
     }
-    // Default padlen matches scipy's formula for these filters (4 full biquads -> 27).
-    CHECK(segy::sosFiltFiltDefaultPadlen(segy::butterworthBandpass(4, 8, 16, fs)) == 27);
+}
+
+// scipy.signal.sosfiltfilt(sos, x, padtype='even' | 'constant'), same x and
+// sample indices as kScipyCases. The app's default is 'even'.
+struct ScipyPaddingCase {
+    const char* padtype;
+    const char* kind;
+    int order;
+    double lo, hi;
+    double expected[17];
+};
+const ScipyPaddingCase kScipyPaddingCases[] = {
+{"even", "band", 4, 8, 16, {0.17168511, 0.163488014, 0.156648829, 0.119187789, -0.368137139, 0.466666941, -0.209508182, 0.146054539, 0.147745333, 0.15025987, 0.441604862, -0.307201322, 0.207835836, -0.186947024, -0.0424820905, 0.00666597049, 0.0465647368}},
+{"even", "low", 4, 30, 0, {1.15931116, 1.17111032, 1.20519206, 1.35348924, 0.750848358, 2.02197831, 1.37134229, 0.0976905965, 1.3476906, 2.5976906, 1.24398133, 0.422145795, 1.52493605, 0.969900072, 1.33732166, 1.4341809, 1.46948833}},
+{"even", "high", 5, 20, 0, {-0.363989644, 0.244909007, -0.0850445622, -0.113780089, -0.377197824, -0.0191061797, -0.118701908, 0.000774583862, 0.000774583483, 0.000774582763, 0.119825933, 0.186659539, 0.251239027, -0.544010937, 0.072042578, 0.132270173, -0.155704388}},
+{"constant", "band", 4, 8, 16, {0.0840234983, 0.153030393, 0.215770811, 0.294047164, -0.37947047, 0.430043628, -0.219108153, 0.146400831, 0.147802542, 0.15010285, 0.437408119, -0.311900015, 0.25707469, -0.213327289, -0.0974903758, -0.0475675103, -0.00163441191}},
+{"constant", "low", 4, 30, 0, {1.00353283, 1.09453557, 1.18628848, 1.36965061, 0.752908159, 2.02193547, 1.37134229, 0.0976905965, 1.3476906, 2.5976906, 1.24398133, 0.42214534, 1.52750601, 0.994106858, 1.30587256, 1.35079506, 1.34352861}},
+{"constant", "high", 5, 20, 0, {-0.178174657, 0.352096849, -0.0418823298, -0.151447704, -0.366683933, -0.018261747, -0.118706135, 0.000774583559, 0.000774583483, 0.000774582315, 0.119817134, 0.187819441, 0.257929891, -0.532286067, 0.158888199, 0.225914387, -0.0750030487}},
+};
+
+void testSosFiltFiltPaddingTypesMatchScipy() {
+    section("IIR: sosfiltfilt with even (the app's default) and constant padding matches scipy");
+    const double fs = 250.0;
+    const int n = 500;
+    std::vector<float> x(static_cast<size_t>(n));
+    const double twoPi = 2.0 * 3.14159265358979323846;
+    for (int i = 0; i < n; ++i) {
+        double t = i / fs;
+        x[size_t(i)] = float(std::sin(twoPi * 1.5 * t) + 0.5 * std::sin(twoPi * 12.0 * t + 0.3) +
+                             0.3 * std::sin(twoPi * 50.0 * t) + 0.2 * std::sin(twoPi * 90.0 * t) + 0.002 * i + 0.7);
+    }
+    for (const ScipyPaddingCase& c : kScipyPaddingCases) {
+        const std::string kind = c.kind;
+        std::vector<segy::Biquad> sos = kind == "band"   ? segy::butterworthBandpass(c.order, c.lo, c.hi, fs)
+                                        : kind == "high" ? segy::butterworthHighpass(c.order, c.lo, fs)
+                                                         : segy::butterworthLowpass(c.order, c.lo, fs);
+        const bool even = std::string(c.padtype) == "even";
+        std::vector<float> y = x;
+        if (even) {
+            segy::sosFiltFilt(sos, y); // default padding must be even
+        } else {
+            segy::sosFiltFilt(sos, y, -1, segy::EdgePadding::Constant);
+        }
+        double maxError = 0.0;
+        for (int k = 0; k < 17; ++k) {
+            double expected = c.expected[k];
+            maxError = std::max(maxError, std::fabs(double(y[size_t(kScipyIndices[k])]) - expected));
+            CHECK_NEAR(y[size_t(kScipyIndices[k])], expected, 2e-6 + 2e-6 * std::fabs(expected));
+        }
+        std::printf("   %s padding, %s order %d: max |C++ - scipy| = %.2g\n", c.padtype, c.kind, c.order, maxError);
+    }
+}
+
+void testDesignButterworthBand() {
+    section("IIR: Bandpass dialog's filter design -- band/lowpass/highpass selection and refusals");
+    const double fs = 250.0; // Nyquist 125
+    std::string error;
+    CHECK(segy::designButterworthBand({10.0, 50.0, 4}, fs, &error).size() == 4);   // bandpass
+    CHECK(segy::designButterworthBand({0.0, 50.0, 4}, fs, &error).size() == 2);    // no low cut -> lowpass
+    CHECK(segy::designButterworthBand({10.0, 125.0, 4}, fs, &error).size() == 2);  // high at Nyquist -> highpass
+    CHECK(segy::designButterworthBand({10.0, 300.0, 3}, fs, &error).size() == 2);  // odd-order highpass: 1 biquad + 1 first-order
+    error.clear();
+    CHECK(segy::designButterworthBand({0.0, 200.0, 4}, fs, &error).empty());       // both corners open
+    CHECK(!error.empty());
+    error.clear();
+    CHECK(segy::designButterworthBand({60.0, 40.0, 4}, fs, &error).empty());       // low >= high
+    CHECK(!error.empty());
+    error.clear();
+    CHECK(segy::designButterworthBand({130.0, 200.0, 4}, fs, &error).empty());     // low above Nyquist
+    CHECK(!error.empty());
 }
 
 void testButterworthCornerGain() {
@@ -1433,6 +1523,8 @@ int main() {
     testWriteSegyFileRoundTrips();
     testNormalizedAutocorrelation();
     testSosFiltFiltMatchesScipy();
+    testSosFiltFiltPaddingTypesMatchScipy();
+    testDesignButterworthBand();
     testButterworthCornerGain();
     testGainCurveInterpolation();
     testAgcEqualizesAmplitude();

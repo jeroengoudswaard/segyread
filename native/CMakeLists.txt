@@ -83,7 +83,6 @@ add_library(segyviewercore STATIC
     viewer/analysis.cpp
     viewer/axis_ticks.cpp
     viewer/fft.cpp
-    viewer/bandpass.cpp
     viewer/amplitude.cpp
     viewer/iirfilter.cpp
 )

@@ -1773,22 +1773,43 @@ BandpassDialog::BandpassDialog(QWidget* parent) : QDialog(parent) {
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QHBoxLayout* cornerRow = new QHBoxLayout();
-    auto corner = [&](const QString& label, QDoubleSpinBox*& spin, double defaultValue) {
+    auto column = [&](const QString& label, QWidget* field) {
         QVBoxLayout* col = new QVBoxLayout();
         col->addWidget(new QLabel(label));
-        spin = new QDoubleSpinBox();
-        spin->setRange(0.0, 100000.0);
-        spin->setSuffix(" Hz");
-        spin->setValue(defaultValue);
-        col->addWidget(spin);
+        col->addWidget(field);
         cornerRow->addLayout(col);
     };
-    // Defaults per the original ask: 5-10-50-60 Hz.
-    corner("Low Cut", lowCutSpin_, 5.0);
-    corner("Low Pass", lowPassSpin_, 10.0);
-    corner("High Pass", highPassSpin_, 50.0);
-    corner("High Cut", highCutSpin_, 60.0);
+    lowSpin_ = new QDoubleSpinBox();
+    lowSpin_->setRange(0.0, 100000.0);
+    lowSpin_->setSuffix(" Hz");
+    lowSpin_->setValue(10.0);
+    lowSpin_->setToolTip("Low corner (-3 dB per pass). 0 Hz: no low cut, i.e. a lowpass.");
+    highSpin_ = new QDoubleSpinBox();
+    highSpin_->setRange(0.1, 100000.0);
+    highSpin_->setSuffix(" Hz");
+    highSpin_->setValue(50.0);
+    highSpin_->setToolTip("High corner (-3 dB per pass). At or above Nyquist: no high cut, i.e. a highpass.");
+    orderSpin_ = new QSpinBox();
+    orderSpin_->setRange(1, 10);
+    orderSpin_->setValue(4);
+    orderSpin_->setToolTip("Butterworth order per pass; filtfilt runs it twice, doubling the roll-off.");
+    edgesCombo_ = new QComboBox();
+    edgesCombo_->addItem("Mirror (even)", int(segy::EdgePadding::Even));
+    edgesCombo_->addItem("Point mirror (odd, scipy default)", int(segy::EdgePadding::Odd));
+    edgesCombo_->addItem("Repeat end value (constant)", int(segy::EdgePadding::Constant));
+    edgesCombo_->setToolTip("How each trace is extended past its ends before filtering (scipy's padtype).\n"
+                            "Mirror gave the smallest edge effects on real data, especially in low bands.");
+    column("Low Corner", lowSpin_);
+    column("High Corner", highSpin_);
+    column("Order", orderSpin_);
+    column("Edges", edgesCombo_);
     layout->addLayout(cornerRow);
+
+    QLabel* hint = new QLabel("Butterworth, applied zero-phase with scipy.signal.sosfiltfilt's method "
+                              "(trace ends padded, steady-state start). Corners end up at -6 dB.");
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    layout->addWidget(hint);
 
     QHBoxLayout* nameRow = new QHBoxLayout();
     nameRow->addWidget(new QLabel("Output Name:"));
@@ -1796,12 +1817,13 @@ BandpassDialog::BandpassDialog(QWidget* parent) : QDialog(parent) {
     nameRow->addWidget(outputNameEdit_, 1);
     layout->addLayout(nameRow);
 
-    for (QDoubleSpinBox* spin : {lowCutSpin_, lowPassSpin_, highPassSpin_, highCutSpin_}) {
-        connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) {
-            enforceOrdering();
+    for (QDoubleSpinBox* spin : {lowSpin_, highSpin_}) {
+        connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, spin](double) {
+            enforceOrdering(spin);
             updateDefaultOutputName();
         });
     }
+    connect(orderSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDefaultOutputName(); });
     connect(outputNameEdit_, &QLineEdit::textEdited, this, [this](const QString&) { outputNameEdited_ = true; });
 
     addButtonRow(this, layout,
@@ -1822,53 +1844,38 @@ void BandpassDialog::refreshSource(const QString& sourceName, bool loaded) {
     updateDefaultOutputName();
 }
 
-void BandpassDialog::setApplyCallback(std::function<void(segy::BandpassParams, QString)> callback) {
+void BandpassDialog::setApplyCallback(std::function<void(segy::ButterworthBandParams, QString)> callback) {
     onApply_ = std::move(callback);
 }
 
-void BandpassDialog::enforceOrdering() {
-    double a = lowCutSpin_->value();
-    double b = lowPassSpin_->value();
-    double c = highPassSpin_->value();
-    double d = highCutSpin_->value();
-    // Push forward, then back, so a change to any one corner drags only the
-    // minimum necessary neighbors along with it instead of rejecting the
-    // edit outright.
-    b = std::max(b, a);
-    c = std::max(c, b);
-    d = std::max(d, c);
-    c = std::min(c, d);
-    b = std::min(b, c);
-    a = std::min(a, b);
-    auto setQuiet = [](QDoubleSpinBox* spin, double v) {
-        if (spin->value() == v) return;
-        spin->blockSignals(true);
-        spin->setValue(v);
-        spin->blockSignals(false);
-    };
-    setQuiet(lowCutSpin_, a);
-    setQuiet(lowPassSpin_, b);
-    setQuiet(highPassSpin_, c);
-    setQuiet(highCutSpin_, d);
+void BandpassDialog::enforceOrdering(QDoubleSpinBox* edited) {
+    // Low 0 means "no low cut", so only a positive low corner constrains high.
+    const double low = lowSpin_->value();
+    const double high = highSpin_->value();
+    if (low <= 0.0 || low < high) return;
+    QDoubleSpinBox* other = edited == lowSpin_ ? highSpin_ : lowSpin_;
+    const double value = edited == lowSpin_ ? low + 1.0 : std::max(0.0, high - 1.0);
+    other->blockSignals(true);
+    other->setValue(value);
+    other->blockSignals(false);
 }
 
 void BandpassDialog::updateDefaultOutputName() {
     if (outputNameEdited_ || sourceName_.isEmpty()) return;
-    outputNameEdit_->setText(QString("%1_Bandpass_%2_%3_%4_%5")
+    outputNameEdit_->setText(QString("%1_Bandpass_%2_%3_N%4")
                                   .arg(sourceName_)
-                                  .arg(lowCutSpin_->value(), 0, 'g', 4)
-                                  .arg(lowPassSpin_->value(), 0, 'g', 4)
-                                  .arg(highPassSpin_->value(), 0, 'g', 4)
-                                  .arg(highCutSpin_->value(), 0, 'g', 4));
+                                  .arg(lowSpin_->value(), 0, 'g', 4)
+                                  .arg(highSpin_->value(), 0, 'g', 4)
+                                  .arg(orderSpin_->value()));
 }
 
 void BandpassDialog::emitApply() {
     if (!onApply_) return;
-    segy::BandpassParams params;
-    params.lowCut = lowCutSpin_->value();
-    params.lowPass = lowPassSpin_->value();
-    params.highPass = highPassSpin_->value();
-    params.highCut = highCutSpin_->value();
+    segy::ButterworthBandParams params;
+    params.lowHz = lowSpin_->value();
+    params.highHz = highSpin_->value();
+    params.order = orderSpin_->value();
+    params.padding = segy::EdgePadding(edgesCombo_->currentData().toInt());
     onApply_(params, outputNameEdit_->text());
 }
 
@@ -2705,7 +2712,7 @@ void DatasetSlotWidget::paintEvent(QPaintEvent*) {
     nameFont.setPixelSize(11);
     painter.setFont(nameFont);
     painter.setPen(QColor(0xd4, 0xd4, 0xd8));
-    QString shown = datasetName_.isEmpty() ? QStringLiteral("â€”") : datasetName_;
+    QString shown = datasetName_.isEmpty() ? QString(QChar(0x2014)) /* em dash; QChar keeps it independent of source encoding */ : datasetName_;
     QRect nameRect(4, 15, width() - 8 - 20, 16);
     painter.drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter,
                       painter.fontMetrics().elidedText(shown, Qt::ElideRight, nameRect.width()));
@@ -2897,13 +2904,38 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     // Every function stays reachable from the menus either way.
     QGroupBox* buttonsGroup = new QGroupBox("Toolbar Buttons");
     QVBoxLayout* buttonsLayout = new QVBoxLayout(buttonsGroup);
+    // One block per category (consecutive items sharing it): its name on
+    // the left, its buttons in two columns on the right, a thin line
+    // between blocks.
     QGridLayout* grid = new QGridLayout();
-    const int rows = int((toolbarItems.size() + 1) / 2); // two columns, filled top to bottom
-    for (size_t i = 0; i < toolbarItems.size(); ++i) {
-        QCheckBox* check = new QCheckBox(toolbarItems[i].label);
-        check->setChecked(!initial.hiddenToolbarItems.contains(toolbarItems[i].id));
-        grid->addWidget(check, int(i) % std::max(1, rows), int(i) / std::max(1, rows));
-        toolbarItemChecks_.push_back({toolbarItems[i].id, check});
+    grid->setHorizontalSpacing(14);
+    grid->setVerticalSpacing(4);
+    grid->setColumnStretch(1, 1);
+    grid->setColumnStretch(2, 1);
+    int row = 0;
+    for (size_t i = 0; i < toolbarItems.size();) {
+        size_t end = i;
+        while (end < toolbarItems.size() && toolbarItems[end].category == toolbarItems[i].category) ++end;
+        if (row > 0) {
+            // A plain 1 px strip: a styled QFrame::HLine rendered ~3 px and too bright.
+            QWidget* line = new QWidget();
+            line->setFixedHeight(1);
+            line->setStyleSheet("background-color: #34363b;");
+            grid->addWidget(line, row++, 0, 1, 3);
+        }
+        QLabel* heading = new QLabel(toolbarItems[i].category.toUpper());
+        heading->setStyleSheet("color: #7a7c82; font-size: 10px; letter-spacing: 1px; font-weight: 600;");
+        const int blockRows = int((end - i + 1) / 2);
+        grid->addWidget(heading, row, 0, blockRows, 1, Qt::AlignTop | Qt::AlignLeft);
+        for (size_t k = i; k < end; ++k) {
+            QCheckBox* check = new QCheckBox(toolbarItems[k].label);
+            check->setChecked(!initial.hiddenToolbarItems.contains(toolbarItems[k].id));
+            const int offset = int(k - i);
+            grid->addWidget(check, row + offset / 2, 1 + offset % 2); // left to right, then down
+            toolbarItemChecks_.push_back({toolbarItems[k].id, check});
+        }
+        row += blockRows;
+        i = end;
     }
     buttonsLayout->addLayout(grid);
     QHBoxLayout* buttonsRow = new QHBoxLayout();
@@ -4330,7 +4362,20 @@ MainWindow::MainWindow() : QMainWindow() {
     connect(preferencesAction, &QAction::triggered, this, [this]() {
         if (!preferencesDialog_) {
             std::vector<ToolbarItemInfo> items;
-            for (const ToolbarItem& item : toolbarItems_) items.push_back({item.id, item.label});
+            // Grouped by what the buttons do, for Preferences' Toolbar
+            // Buttons section (finer than the toolbar's own separators,
+            // which lump analysis, headers and panel controls together).
+            auto categoryFor = [](const QString& id) -> QString {
+                if (id == "zoom" || id == "mooz") return "Zoom";
+                if (id == "pan" || id == "boxSelect") return "Tools";
+                if (id == "seismicMode" || id == "flipHorizontal" || id == "idents") return "Display";
+                if (id == "displayParameters" || id == "gain" || id == "agc") return "Amplitude";
+                if (id == "spectrum" || id == "histogram" || id == "octaveBands" || id == "autocorrelation")
+                    return "Analysis";
+                if (id == "textHeader" || id == "binaryHeader") return "Headers";
+                return "Panels"; // splitView, lock, sidebar
+            };
+            for (const ToolbarItem& item : toolbarItems_) items.push_back({item.id, item.label, categoryFor(item.id)});
             preferencesDialog_ = new PreferencesDialog(prefs_, items, this);
             preferencesDialog_->setAppliedCallback([this](const Preferences& newPrefs) {
                 prefs_ = newPrefs;
@@ -5752,7 +5797,7 @@ void MainWindow::runCalculator(AppState& a, AppState& b, bool subtract, const QS
         });
 }
 
-void MainWindow::runBandpass(AppState& source, const segy::BandpassParams& params, const QString& outputName) {
+void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams& params, const QString& outputName) {
     if (!source.loaded || source.foreground->traceCount <= 0 || source.foreground->binHeader.samplesPerTrace <= 0) {
         flashStatusMessage("No data selected");
         return;
@@ -5769,13 +5814,32 @@ void MainWindow::runBandpass(AppState& source, const segy::BandpassParams& param
                        .arg(ds->traceCount)
                        .arg(ds->binHeader.samplesPerTrace)
                        .arg(ds->binHeader.sampleIntervalUs);
+    // Designed up front (cheap), so an impossible request -- both corners
+    // open, low corner above Nyquist, low >= high -- is refused with a
+    // message instead of silently writing an unfiltered copy.
+    const double sampleRateHz = ds->binHeader.sampleIntervalUs > 0 ? 1'000'000.0 / ds->binHeader.sampleIntervalUs : 0.0;
+    std::string designError;
+    const std::vector<segy::Biquad> sos = segy::designButterworthBand(params, sampleRateHz, &designError);
+    if (sos.empty()) {
+        QMessageBox::warning(this, "Bandpass Filter", QString::fromStdString(designError));
+        return;
+    }
+    const double nyquistHz = sampleRateHz / 2.0;
+    const bool hasLow = params.lowHz > 0.0;
+    const bool hasHigh = params.highHz < nyquistHz * 0.999;
+    QString filterText = hasLow && hasHigh ? QString("BANDPASS %1-%2 HZ").arg(params.lowHz, 0, 'g', 4).arg(params.highHz, 0, 'g', 4)
+                         : hasLow          ? QString("HIGHPASS %1 HZ").arg(params.lowHz, 0, 'g', 4)
+                                           : QString("LOWPASS %1 HZ").arg(params.highHz, 0, 'g', 4);
     std::vector<std::string> history = ds->processingHistory;
-    history.push_back(QString("BANDPASS FILTER (HANNING TAPER) %1-%2-%3-%4 HZ")
-                          .arg(params.lowCut, 0, 'g', 4)
-                          .arg(params.lowPass, 0, 'g', 4)
-                          .arg(params.highPass, 0, 'g', 4)
-                          .arg(params.highCut, 0, 'g', 4)
+    const char* paddingText = params.padding == segy::EdgePadding::Even  ? "EVEN"
+                              : params.padding == segy::EdgePadding::Odd ? "ODD"
+                                                                          : "CONSTANT";
+    history.push_back(QString("BUTTERWORTH %1, ORDER %2, ZERO-PHASE SOSFILTFILT, %3 PADDING")
+                          .arg(filterText)
+                          .arg(params.order)
+                          .arg(paddingText)
                           .toStdString());
+    const segy::EdgePadding padding = params.padding;
 
     QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, traceCount, samplesPerTrace,
                                               ds->binHeader.sampleIntervalUs);
@@ -5787,7 +5851,7 @@ void MainWindow::runBandpass(AppState& source, const segy::BandpassParams& param
 
     runBackgroundTask(
         QString("Bandpass: %1").arg(sourceName),
-        [this, ds, traceCount, samplesPerTrace, params, outHeader, textHeader, outPath, writeOk, writeError]() {
+        [this, ds, traceCount, samplesPerTrace, sos, padding, outHeader, textHeader, outPath, writeOk, writeError]() {
             backgroundTaskTotal_ = traceCount;
             std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
             std::vector<float> samples(static_cast<size_t>(samplesPerTrace));
@@ -5795,7 +5859,7 @@ void MainWindow::runBandpass(AppState& source, const segy::BandpassParams& param
                 const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
                 segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples.data(), size_t(samplesPerTrace),
                                     ds->binHeader.formatCode);
-                segy::applyBandpassFilter(samples, ds->binHeader.sampleIntervalUs, params);
+                segy::sosFiltFilt(sos, samples, -1, padding);
                 segy::WriteTrace& out = traces[size_t(t)];
                 out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
                 out.samples = samples;
@@ -5949,7 +6013,8 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
                     spec.highpass ? segy::butterworthHighpass(kOctaveButterworthOrder, spec.lo, sampleRateHz)
                                   : segy::butterworthBandpass(kOctaveButterworthOrder, spec.lo, spec.hi, sampleRateHz);
                 std::vector<std::vector<float>> filtered = rawTraces;
-                for (std::vector<float>& tr : filtered) segy::sosFiltFilt(sos, tr);
+                // Even (mirror) padding, the app-wide default: see iirfilter.h.
+                for (std::vector<float>& tr : filtered) segy::sosFiltFilt(sos, tr, -1, segy::EdgePadding::Even);
                 QString label = spec.highpass ? QString("%1 Hz - Nyquist").arg(spec.lo)
                                               : QString("%1 - %2 Hz").arg(spec.lo).arg(spec.hi);
                 result->bands.push_back({label, makeOctaveBandData(std::move(filtered), colorScale, colorScaleFlipped)});
@@ -5985,7 +6050,7 @@ void MainWindow::openCalculatorDialog() {
 void MainWindow::openBandpassDialog() {
     if (!bandpassDialog_) {
         bandpassDialog_ = new BandpassDialog(this);
-        bandpassDialog_->setApplyCallback([this](segy::BandpassParams params, QString outputName) {
+        bandpassDialog_->setApplyCallback([this](segy::ButterworthBandParams params, QString outputName) {
             // Filters whichever panel is active when Apply is pressed, not
             // whichever was active when the dialog first opened -- it's a
             // non-modal dialog, so the user may have clicked the other

@@ -1875,11 +1875,10 @@ that machinery was built once and shared:
   `parseBinaryHeader`, `decodeEbcdicText`, `decodeSamples`).
 - **`fft.h/.cpp`** — the radix-2 FFT moved out of `analysis.cpp` (verified
   behavior-preserving: Spectrum's test still passes) and gained `ifft`
-  (conjugate trick). **`bandpass.h/.cpp`** — `applyBandpassFilter()`: FFT,
-  multiply by a Hanning (raised-cosine) tapered trapezoid gain mask mirrored
-  around Nyquist so real input stays real, inverse FFT. Tested on
-  bin-aligned sines (passband tone reconstructed to <0.01, out-of-band tone
-  and an all-stop filter suppressed).
+  (conjugate trick). Bandpass originally used an FFT trapezoid filter
+  (`bandpass.h/.cpp`). That was replaced by Butterworth + sosfiltfilt, and
+  the file removed; see "Octave-band and Bandpass filtering: Butterworth +
+  sosfiltfilt".
 - **Displaying a result**: rather than a parallel in-memory-dataset code
   path, Calculator/Bandpass write the result to a scratch `.sgy` under the OS
   temp dir (`segyread_scratch/<name>.sgy`) and load it through the existing,
@@ -1903,9 +1902,8 @@ that machinery was built once and shared:
   traces/samples (current view) of the chosen Left/Right panel into
   unfiltered + 2^N Hz octave bands (min/max are power-of-2 combos), rendered
   **variable-density** (per the mockup feedback). Each band is filtered the
-  way scipy users do it, using `viewer/iirfilter.*` (see "Octave-band
-  filtering: Butterworth + sosfiltfilt" below), not the FFT trapezoid
-  filter used by Edit > Processing > Bandpass. **Scale** (in the window's toolbar) chooses the clip:
+  way scipy users do it, using `viewer/iirfilter.*` (see "Octave-band and
+  Bandpass filtering: Butterworth + sosfiltfilt" below). **Scale** (in the window's toolbar) chooses the clip:
   + **Common** (the default): every band uses the Unfiltered band's
     99.5th-percentile |amplitude|, so each band's true strength shows. In
     seismic data a 1-2 Hz or 2-4 Hz band should read near-white.
@@ -2397,8 +2395,13 @@ technique this file already uses for `DatasetSlotWidget`/
 COPILOT.md item 1. Every toolbar button can be removed from or added back
 to the toolbar; the order stays fixed (show/hide only, no drag-reordering
 yet). **This is edited only in Edit > Preferences > Toolbar Buttons**: one
-checkbox per item in two columns, plus *Show All*, applied with OK/Apply
-like the rest of Preferences.
+checkbox per item plus *Show All*, applied with OK/Apply like the rest of
+Preferences. At the user's request the checkboxes are grouped by function,
+each group headed by its name and separated from the next by a 1 px line:
+Zoom, Tools, Display, Amplitude, Analysis, Headers, Panels. This is finer
+than the toolbar's own separators, which lump analysis, headers and panel
+controls together. The category is presentation-only:
+`ToolbarItemInfo::category`, assigned when Preferences is first opened.
 
 Two other ways in existed at first and were removed at the user's request:
 - right-clicking the toolbar (a "Remove … from Toolbar" item plus the full
@@ -2482,17 +2485,18 @@ settings file (restored afterward):
 The new menu entries and the right-click menu were not clicked through
 interactively; see "Trade-offs".
 
-### Octave-band filtering: Butterworth + sosfiltfilt
+### Octave-band and Bandpass filtering: Butterworth + sosfiltfilt
 
-At the user's request the Octave Band Display filters the way
-`scipy.signal` users do, since that is the industry standard:
-`butter(4, [lo, hi], btype='band', output='sos')` applied with
-`sosfiltfilt`, using its defaults. `viewer/iirfilter.*` ports exactly that:
+At the user's request, the Octave Band Display and Edit > Processing >
+Bandpass filter the way `scipy.signal` users do, since that is the industry
+standard: `butter(order, ..., output='sos')` applied with `sosfiltfilt`.
+`viewer/iirfilter.*` ports exactly that:
 
-- `butterworthBandpass` / `butterworthHighpass` follow scipy's own chain:
+- `butterworthBandpass` / `butterworthHighpass` / `butterworthLowpass`
+  follow scipy's own chain:
   - `buttap` prototype poles;
   - prewarping with fs = 2;
-  - `lp2bp_zpk` / `lp2hp_zpk`;
+  - `lp2bp_zpk` / `lp2hp_zpk` / `lp2lp_zpk`;
   - `bilinear_zpk`.
 
   The result is second-order sections, which stay numerically stable for
@@ -2502,9 +2506,10 @@ At the user's request the Octave Band Display filters the way
   identical.
 - `sosFiltFilt` runs a forward and a backward pass (zero phase). Edge
   handling is the reason filtfilt is the standard:
-  - **Odd padding** (`padtype='odd'`): the trace is extended at both ends by
-    a point reflection about its end sample (2·x[0] − x[k]), with scipy's
-    default length of 3·(2·sections + 1) samples.
+  - **Padding**: the trace is extended at both ends with scipy's default
+    length of 3·(2·sections + 1) samples. All three of scipy's padtypes are
+    implemented: `EdgePadding::Even` (mirror), `Odd` (point reflection
+    2·x[0] − x[k], scipy's default) and `Constant` (repeat the end value).
   - **Steady-state start** (`sosfilt_zi`): each pass starts from the
     filter's steady state for its first sample.
 
@@ -2514,18 +2519,67 @@ At the user's request the Octave Band Display filters the way
   maths runs in double precision; float is used only at the interface.
   Where scipy would refuse a trace too short for the padding, the padding is
   shortened to len − 1 instead.
-- **Verification:** reference values from scipy 1.18.1 for four filters
-  (1-2, 8-16 and 32-64 Hz bandpasses, and a 64 Hz highpass) are in
-  `test_main.cpp`, at 17 sample positions including both trace ends. The
-  largest deviation is 7·10⁻⁸, which is float32 rounding. A second test
-  checks that the corners sit at exactly −3 dB. On real data, scipy's
-  octave-band dB levels for the same 160 traces of the test file matched the
-  app's to the rounded dB.
+- **The app pads with Even (mirror), not scipy's default Odd.** The user
+  asked for mirrored edges, and the measurements agreed. Odd padding keeps
+  the end sample's value as the level of the extension. A trace that ends
+  on a large high-frequency excursion therefore gets a step-like extension,
+  and the step's low-frequency energy leaks into low passbands. In a
+  two-tone test this alone produced an error of 0.78 at the trace end;
+  scipy gives the same number, so it is the method and not the port.
+
+  The real-data check took 200 traces of the test file and filtered only
+  their middle half. It then compared the window's edges with the same
+  samples filtered as part of the whole trace, where they are far from any
+  edge. Edge error relative to the band's RMS:
+
+  | Band     | Odd  | Even | Constant |
+  |----------|------|------|----------|
+  | 4-8 Hz   | 2.67 | 0.99 | 1.47     |
+  | 8-16 Hz  | 1.91 | 0.90 | 1.10     |
+  | 32-64 Hz | 0.52 | 0.43 | 0.32     |
+
+  A longer padlen didn't help either type; for odd padding it made things
+  worse. So `sosFiltFilt` defaults to Even. The octave bands use it. Bandpass
+  offers all three under **Edges**, with Mirror (even) as the default, and
+  records the choice in the output's processing history.
+- **Verification:** reference values from scipy 1.18.1 are in
+  `test_main.cpp`, at 17 sample positions including both trace ends:
+  - odd padding: 1-2, 8-16 and 32-64 Hz bandpasses, a 64 Hz highpass, a
+    30 Hz lowpass, plus odd orders (order-3 bandpass, order-5 highpass,
+    order-1 lowpass), whose first-order sections change scipy's padlen;
+  - even and constant padding: three filters each.
+
+  The section counts and default padlen match scipy's. The largest
+  deviation in any case is 1.1·10⁻⁷, which is float32 rounding. Other
+  tests check that the corners sit at exactly −3 dB, and the design rules
+  below. On real data, scipy's octave-band dB levels (odd padding) for the
+  same 160 traces of the test file matched the app's to the rounded dB.
 - **Bands at Nyquist:** a band reaching Nyquist becomes a highpass labelled
   "N Hz - Nyquist", because scipy refuses a bandpass edge at or above
   Nyquist. Bands entirely above Nyquist are dropped instead of shown blank.
-- **Order:** 4, a fixed constant (`kOctaveButterworthOrder`). With filtfilt
-  the response is squared, so the corners end up at −6 dB.
+- **Order:** 4 for the octave bands, a fixed constant
+  (`kOctaveButterworthOrder`). With filtfilt the response is squared, so
+  the corners end up at −6 dB.
+- **Edit > Processing > Bandpass** fields: Low Corner (0 Hz means no low
+  cut, so a lowpass), High Corner (at or above Nyquist means no high cut, so
+  a highpass), Order (1-10, default 4) and Edges. These replaced the four
+  trapezoid corners. `designButterworthBand` picks the band, lowpass or
+  highpass. It refuses, with a message instead of silently writing an
+  unfiltered copy, when:
+  - both corners are open;
+  - the low corner is at or above Nyquist;
+  - low ≥ high.
+
+  The output's processing history records the filter, for example
+  "BUTTERWORTH BANDPASS 10-50 HZ, ORDER 4, ZERO-PHASE SOSFILTFILT, EVEN
+  PADDING". Verified end to end on the test file: a 53.5 MB filtered SEG-Y
+  was written and loaded.
+- **Edges of short records.** No padding knows the data past a trace's
+  end, so a low corner's ringing still reaches inside. The two-tone unit
+  test (512 samples at 1 kHz, 8 Hz low corner) holds the middle half to
+  scipy's 0.049 and the whole trace only to "no blow-up". Its old
+  FFT-filter bounds (0.01 over the whole trace) don't apply to any IIR
+  filtfilt.
 - **Changed dB levels.** On the 0.704 s test file the levels changed from
   the FFT-trapezoid values, most visibly at 2-4 Hz: from −33 dB to −17 dB.
   scipy gives the same −17 dB. Traces shorter than about one period of a

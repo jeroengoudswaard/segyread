@@ -181,6 +181,44 @@ std::vector<Biquad> butterworthHighpass(int order, double cutoffHz, double sampl
     return toSections(poles, zeros, gain);
 }
 
+std::vector<Biquad> butterworthLowpass(int order, double cutoffHz, double sampleRateHz) {
+    const double wo = prewarp(cutoffHz, sampleRateHz);
+    // lp2lp_zpk: p -> p * wo; gain wo^order. bilinear_zpk: all `order`
+    // zeros are "at infinity" -> z = -1; gain * prod(4 - z) / prod(4 - p)
+    // with no analog zeros, i.e. 1 / prod(4 - p).
+    std::vector<cplx> poles, zeros;
+    cplx den(1.0, 0.0);
+    for (const cplx& p : butterworthPrototypePoles(order)) {
+        cplx analog = p * wo;
+        poles.push_back(bilinear(analog));
+        den *= (4.0 - analog);
+    }
+    for (int i = 0; i < order; ++i) zeros.push_back(cplx(-1.0, 0.0));
+    double gain = std::pow(wo, order) * (cplx(1.0, 0.0) / den).real();
+    return toSections(poles, zeros, gain);
+}
+
+std::vector<Biquad> designButterworthBand(const ButterworthBandParams& params, double sampleRateHz,
+                                          std::string* error) {
+    auto fail = [error](const char* message) {
+        if (error) *error = message;
+        return std::vector<Biquad>{};
+    };
+    const double nyquist = sampleRateHz / 2.0;
+    if (sampleRateHz <= 0.0) return fail("The file has no valid sample interval.");
+    const int order = std::clamp(params.order, 1, 20);
+    const bool hasLow = params.lowHz > 0.0;
+    const bool hasHigh = params.highHz < nyquist * 0.999;
+    if (hasLow && params.lowHz >= nyquist * 0.999) return fail("The low corner is at or above the Nyquist frequency.");
+    if (!hasLow && !hasHigh) return fail("Both corners are open (low 0 Hz, high at/above Nyquist): nothing to filter.");
+    if (hasLow && hasHigh) {
+        if (params.lowHz >= params.highHz) return fail("The low corner must be below the high corner.");
+        return butterworthBandpass(order, params.lowHz, params.highHz, sampleRateHz);
+    }
+    return hasLow ? butterworthHighpass(order, params.lowHz, sampleRateHz)
+                  : butterworthLowpass(order, params.highHz, sampleRateHz);
+}
+
 int sosFiltFiltDefaultPadlen(const std::vector<Biquad>& sos) {
     int zeroB2 = 0, zeroA2 = 0;
     for (const Biquad& q : sos) {
@@ -190,18 +228,30 @@ int sosFiltFiltDefaultPadlen(const std::vector<Biquad>& sos) {
     return 3 * (2 * int(sos.size()) + 1 - std::min(zeroB2, zeroA2));
 }
 
-void sosFiltFilt(const std::vector<Biquad>& sos, std::vector<float>& x, int padlen) {
+void sosFiltFilt(const std::vector<Biquad>& sos, std::vector<float>& x, int padlen, EdgePadding padding) {
     const int n = int(x.size());
     if (n < 2 || sos.empty()) return;
     int edge = padlen < 0 ? sosFiltFiltDefaultPadlen(sos) : padlen;
     edge = std::clamp(edge, 0, n - 1);
 
-    // Odd extension (scipy's odd_ext): point-reflect `edge` samples about
-    // each endpoint, so the signal continues smoothly through the ends.
+    // scipy's even_ext / odd_ext / const_ext: `edge` samples past each end.
+    // The mirrored samples are x[edge..1] on the left and x[n-2..n-1-edge]
+    // on the right (the end sample itself is not repeated).
     std::vector<double> ext(size_t(n + 2 * edge));
-    for (int i = 0; i < edge; ++i) ext[size_t(i)] = 2.0 * x[0] - double(x[size_t(edge - i)]);
+    const double first = x[0], last = x[size_t(n - 1)];
+    for (int i = 0; i < edge; ++i) {
+        const double mirrored = x[size_t(edge - i)];
+        ext[size_t(i)] = padding == EdgePadding::Even ? mirrored
+                         : padding == EdgePadding::Odd ? 2.0 * first - mirrored
+                                                       : first;
+    }
     for (int i = 0; i < n; ++i) ext[size_t(edge + i)] = x[size_t(i)];
-    for (int i = 0; i < edge; ++i) ext[size_t(edge + n + i)] = 2.0 * x[size_t(n - 1)] - double(x[size_t(n - 2 - i)]);
+    for (int i = 0; i < edge; ++i) {
+        const double mirrored = x[size_t(n - 2 - i)];
+        ext[size_t(edge + n + i)] = padding == EdgePadding::Even ? mirrored
+                                    : padding == EdgePadding::Odd ? 2.0 * last - mirrored
+                                                                  : last;
+    }
 
     const auto zi = sosFiltZi(sos);
     sosFilterPass(sos, zi, ext.front(), ext);   // forward

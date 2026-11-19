@@ -1,6 +1,6 @@
-// Shared radix-2 FFT/IFFT, used by both analysis.cpp (Spectrum's magnitude
-// display) and bandpass.cpp (real filtering) -- one implementation instead
-// of two, so a bug fix or precision change can't apply to only one caller.
+// Radix-2 FFT/IFFT, used by analysis.cpp (Spectrum's magnitude display).
+// (bandpass.cpp, an FFT trapezoid filter, used it too until Bandpass and the
+// Octave Band Display moved to Butterworth + sosfiltfilt, viewer/iirfilter.h.)
 #pragma once
 #include <complex>
 #include <cstddef>
