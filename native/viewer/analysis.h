@@ -140,6 +140,68 @@ XfGrid makeXfGrid(int gateSamples, double sampleIntervalUs);
 void xfAmplitudeSpectrum(const float* samples, int count, const std::vector<float>& window, const XfGrid& grid,
                          float* out);
 
+// The x-f display's spectra: |A(f)| of gate [gateStart, gateEnd) for every
+// trace in [traceStart, traceEnd), cosine-squared taper (80% flat), one
+// vector of grid.bins per trace. Runs in parallel over traces, so `fetch`
+// must be safe to call from several threads (decoding from the mmap is);
+// `progress(done)` may also be called from worker threads.
+std::vector<std::vector<float>> computeXfAmplitudes(const std::function<void(int64_t traceIndex, float* out)>& fetch,
+                                                    int samplesPerTrace, int64_t traceStart, int64_t traceEnd,
+                                                    int gateStart, int gateEnd, const XfGrid& grid,
+                                                    const std::function<void(int64_t done)>& progress = nullptr);
+
+// ---------------------------------------------------------------------------
+// F-K (see native/README.md, "F-K window"): the 2D amplitude spectrum of
+// panels of traces, power-averaged over the panels. A panel is a gather
+// (a run of consecutive traces with the same key, e.g. FFID or CDP), or a
+// sliding window of traces when the data has no gathers.
+struct FkPanel {
+    int64_t start = 0; // first trace (absolute index)
+    int64_t end = 0;   // one past the last trace
+    // Optional explicit trace order (absolute indices), e.g. a gather
+    // sorted by offset; empty = start..end-1 in file order.
+    std::vector<int64_t> traces;
+    int64_t traceCount() const { return traces.empty() ? end - start : int64_t(traces.size()); }
+    int64_t traceAt(int64_t i) const { return traces.empty() ? start + i : traces[size_t(i)]; }
+};
+
+// Runs of equal consecutive `keys`, as panels offset by `firstTrace`;
+// runs shorter than `minTraces` are dropped.
+std::vector<FkPanel> splitIntoGathers(const std::vector<int32_t>& keys, int64_t firstTrace, int minTraces);
+
+// Windows of `width` traces with 50% overlap covering [start, end) (one
+// shorter window when the range is narrower than `width`).
+std::vector<FkPanel> slidingPanels(int64_t start, int64_t end, int width);
+
+struct FkResult {
+    int frequencies = 0;  // rows: f = row * frequencyStepHz, 0..Nyquist
+    int wavenumbers = 0;  // columns: k = (col - wavenumbers / 2) / wavenumbers cycles/trace, -0.5..<0.5
+    double frequencyStepHz = 0.0;
+    std::vector<float> db; // frequencies x wavenumbers, row-major; 0 dB = max, floor -120
+    int panelsUsed = 0;
+};
+
+// Runs in parallel (time FFTs over traces, space FFTs over frequencies),
+// so `fetch` must be safe to call from several threads; `progress` is
+// called from the calling thread, once per panel.
+// Per panel: mean removed per trace, cosine-squared taper (80% flat) in
+// time and across the traces, 2D FFT on a common power-of-two grid (the
+// widest panel sets the wavenumber count). Sign convention: an event that
+// gets later on later traces (t = t0 + p * x, p > 0) lands at k = f * p > 0.
+FkResult computeFk(const SigcorTraceFetch& fetch, int samplesPerTrace, const std::vector<FkPanel>& panels,
+                   int gateStart, int gateEnd, double sampleIntervalUs,
+                   const std::function<void(int, int)>& progress = nullptr);
+
+// Trace differentiation (slopeDbPerOctave > 0) or integration (< 0), full
+// or fractional: the spectrum is multiplied by (i 2 pi f)^a with
+// a = slope / 6.0206, so 6 dB/octave is exactly d/dt (or the integral dt),
+// including its +90 (-90) degree phase, 3 dB/octave a half derivative
+// (amplitude ~ sqrt(f), 45 degrees), 0 leaves the trace alone. The mean is
+// removed first (and after integration: the integration constant); DC
+// gets zero gain. Zero-padded to twice the length (no wrap-around). Time
+// in seconds: full differentiation scales by 2 pi f.
+void traceDerivative(std::vector<float>& trace, double sampleIntervalUs, double slopeDbPerOctave);
+
 // Shifts x by a fraction of a sample: out[i] = x(i + shift), band-limited
 // (phase ramp in the frequency domain). |shift| <= 1 is the intended use.
 std::vector<float> fractionalShift(const std::vector<float>& x, double shift);

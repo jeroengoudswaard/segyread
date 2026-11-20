@@ -24,6 +24,10 @@
 #include "synthetic_segy.h"
 #include "renderer.h"
 #include "wiggle.h"
+#include "analysis.h"
+#include "fft.h"
+#include "loader.h"
+#include "segy_writer.h"
 
 namespace {
 
@@ -273,11 +277,83 @@ void benchWiggleLayout() {
 
 } // namespace
 
+
+// Spectral analyses (x-f display, f-k window): where the time goes. Sizes
+// match the PARAGON stack (15082 traces x 2501 samples) and the F3
+// prestack gathers (252 x 38 traces x 376 samples).
+void benchSpectral() {
+    std::printf("\n-- Spectral (x-f, f-k)\n");
+    const int traces = 15082, samples = 2501;
+    std::mt19937 rng(5);
+    std::normal_distribution<float> gauss(0.0f, 1.0f);
+    std::vector<float> data(size_t(traces) * size_t(samples));
+    for (float& v : data) v = gauss(rng);
+    auto fetch = [&](int64_t idx, float* out) {
+        std::copy_n(data.begin() + std::ptrdiff_t(size_t(idx) * size_t(samples)), samples, out);
+    };
+
+    {
+        std::vector<std::complex<float>> buf(4096);
+        auto start = Clock::now();
+        for (int t = 0; t < traces; ++t) {
+            for (size_t i = 0; i < buf.size(); ++i) buf[i] = std::complex<float>(float(i % 7), 0.0f);
+            segy::fft(buf);
+        }
+        std::printf("  fft: %d x 4096-point                 %8.3f s\n", traces, elapsedSeconds(start));
+    }
+    {
+        segy::XfGrid grid = segy::makeXfGrid(samples, 4000.0);
+        auto start = Clock::now();
+        std::vector<std::vector<float>> spectra = segy::computeXfAmplitudes(fetch, samples, 0, traces, 0, samples, grid);
+        std::printf("  x-f spectra: %d traces               %8.3f s\n", traces, elapsedSeconds(start));
+    }
+    {
+        auto start = Clock::now();
+        segy::FkResult fk = segy::computeFk(fetch, samples, segy::slidingPanels(0, traces, 256), 0, samples, 4000.0);
+        std::printf("  f-k stack: %d panels of 256 traces    %8.3f s\n", fk.panelsUsed, elapsedSeconds(start));
+    }
+    {
+        std::vector<segy::FkPanel> gathers;
+        for (int g = 0; g < 252; ++g) gathers.push_back({int64_t(g) * 38, int64_t(g) * 38 + 38, {}});
+        auto start = Clock::now();
+        for (const segy::FkPanel& g : gathers) segy::computeFk(fetch, samples, {g}, 0, 376, 4000.0);
+        std::printf("  f-k gathers: 252 x 38 traces x 376    %8.3f s\n", elapsedSeconds(start));
+    }
+    {
+        // x-f output round trip: write the float32 SEG-Y, load it (pyramid build).
+        const int bins = 2049;
+        std::vector<segy::WriteTrace> out(static_cast<size_t>(traces));
+        for (int t = 0; t < traces; ++t) {
+            out[size_t(t)].headerBytes.assign(240, 0);
+            out[size_t(t)].samples.assign(size_t(bins), -30.0f + float(t % 13));
+        }
+        segy::BinaryHeader header{};
+        header.samplesPerTrace = int16_t(bins);
+        header.sampleIntervalUs = 61;
+        header.formatCode = 5;
+        std::filesystem::path path = std::filesystem::temp_directory_path() / "segybench_xf.sgy";
+        std::string error;
+        auto start = Clock::now();
+        segy::writeSegyFile(path, std::string(3200, ' '), header, out, &error);
+        std::printf("  x-f write SEG-Y (%d x %d)          %8.3f s\n", traces, bins, elapsedSeconds(start));
+        segy::ThreadPool pool{std::max(1u, std::thread::hardware_concurrency())};
+        start = Clock::now();
+        segy::LoadResult loaded = segy::loadSegyFile(path, pool);
+        std::printf("  x-f load + pyramid                    %8.3f s (%s)\n", elapsedSeconds(start), loaded.ok ? "ok" : loaded.error.c_str());
+        loaded = segy::LoadResult{};
+        std::filesystem::remove(path);
+    }
+}
+
 int main(int argc, char** argv) {
     std::printf("SEG-Y native rewrite -- microbenchmarks\n");
     std::printf("AVX2 available: %s\n", segy::cpuSupportsAvx2() ? "yes" : "no");
     std::printf("hardware_concurrency: %u\n", std::thread::hardware_concurrency());
 
+    if (argc > 1 && std::string(argv[1]) == "spectral") {
+        benchSpectral();
+        return 0;
+    }
     benchIbmDecode();
     benchPyramidBuild();
     benchHeaderSelectSort();

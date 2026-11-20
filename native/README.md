@@ -2671,21 +2671,37 @@ time gate.
     transformed once at the end, on twice the frequency density. Without
     a lag window this gives the same spectra as SPECTR (tested to 1e-4).
   - noise = trace − signal.
-- **Display:** a `SignalNoiseWindow` with toggles for Trace, Signal, Noise
-  (dB relative to the trace spectrum's peak) and S/N (10·log10 S/N, dB).
-  Signal and noise are on by default. All four share one dB axis. Bins
-  where a value is ≤ 0 (noise can dip below zero) leave a gap. The 1σ of
-  the accepted pairs' time shifts is always shown above the chart, next
-  to the pair counts, gate, method and mean shift. Recompute re-reads the
-  active panel with the parameters below.
+- **Window:** kept deliberately calm, at the user's request.
+  - **Top row:** only the two parameters you tune per look, Trace
+    distance and Min correlation.
+  - **Two equal-size buttons** on the right:
+    - the time-shift statistics, typeset like the LaTeX
+      $\Delta t = \bar{t} \pm \sigma$ ms (mean and 1σ of the accepted
+      pairs' shifts). Clicking it opens a details table: time shift
+      (mean, 1σ, min, max, mean correlation), trace pairs (used, below
+      min correlation, at max shift, dead), data (source, traces, time
+      gate) and every parameter;
+    - **Recompute**. It turns the accent orange when recomputing would
+      change something: the active panel's selection box, view or dataset
+      differs from the last computation, or a parameter changed (window
+      or Preferences). Otherwise it stays plain. The check runs on every
+      tool-chrome refresh, view change, parameter edit and Preferences
+      Apply.
+  - **The chart:** a zoom strip above it.
+  - **Curve toggles** (Trace, Signal, Noise, S/N): a row centred under
+    the chart only (not the readout panel beside it), like a legend. Signal and Noise are on by
+    default. All curves share one dB axis (Trace/Signal/Noise relative to
+    the trace peak, S/N as 10·log10 S/N). A bin with a value ≤ 0 (noise
+    can dip below zero) leaves a gap.
 - **Colors:** the dark-surface steps of the dataviz reference palette,
   validated for lightness, chroma, CVD separation and contrast:
   signal blue `#3987e5`, noise orange `#d95926`, S/N aqua `#199e70`
   (also dashed), and trace neutral `#c3c2b7`.
-- **Parameters:** in the window itself, beside Recompute, under plain
-  names. The SIGCOR card name is in each tooltip:
+- **Parameters:** Trace distance and Min correlation are in the window.
+  Everything else is in Edit > Preferences > Signal/Noise, under plain
+  names, with the SIGCOR card name in each tooltip:
 
-  | In the window | SIGCOR |
+  | Name in the app | SIGCOR |
   |---|---|
   | Method: Spectrum / Autocorrelation | OPTION SPECTR / AUTCOR |
   | Trace distance | NSKIP |
@@ -2699,10 +2715,7 @@ time gate.
   They are persisted under `signalNoise/*` in `~/.segyread_settings` on
   every compute. The defaults are the user's own SIPMAP deck: Spectrum,
   distance 3, random extra 2, plain shift pick, max shift 30 ms, min
-  correlation 0.3, 5% flat, and Equalize energy and Remove DC on. An
-  earlier version put these in Edit > Preferences, next to the toolbar
-  buttons. The user moved them, since they belong with the computation.
-  The window's menu bar has no Utilities > Parameters.
+  correlation 0.3, 5% flat, and Equalize energy and Remove DC on.
 - **Left out of SIGCOR:** horizon-following gates, RANDTB, MEM/AR
   estimation, the TCROSS optimum filter, substacks, and card/trace output.
 - **Tests:** window shape, fractional shift of a sine, exact shifts and
@@ -2713,7 +2726,7 @@ time gate.
 - **Verified by screenshot** on the PARAGON 12.5 m inline: 2000/2000 pairs,
   1σ 0.78 ms, S/N about 12–15 dB across 10–90 Hz.
 
-### x-F display (toolbar toggle, View > x-F Display)
+### x-f display (toolbar toggle, View > x-f Display)
 
 A toggle on the seismic display. When switched on, the active panel shows
 the amplitude spectrum of every trace in view. It uses the traces and time
@@ -2734,11 +2747,11 @@ from 0 to Nyquist.
   seismic keeps rendering meanwhile. Zoom, pan, hover, color scales, clip,
   idents and Flip Horizontal therefore all work unchanged.
   - The trace headers are copied from the seismic, with the delay zeroed
-    and the sample count and interval set to the x-F values.
+    and the sample count and interval set to the x-f values.
   - The dataset is not added to the dataset pool.
 - **Hz on the axis:** the bin spacing is chosen as a whole number of
   millihertz and stored as the sample interval in µs, so where the seismic
-  reads ms the x-F reads Hz exactly. The FFT spectrum is linearly
+  reads ms the x-f reads Hz exactly. The FFT spectrum is linearly
   interpolated onto that grid. SEG-Y's int16 count and interval are
   respected: long, finely sampled gates are coarsened to at most 32767
   bins (tested).
@@ -2748,24 +2761,178 @@ from 0 to Nyquist.
 - **Colors:** variable density by default, with the Red-Yellow-Green
   scale flipped so −40 dB is green and 0 dB is red.
   - This needed one renderer addition: `ManualClip::center`, the data
-    value at the middle of the color scale (0 for seismic). x-F uses
+    value at the middle of the color scale (0 for seismic). x-f uses
     center −20 dB, ±20 dB, no gain or AGC.
   - The amplitude legend shows the centred values (0 / −20 / −40) under a
     "dB" heading. The heading sits on its own line, since the fixed legend
     column only fits a number.
-  - The user may change the color scale while in x-F. That choice is
-    remembered for the next x-F of the session.
+  - The user may change the color scale while in x-f. That choice is
+    remembered for the next x-f of the session.
 - **Selection boxes:** they disappear. On entry the seismic Foreground,
   view, display settings, selection boxes and zoom history are parked in
   `AppState::xf`. Toggling off restores all of them verbatim, so the boxes
-  come back. Picking a different Foreground while in x-F leaves x-F: the
+  come back. Picking a different Foreground while in x-f leaves x-f: the
   seismic display settings come back, but the parked dataset and boxes
   do not.
 - **Toolbar:** customizable item `xf` in the Display group, with a
   per-trace-spectrum glyph. The toggle follows the active panel.
 - **Verified by screenshot** on the PARAGON 12.5 m inline (15082 traces,
-  0–10 s): x-F on, then off, gives back the original seismic display and
+  0–10 s): x-f on, then off, gives back the original seismic display and
   color scale.
+
+### Zoom and axis ranges on the dB charts and the seismic display
+
+- **dB charts** (Spectrum, Signal/Noise):
+  - a slim strip above the chart has the seismic toolbar's three
+    buttons, with the same icons: Zoom (to the box), Unzoom (back
+    through the zoom history, ending at the automatic range) and Box
+    Select (drag a box on the chart);
+  - right-click on an axis (outside the plot frame) opens Axis Ranges…,
+    a min/max dialog for both axes, and Reset Axes;
+  - a manual range survives a recompute.
+- **Seismic display:** right-click outside the plot (the time/frequency
+  axis columns, ident rows) opens the same Axis Ranges… dialog (traces as
+  the hover readout numbers them, time in ms or frequency in Hz on x-f)
+  and Reset View. Both push the current view on the zoom history, so Mooz
+  steps back. Inside the plot, right-click keeps its box-select meaning.
+- **Shared dialog:** `editAxisRanges` is used by both.
+
+### Octave Band Display: same scaling as the main display
+
+The default Scale is now **Same as main display**. Every band uses the
+source panel's own clip, exactly as the seismic renderer gets it from
+`segy::displayClipPosNeg`: the auto clip from the file's peak, gain, and
+the manual (possibly asymmetric) clip. Reverse polarity is applied too.
+
+- **Live updates:** the panels follow the gain slider and Clip dialog
+  (`OctaveBandDialog::setMainClip` from `refreshAmplitudeScale`).
+- **AGC and computed gain:** left out, since the bands are filtered raw
+  data.
+- **Per band:** still available, with each band's own 99.5th-percentile
+  clip.
+- **Removed:** the old "Common (relative to unfiltered)" option. The
+  header's dB level per band (relative to unfiltered) is unchanged.
+
+### x-f display: time-series analyses off
+
+On an x-f display the samples are frequency bins in dB, so Spectrum,
+Octave Bands, Autocorrelation and Signal/Noise are disabled (toolbar and
+menus). Their compute functions also refuse with a status message, so
+Apply or Recompute from an already-open window can't run them either.
+Histogram stays available, since a distribution of dB values is still
+meaningful.
+
+### f-k display (Analysis > f-k display…)
+
+A separate window with the 2D amplitude spectrum, in dB. Frequency runs
+0..Nyquist upward and wavenumber −Nyquist..+Nyquist, with 0 in the
+middle. Colors are as on the x-f display: −40 dB green, 0 dB red, with
+the legend on the last plot.
+
+**Data:** the active selection box, or the visible data without one.
+
+**Panel ident** (Auto / FFID / CDP / None):
+- **Gathers:** runs of 8 or more consecutive traces with the same FFID or
+  CDP. With several gathers in view the window shows **one f-k plot per
+  gather, side by side** (scrolling, at most 24, evenly spread, with a
+  note when more are in view). The plots zoom together: a box drawn on
+  any of them, Zoom, Unzoom, Axis Ranges and Reset Axes apply to all
+  (`ZoomableChart::linkGroup`).
+- **Average gathers:** an option for one power-averaged plot instead.
+- **None (stack):** sliding panels of 256 traces with 50% overlap,
+  averaged into one plot.
+- **Auto:** picks FFID, then CDP, then None. It takes FFID or CDP when
+  the runs look like gathers (8 to 2048 traces, covering at least half
+  the data).
+
+**Distance ident** (Auto / Offset / CDP) for the k axis:
+- **Sorting:** gathers are sorted on it, because prestack data often
+  stores offsets interleaved. The F3 demo gathers run 200, 300, …, 2000
+  and then 300, … again; without sorting the f-k is meaningless.
+- **Spacing:** Δx is the panel's range of that value over (traces − 1),
+  median over the panels, times a scalar. A median of steps would break
+  on repeated offsets.
+- **Offset:** offset scalar, default 1.
+- **CDP:** metres per CDP. Default 1, replaced by the distance the trace
+  coordinates imply (CDP X/Y at bytes 181–188, else source X/Y at 73–80,
+  with the coordinate scalar at 71–72) until the user types a value.
+- **Auto:** offset for gathers, CDP for stacks.
+- **No spacing found:** k is in cycles/trace.
+- **On screen:** the k-axis line above the plots shows ident, range,
+  scalar and Δx, e.g. "Range: offset = 200–2000 scalar 1 Δx 48.6 m".
+  Each plot shows its panel, e.g. "CDP = 702".
+
+**Sign convention:** an event that gets later on later traces
+(t = t0 + p·x, p > 0) lands at k = f·p > 0 (tested both ways with
+reversed trace order).
+
+**Overlay:** an apparent-velocity fan f = v·k (300 to 5000 m/s, both
+signs). Labels that would collide are dropped.
+
+**Readout:** panel, f, k, v = f/k, and dB.
+
+**Recompute:** turns orange when the data, the panel or distance ident,
+the scalars or the average setting change.
+
+**Disabled on an x-f display.**
+
+**Headers:** `segy::TraceHeader` now also parses offset (37–40), the
+coordinate scalar (71–72) and CDP X/Y (181–188).
+
+**Verified:**
+- *F3 prestack:* 252 CDP gathers, offsets sorted, Δx 48.6 m, a
+  symmetric spectrum, 24 plots side by side.
+- *PARAGON stack:* sliding panels, 6.25 m per CDP from the coordinates.
+
+### Spectral speed: faster FFT, parallel x-f and f-k
+
+Measured with `segybench spectral` (16 threads, PARAGON-sized data,
+15082 × 2501). The time was almost all FFT, run on one thread:
+
+| | before | after |
+|---|---|---|
+| FFT, 15082 × 4096 points (one thread) | 1.10 s | 0.61 s |
+| x-f spectra | 1.59 s | 0.17 s |
+| f-k stack, 117 panels × 256 traces | 3.27 s | 0.60 s |
+| f-k gathers, 252 × 38 × 376 | 0.16 s | 0.08 s |
+
+Writing and loading the temporary x-f SEG-Y were already fast (0.2 s and
+0.04 s).
+
+- **FFT** (`fft.cpp`): a per-length, per-thread plan. Bit-reversal and
+  twiddle tables are computed once in double precision and stored
+  contiguously per stage. Butterflies use plain float arithmetic on the
+  interleaved data. The old code re-derived twiddles by repeated
+  multiplication, which was slower and lost precision on long transforms.
+- **Parallel:** `computeXfAmplitudes` runs over traces; `computeFk` runs
+  time FFTs over traces and space FFTs over frequency rows, each row
+  owned by one worker, so there are no locks. Both use one shared
+  analysis thread pool: a pool per call cost more than the work for small
+  gathers. Trace fetches decode from the mmap and are thread-safe.
+
+### Sort idents on top, Trace Header Ranges
+
+- **Default idents:** for a new Foreground, the top ident rows show the
+  data's sorting keys: those of FFID, CDP and Offset that change over the
+  first 5000 traces, slowest-changing first. Examples: F3 prestack
+  CDP, Offset; a stack CDP. Seq (Line) is used when none change. Offset
+  is now an ident field.
+- **File > Trace Header Ranges…:** scans every trace header in the
+  background and shows a table. Per field: bytes, min, max, number of
+  changes from trace to trace, and the most common step. Constant fields
+  are dimmed.
+
+### Menus
+
+- **Processing** (between Analysis and Help): Calculator…, and **Filter**
+  with Bandpass…. Both moved out of Edit.
+- **x-f and f-k under Analysis:** the x-f display toggle and f-k
+  display… are in Analysis. The x-f toolbar button sits with the
+  analysis buttons, and Preferences lists it under Analysis.
+- **Color bar menu:** a right-click anywhere in the color bar's column
+  opens the color scale menu. The axis-range menu added for the seismic
+  axes had swallowed it, because the legend overlay passes mouse presses
+  through to the canvas.
 
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
@@ -2776,6 +2943,7 @@ bin and puts a marker, with a surface-colored ring, on every visible
 curve. A `CurveReadoutPanel` beside the chart, styled like the Trace Info
 dock, shows the frequency, the dB level under the cursor, and each visible
 curve's value at that frequency. View > Crosshair switches both off.
+See "Zoom and axis ranges" for box zoom and the axis menu.
 
 ### Dark title bars (Windows)
 

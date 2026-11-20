@@ -57,8 +57,12 @@ TraceHeader parseTraceHeader(const uint8_t* t) {
     h.fieldRecord        = readI32BE(t + 8);  // bytes 9-12
     h.traceNumber        = readI32BE(t + 12); // bytes 13-16
     h.cdp                = readI32BE(t + 20); // bytes 21-24
+    h.offset             = readI32BE(t + 36); // bytes 37-40
     h.x                  = readI32BE(t + 72); // bytes 73-76
     h.y                  = readI32BE(t + 76); // bytes 77-80
+    h.coordinateScalar   = readI16BE(t + 70); // bytes 71-72
+    h.cdpX               = readI32BE(t + 180); // bytes 181-184
+    h.cdpY               = readI32BE(t + 184); // bytes 185-188
     return h;
 }
 

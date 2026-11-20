@@ -9,6 +9,9 @@
 #include "fft.h"
 #include "segy_decode.h"
 #include "segy_format.h"
+#include "threadpool.h"
+
+#include <atomic>
 
 namespace segy {
 
@@ -224,6 +227,178 @@ void xfAmplitudeSpectrum(const float* samples, int count, const std::vector<floa
         double frac = std::clamp(x - double(i0), 0.0, 1.0);
         out[k] = float(std::abs(buf[i0]) * (1.0 - frac) + std::abs(buf[i1]) * frac);
     }
+}
+
+namespace {
+// One pool for the spectral analyses, created on first use: a pool per call
+// cost more than the work for small panels (one f-k per gather). The pool's
+// parallelFor is safe to call from several threads at once.
+ThreadPool& analysisPool() {
+    static ThreadPool pool;
+    return pool;
+}
+} // namespace
+
+std::vector<std::vector<float>> computeXfAmplitudes(const std::function<void(int64_t, float*)>& fetch,
+                                                    int samplesPerTrace, int64_t traceStart, int64_t traceEnd,
+                                                    int gateStart, int gateEnd, const XfGrid& grid,
+                                                    const std::function<void(int64_t)>& progress) {
+    const int64_t count = std::max<int64_t>(0, traceEnd - traceStart);
+    std::vector<std::vector<float>> spectra(static_cast<size_t>(count));
+    gateStart = std::clamp(gateStart, 0, std::max(0, samplesPerTrace));
+    gateEnd = std::clamp(gateEnd, gateStart, std::max(0, samplesPerTrace));
+    const int gate = gateEnd - gateStart;
+    if (count == 0 || gate < 2 || grid.bins <= 0 || !fetch) return spectra;
+    const std::vector<float> window = cosineSquaredWindow(gate, 80.0);
+    std::atomic<int64_t> done{0};
+    ThreadPool& pool = analysisPool();
+    pool.parallelFor(size_t(count), 16, [&](size_t begin, size_t end) {
+        std::vector<float> trace(static_cast<size_t>(samplesPerTrace));
+        for (size_t i = begin; i < end; ++i) {
+            fetch(traceStart + int64_t(i), trace.data());
+            spectra[i].resize(size_t(grid.bins));
+            xfAmplitudeSpectrum(trace.data() + gateStart, gate, window, grid, spectra[i].data());
+            const int64_t finished = done.fetch_add(1) + 1;
+            if (progress && finished % 64 == 0) progress(finished);
+        }
+    });
+    if (progress) progress(count);
+    return spectra;
+}
+
+std::vector<FkPanel> splitIntoGathers(const std::vector<int32_t>& keys, int64_t firstTrace, int minTraces) {
+    std::vector<FkPanel> panels;
+    size_t runStart = 0;
+    for (size_t i = 1; i <= keys.size(); ++i) {
+        if (i == keys.size() || keys[i] != keys[runStart]) {
+            if (int64_t(i - runStart) >= minTraces) {
+                panels.push_back({firstTrace + int64_t(runStart), firstTrace + int64_t(i)});
+            }
+            runStart = i;
+        }
+    }
+    return panels;
+}
+
+std::vector<FkPanel> slidingPanels(int64_t start, int64_t end, int width) {
+    std::vector<FkPanel> panels;
+    if (end <= start || width < 2) return panels;
+    if (end - start <= width) return {{start, end}};
+    const int64_t step = std::max<int64_t>(1, width / 2);
+    int64_t s = start;
+    for (; s + width <= end; s += step) panels.push_back({s, s + width});
+    if (panels.back().end < end) panels.push_back({end - width, end}); // cover the tail
+    return panels;
+}
+
+FkResult computeFk(const SigcorTraceFetch& fetch, int samplesPerTrace, const std::vector<FkPanel>& panels,
+                   int gateStart, int gateEnd, double sampleIntervalUs, const std::function<void(int, int)>& progress) {
+    FkResult res;
+    gateStart = std::clamp(gateStart, 0, std::max(0, samplesPerTrace));
+    gateEnd = std::clamp(gateEnd, gateStart, std::max(0, samplesPerTrace));
+    const int nt = gateEnd - gateStart;
+    if (nt < 8 || sampleIntervalUs <= 0.0 || !fetch || panels.empty()) return res;
+    int64_t widest = 0;
+    for (const FkPanel& panel : panels) widest = std::max(widest, panel.traceCount());
+    if (widest < 2) return res;
+
+    const size_t fftT = std::max<size_t>(64, nextPowerOfTwo(size_t(nt)));
+    const size_t fftX = std::max<size_t>(32, nextPowerOfTwo(size_t(widest)));
+    const size_t nf = fftT / 2 + 1;
+    std::vector<double> power(nf * fftX, 0.0);
+    const std::vector<float> timeWindow = cosineSquaredWindow(nt, 80.0);
+    ThreadPool& pool = analysisPool();
+
+    for (size_t p = 0; p < panels.size(); ++p) {
+        if (progress) progress(int(p) + 1, int(panels.size()));
+        const FkPanel& panel = panels[p];
+        const int nx = int(panel.traceCount());
+        if (nx < 2) continue;
+        const std::vector<float> spaceWindow = cosineSquaredWindow(nx, 80.0);
+        // Time FFT per trace, positive frequencies kept: spectra[x][f].
+        std::vector<std::complex<float>> spectra(size_t(nx) * nf);
+        pool.parallelFor(size_t(nx), 4, [&](size_t begin, size_t end) {
+            std::vector<float> trace(static_cast<size_t>(samplesPerTrace));
+            std::vector<std::complex<float>> column(fftT);
+            for (size_t x = begin; x < end; ++x) {
+                fetch(panel.traceAt(int64_t(x)), trace.data());
+                double mean = 0.0;
+                for (int i = 0; i < nt; ++i) mean += trace[size_t(gateStart + i)];
+                mean /= nt;
+                std::fill(column.begin(), column.end(), std::complex<float>(0.0f, 0.0f));
+                const float w = spaceWindow[x];
+                for (int i = 0; i < nt; ++i) {
+                    column[size_t(i)] = float((trace[size_t(gateStart + i)] - mean) * timeWindow[size_t(i)] * w);
+                }
+                fft(column);
+                std::copy_n(column.begin(), nf, spectra.begin() + std::ptrdiff_t(x * nf));
+            }
+        });
+        // Space FFT per frequency. A forward FFT puts t = p x at k_fwd = -f p;
+        // the column index flips that so positive dips land at positive k.
+        // Each frequency row of `power` belongs to one worker: no races.
+        pool.parallelFor(nf, 16, [&](size_t begin, size_t end) {
+            std::vector<std::complex<float>> row(fftX);
+            for (size_t f = begin; f < end; ++f) {
+                std::fill(row.begin(), row.end(), std::complex<float>(0.0f, 0.0f));
+                for (int x = 0; x < nx; ++x) row[size_t(x)] = spectra[size_t(x) * nf + f];
+                fft(row);
+                for (size_t m = 0; m < fftX; ++m) {
+                    const int64_t kFwd = m < fftX / 2 ? int64_t(m) : int64_t(m) - int64_t(fftX);
+                    const size_t col = size_t((-kFwd + int64_t(fftX / 2)) % int64_t(fftX));
+                    power[f * fftX + col] += std::norm(std::complex<double>(row[m]));
+                }
+            }
+        });
+        ++res.panelsUsed;
+    }
+    if (res.panelsUsed == 0) return res;
+
+    const double peak = *std::max_element(power.begin(), power.end());
+    res.frequencies = int(nf);
+    res.wavenumbers = int(fftX);
+    res.frequencyStepHz = 1e6 / (double(fftT) * sampleIntervalUs);
+    res.db.resize(power.size());
+    for (size_t i = 0; i < power.size(); ++i) {
+        res.db[i] = peak > 0.0 && power[i] > 0.0 ? std::max(-120.0f, float(10.0 * std::log10(power[i] / peak))) : -120.0f;
+    }
+    return res;
+}
+
+void traceDerivative(std::vector<float>& trace, double sampleIntervalUs, double slopeDbPerOctave) {
+    const size_t n = trace.size();
+    if (n < 2 || sampleIntervalUs <= 0.0 || slopeDbPerOctave == 0.0) return;
+    const double a = slopeDbPerOctave / (20.0 * std::log10(2.0)); // 6.0206 dB/octave = power 1
+    const size_t len = nextPowerOfTwo(2 * n);
+    double mean = 0.0;
+    for (float v : trace) mean += v;
+    mean /= double(n);
+    std::vector<std::complex<float>> buf(len, std::complex<float>(0.0f, 0.0f));
+    for (size_t i = 0; i < n; ++i) buf[i] = std::complex<float>(float(trace[i] - mean), 0.0f);
+    fft(buf);
+    const double df = 1e6 / (double(len) * sampleIntervalUs); // Hz per bin
+    const double pi = std::acos(-1.0);
+    const std::complex<double> phase = std::polar(1.0, a * 0.5 * pi); // i^a
+    for (size_t m = 0; m < len; ++m) {
+        if (m == 0) {
+            buf[m] = 0.0f;
+            continue;
+        }
+        const bool negative = m > len / 2;
+        const double f = (negative ? double(len - m) : double(m)) * df;
+        const double gain = std::pow(2.0 * pi * f, a);
+        // (i w)^a for w > 0; its complex conjugate for the negative
+        // frequencies keeps the output real. Nyquist (m = len/2): real part.
+        std::complex<double> h = gain * (negative ? std::conj(phase) : phase);
+        if (m == len / 2) h = std::complex<double>(h.real(), 0.0);
+        buf[m] = std::complex<float>(std::complex<double>(buf[m]) * h);
+    }
+    ifft(buf);
+    double outMean = 0.0;
+    for (size_t i = 0; i < n; ++i) outMean += buf[i].real();
+    outMean /= double(n);
+    // An integral is defined up to a constant: keep it centred on zero.
+    for (size_t i = 0; i < n; ++i) trace[i] = float(buf[i].real() - (a < 0.0 ? outMean : 0.0));
 }
 
 std::vector<float> fractionalShift(const std::vector<float>& x, double shift) {

@@ -1583,6 +1583,91 @@ void testXfSpectrum() {
     CHECK(amp[0] < 0.01f * amp[peak]); // the +5 offset is removed
 }
 
+void testFk() {
+    section("F-K: gather splitting, sliding panels, a dipping event lands at k = f * p");
+    std::vector<int32_t> keys = {7, 7, 7, 9, 9, 4, 4, 4, 4};
+    std::vector<segy::FkPanel> g = segy::splitIntoGathers(keys, 100, 3);
+    CHECK(g.size() == 2); // the 2-trace run is dropped
+    CHECK(g[0].start == 100 && g[0].end == 103);
+    CHECK(g[1].start == 105 && g[1].end == 109);
+    std::vector<segy::FkPanel> s = segy::slidingPanels(0, 1000, 256);
+    CHECK(s.front().start == 0 && s.front().end == 256);
+    CHECK(s[1].start == 128);
+    CHECK(s.back().end == 1000);
+    CHECK(segy::slidingPanels(10, 50, 256).size() == 1);
+
+    // 64 traces, 4 ms, a 30 Hz Ricker event that is 0.5 samples (2 ms)
+    // later on every next trace: at 30 Hz it sits at k = 30 * 0.002 = 0.06
+    // cycles/trace -- positive, by the sign convention.
+    const double dt = 0.004;
+    SigcorSynthetic syn = makeSigcorSynthetic(64, 500, dt, 30.0, 0.5, 1.0, 0.0, 21);
+    auto fetch = [&syn](int64_t idx, float* out) {
+        std::copy(syn.data[size_t(idx)].begin(), syn.data[size_t(idx)].end(), out);
+    };
+    segy::FkResult fk = segy::computeFk(fetch, 500, {{0, 64}}, 50, 450, dt * 1e6);
+    CHECK(fk.panelsUsed == 1);
+    CHECK(fk.wavenumbers == 64);
+    CHECK(fk.frequencies == 257); // 512-point time FFT
+    const int row = int(std::lround(30.0 / fk.frequencyStepHz));
+    int best = 0;
+    for (int col = 0; col < fk.wavenumbers; ++col) {
+        if (fk.db[size_t(row * fk.wavenumbers + col)] > fk.db[size_t(row * fk.wavenumbers + best)]) best = col;
+    }
+    const double k = double(best - fk.wavenumbers / 2) / fk.wavenumbers;
+    CHECK_NEAR(k, 0.06, 1.0 / 64.0);
+
+    // Averaging over two gathers keeps the same grid and peak.
+    segy::FkResult two = segy::computeFk(fetch, 500, {{0, 32}, {32, 64}}, 50, 450, dt * 1e6);
+    CHECK(two.panelsUsed == 2);
+    CHECK(two.wavenumbers == 32);
+    CHECK(segy::computeFk(fetch, 500, {}, 50, 450, dt * 1e6).panelsUsed == 0);
+
+    // An explicit trace order: the same gather reversed puts the event at -k.
+    segy::FkPanel reversed{0, 64, {}};
+    for (int64_t i = 63; i >= 0; --i) reversed.traces.push_back(i);
+    segy::FkResult flipped = segy::computeFk(fetch, 500, {reversed}, 50, 450, dt * 1e6);
+    int bestFlipped = 0;
+    for (int col = 0; col < flipped.wavenumbers; ++col) {
+        if (flipped.db[size_t(row * flipped.wavenumbers + col)] > flipped.db[size_t(row * flipped.wavenumbers + bestFlipped)]) {
+            bestFlipped = col;
+        }
+    }
+    CHECK_NEAR(double(bestFlipped - flipped.wavenumbers / 2) / flipped.wavenumbers, -0.06, 1.0 / 64.0);
+}
+
+void testTraceDerivative() {
+    section("Filter: trace differentiation/integration, full and fractional");
+    // 20 Hz sine, 2 ms, 1000 samples; check the middle (no edge effects).
+    const double pi = 3.14159265358979323846, f = 20.0, dt = 0.002, w = 2.0 * pi * f;
+    auto sine = [&](double phase) {
+        std::vector<float> x(1000);
+        for (int i = 0; i < 1000; ++i) x[size_t(i)] = float(std::sin(w * i * dt + phase));
+        return x;
+    };
+    auto maxErr = [&](const std::vector<float>& got, double scale, double phase) {
+        double err = 0.0;
+        for (int i = 300; i < 700; ++i) err = std::max(err, std::fabs(got[size_t(i)] / scale - std::sin(w * i * dt + phase)));
+        return err;
+    };
+    // d/dt sin(wt) = w cos(wt) = w sin(wt + 90 deg).
+    std::vector<float> x = sine(0.0);
+    segy::traceDerivative(x, dt * 1e6, 6.0206);
+    CHECK(maxErr(x, w, pi / 2) < 0.02);
+    // Integral of sin(wt) = -cos(wt) / w = sin(wt - 90 deg) / w.
+    x = sine(0.0);
+    segy::traceDerivative(x, dt * 1e6, -6.0206);
+    CHECK(maxErr(x, 1.0 / w, -pi / 2) < 0.02);
+    // Half derivative: amplitude sqrt(w), phase +45 degrees.
+    x = sine(0.0);
+    segy::traceDerivative(x, dt * 1e6, 3.0103);
+    CHECK(maxErr(x, std::sqrt(w), pi / 4) < 0.02);
+    // 0 dB/octave: untouched.
+    x = sine(0.0);
+    std::vector<float> same = x;
+    segy::traceDerivative(x, dt * 1e6, 0.0);
+    CHECK(x == same);
+}
+
 void testNormalizedAutocorrelation() {
     section("Analysis: normalized autocorrelation -- hand-computed values, spike, dead trace, lag clamp, periodicity");
     // x = 1,2,3,4: r0 = 30, r1 = 1*2+2*3+3*4 = 20, r2 = 1*3+2*4 = 11, r3 = 1*4 = 4.
@@ -1713,6 +1798,8 @@ int main() {
     testSigcorHelpers();
     testSigcorEstimates();
     testXfSpectrum();
+    testFk();
+    testTraceDerivative();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

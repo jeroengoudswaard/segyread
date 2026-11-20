@@ -64,6 +64,9 @@ class QTimer;
 class QToolButton;
 class QGroupBox;
 class QScrollArea;
+class QHBoxLayout;
+class QVBoxLayout;
+class QToolBar;
 
 namespace segyqt {
 
@@ -154,8 +157,8 @@ struct WigglePresentationSettings {
 // like DisplaySettings, and deliberately NOT persisted (confirmed with
 // the user: idents reset to all-off every session, unlike Preferences
 // below).
-enum class IdentField { TraceSequenceLine, TraceSequenceFile, FieldRecord, TraceNumber, Cdp, X, Y };
-constexpr int kIdentFieldCount = 7;
+enum class IdentField { TraceSequenceLine, TraceSequenceFile, FieldRecord, TraceNumber, Cdp, Offset, X, Y };
+constexpr int kIdentFieldCount = 8;
 struct IdentSettings {
     // Index = IdentField, in its declaration order -- fixed, so toggling
     // one field on/off never reshuffles the other enabled rows' paint
@@ -238,7 +241,7 @@ struct Dataset {
 
 // Same fields as the removed shells' AppState -- one shared struct instead
 // of two divergent copies. Owned by MainWindow, referenced by SegyCanvas.
-// The x-F display toggle (see native/README.md, "x-F display"): while
+// The x-f display toggle (see native/README.md, "x-f display"): while
 // active, the panel shows a computed dataset of per-trace amplitude spectra
 // (dB) and everything the seismic view had is parked here, to be restored
 // verbatim when the toggle goes off.
@@ -250,9 +253,9 @@ struct XfState {
     std::vector<SelectionBox> selectionBoxes;
     int activeBoxIndex = -1;
     std::vector<segy::ViewRange> zoomHistory;
-    int64_t traceOffset = 0; // x-F trace 0 = this seismic trace
-    // The x-F color scale, remembered across toggles within a session
-    // (default green -40 dB .. red 0 dB; the user may change it in x-F).
+    int64_t traceOffset = 0; // x-f trace 0 = this seismic trace
+    // The x-f color scale, remembered across toggles within a session
+    // (default green -40 dB .. red 0 dB; the user may change it in x-f).
     segy::ColorScale colorScale = segy::ColorScale::RedYellowGreen;
     bool colorScaleFlipped = true;
 };
@@ -339,9 +342,9 @@ struct HoverInfo {
     bool valid = false;
     int64_t traceIdx = 0;
     int32_t seqNum = 0;
-    double timeMs = 0.0; // Hz on an x-F display (frequencyAxis)
+    double timeMs = 0.0; // Hz on an x-f display (frequencyAxis)
     float amplitude = 0.0f;
-    bool frequencyAxis = false; // x-F: timeMs is Hz, amplitude is dB
+    bool frequencyAxis = false; // x-f: timeMs is Hz, amplitude is dB
 };
 
 // A tall, narrow amplitude-to-color legend (gradient plus +clip/0/-clip
@@ -366,7 +369,7 @@ public:
     void setClipRange(float posClip, float negClip);
     void setColorScale(segy::ColorScale scale, bool flipped);
     // Value at the middle of the scale (ManualClip::center) and a unit
-    // suffix for the labels -- x-F shows "0 dB" / "-20 dB" / "-40 dB".
+    // suffix for the labels -- x-f shows "0 dB" / "-20 dB" / "-40 dB".
     void setCenter(float center, const QString& unit);
 
 protected:
@@ -568,12 +571,73 @@ struct DbCurve {
     bool dashed = false;
 };
 
+// Zoom and axis-range machinery shared by the dB charts and the F-K chart,
+// working like the seismic display: Box Select draws a box, Zoom zooms to
+// it, Unzoom steps back through the zoom history (to the automatic range
+// at the bottom); right-click on an axis gives Axis Ranges... / Reset
+// Axes. Subclasses supply chartRect() and the automatic range, and draw
+// with view_.
+class ZoomableChart : public QWidget {
+public:
+    explicit ZoomableChart(QWidget* parent = nullptr);
+    // Charts in one group zoom together: a box drawn on any of them, Zoom,
+    // Unzoom, Axis Ranges and Reset Axes apply to all (side-by-side f-k
+    // plots). `group` includes this chart; empty = on its own.
+    void linkGroup(const std::vector<ZoomableChart*>& group);
+    void setBoxMode(bool on);
+    bool canZoom() const;
+    bool canUnzoom() const { return manualRange_; }
+    void zoomToBox();
+    void unzoom();
+    void setAxisRanges(double x0, double x1, double y0, double y1); // pushes the current range first
+    void resetAxes();
+    // Fires whenever canZoom()/canUnzoom() may have changed, for the toolbar buttons.
+    void setZoomStateCallback(std::function<void()> callback);
+
+protected:
+    struct Range {
+        double x0 = 0.0, x1 = 1.0, y0 = 0.0, y1 = 1.0;
+    };
+    virtual QRect chartRect() const = 0;
+    virtual void viewChanged() { update(); }
+    void setAutoRange(const Range& range); // also the view, unless zoomed
+    QPointF dataAt(const QPointF& pos) const;
+    QPointF pixelAt(double x, double y) const;
+    // Mouse helpers for the box; each returns true when it used the event.
+    bool handleBoxPress(QMouseEvent* event);
+    bool handleBoxMove(QMouseEvent* event);
+    bool handleBoxRelease(QMouseEvent* event);
+    void paintBox(QPainter& painter) const;
+    void showAxisMenu(const QPoint& globalPos, const QString& xName, const QString& yName, int xDecimals,
+                      int yDecimals);
+
+    Range auto_;
+    Range view_;
+    bool manualRange_ = false;
+    std::vector<Range> history_; // empty with manualRange_ = back to auto
+    bool boxMode_ = false;
+    bool draggingBox_ = false;
+    bool hasBox_ = false;
+    QPointF boxA_, boxB_; // data coordinates
+
+private:
+    void notifyZoomState();
+    std::vector<ZoomableChart*> peers() const; // the group, or just this
+    void applyBoxMode(bool on);
+    void applyAxisRanges(const Range& range);
+    void applyUnzoom();
+    void applyResetAxes();
+    std::function<void()> onZoomState_;
+    std::vector<ZoomableChart*> group_;
+};
+
 // dB vs. frequency line chart shared by Spectrum and Signal/Noise: nice
 // 1-2-5 ticks and gridlines on both axes, one dB axis for every curve, and
 // an optional crosshair that snaps to the nearest frequency bin, marks each
 // visible curve there and reports it through the hover callback (index -1
 // when the cursor leaves) so a CurveReadoutPanel beside it can show values.
-class DbCurveChart : public QWidget {
+// Zoom and axis ranges: see ZoomableChart.
+class DbCurveChart : public ZoomableChart {
 public:
     explicit DbCurveChart(QWidget* parent = nullptr);
     void setCurves(std::vector<float> frequencyHz, std::vector<DbCurve> curves);
@@ -587,8 +651,12 @@ public:
     const std::vector<DbCurve>& curves() const { return curves_; }
 
 protected:
+    QRect chartRect() const override;
+    void viewChanged() override;
     void paintEvent(QPaintEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
     void leaveEvent(QEvent* event) override;
 
 private:
@@ -600,10 +668,8 @@ private:
     bool crosshairEnabled_ = true;
     int hoverIndex_ = -1;
     double hoverY_ = 0.0;
-    double minDb_ = -60.0, maxDb_ = 0.0;
     std::function<void(int, double)> onHover_;
 
-    QRect chartRect() const;
     void updateRange();
 };
 
@@ -769,6 +835,15 @@ private:
     QRadioButton* drawerLeftRadio_ = nullptr;
     QRadioButton* drawerRightRadio_ = nullptr;
     QSpinBox* uiScaleSpin_ = nullptr;
+    // Signal/Noise parameters that are not in the Signal/Noise window.
+    segy::SigcorParams initialSignalNoise_;
+    QComboBox* snMethodCombo_ = nullptr;
+    QSpinBox* snRandomSpin_ = nullptr;
+    QDoubleSpinBox* snMaxShiftSpin_ = nullptr;
+    QComboBox* snShiftPickCombo_ = nullptr;
+    QDoubleSpinBox* snFlatSpin_ = nullptr;
+    QCheckBox* snEqualizeCheck_ = nullptr;
+    QCheckBox* snRemoveDcCheck_ = nullptr;
     std::function<void(const Preferences&)> onApplied_;
 
     void updateDrawerControlState();
@@ -1009,6 +1084,7 @@ struct OctaveBandData {
     float rms = 0.0f;                       // RMS amplitude of this band (for its dB level vs. unfiltered)
     segy::ColorScale colorScale = segy::ColorScale::RedWhiteBlue;
     bool colorScaleFlipped = false;
+    bool reversePolarity = false; // the main display's, so the colors match it
 };
 
 struct OctaveBandResult {
@@ -1022,6 +1098,11 @@ struct OctaveBandResult {
     int sampleStart = 0;
     int sampleEnd = 0;
     double sampleIntervalUs = 0.0;
+    // The source panel's own display clip (auto clip, gain and manual clip,
+    // as segy::displayClipPosNeg gives the seismic renderer) -- the
+    // default "Same as main display" scaling.
+    float mainClipPos = 1.0f;
+    float mainClipNeg = 1.0f;
 };
 
 // Spawned from the toolbar: bandpass-filters the *visible* traces/samples of
@@ -1042,6 +1123,8 @@ public:
     // when the toolbar button opens straight onto the active panel.
     void setSourcePanel(int panelIndex);
     void setResult(const OctaveBandResult& result);
+    // Live update of the main display's clip (gain slider, Clip dialog).
+    void setMainClip(float clipPos, float clipNeg);
     void setApplyCallback(std::function<void(int sourcePanelIndex, int minFreqHz, int maxFreqHz)> callback);
 
 private:
@@ -1059,9 +1142,10 @@ private:
     // horizontal scrolling, capped to the screen -- called per new result.
     void fitWidthToBands();
     std::vector<std::function<void(double, double, bool)>> bandCrosshairUpdaters_;
-    std::vector<std::function<void(float)>> bandClipSetters_; // one per band, same order as bandOwnClips_
+    std::vector<std::function<void(float, float)>> bandClipSetters_; // one per band, same order as bandOwnClips_
     std::vector<float> bandOwnClips_;
-    float commonClip_ = 1.0f;
+    float mainClipPos_ = 1.0f;
+    float mainClipNeg_ = 1.0f;
     void applyScaling();
     std::function<void(int, int, int)> onApply_;
 
@@ -1104,43 +1188,177 @@ private:
 // Analysis > Signal/Noise: SIGCOR estimate (segy::computeSigcor) of the
 // active panel's selection box, or its visible data without one. Trace,
 // signal, noise (dB relative to the trace spectrum's peak) and S/N (dB)
-// can each be switched on/off; signal and noise are on by default. The 1
-// sigma of the pair time shifts is always shown above the chart.
+// can each be switched on/off; signal and noise are on by default. Only
+// Trace distance and Min correlation are in the window; the other
+// parameters are in Edit > Preferences > Signal/Noise. The time-shift
+// statistics are a button (Delta t = mean +/- 1 sigma) above Recompute that
+// opens a details table; Recompute turns orange when the data or the
+// parameters differ from what is on screen.
 struct SignalNoiseDisplay {
     std::vector<float> frequencyHz;
     std::vector<float> traceDb, signalDb, noiseDb, snDb;
-    double shiftSigmaMs = 0.0;
+    bool hasShift = false;
     double shiftMeanMs = 0.0;
-    QString info; // pairs used/rejected, gate, option
+    double shiftSigmaMs = 0.0;
+    // Details table rows: {label, value}; an empty value makes a section heading.
+    std::vector<std::pair<QString, QString>> details;
     QString emptyReason; // non-empty: nothing to plot, show this instead
+};
+
+// What a Signal/Noise result was computed from -- compared against the
+// active panel's current state to decide whether Recompute is useful.
+struct SignalNoiseSource {
+    bool valid = false;
+    const AppState* app = nullptr;
+    const void* dataset = nullptr;
+    int64_t t0 = 0, t1 = 0;
+    int s0 = 0, s1 = 0;
+    QString sourceText; // "selection box" / "visible data"
 };
 
 class SignalNoiseWindow : public QWidget {
 public:
     explicit SignalNoiseWindow(QWidget* parent = nullptr);
     void setResult(const SignalNoiseDisplay& display);
-    // The estimation parameters, edited in the window's own parameter rows
-    // beside Recompute (plain names; the SIGCOR card names are in the tooltips).
-    void setParams(const segy::SigcorParams& params);
-    segy::SigcorParams params() const;
+    // Trace distance and Min correlation live in the window; the rest of
+    // `params` is left alone (it comes from Preferences).
+    void setWindowParams(const segy::SigcorParams& params);
+    void applyWindowParams(segy::SigcorParams& params) const;
     void setRecomputeCallback(std::function<void()> callback);
+    void setParamsEditedCallback(std::function<void()> callback);
+    // Orange when recomputing would change something, plain otherwise.
+    void setRecomputeUseful(bool useful);
 
 private:
     DbCurveChart* chart_ = nullptr;
     CurveReadoutPanel* readout_ = nullptr;
     QCheckBox* curveChecks_[4] = {};
-    QLabel* sigmaLabel_ = nullptr;
-    QLabel* infoLabel_ = nullptr;
-    QComboBox* methodCombo_ = nullptr;
     QSpinBox* distanceSpin_ = nullptr;
-    QSpinBox* randomSpin_ = nullptr;
-    QDoubleSpinBox* maxShiftSpin_ = nullptr;
     QDoubleSpinBox* minCorrelationSpin_ = nullptr;
-    QComboBox* shiftPickCombo_ = nullptr;
-    QDoubleSpinBox* flatSpin_ = nullptr;
-    QCheckBox* equalizeCheck_ = nullptr;
-    QCheckBox* removeDcCheck_ = nullptr;
+    QPushButton* shiftButton_ = nullptr;
+    QLabel* shiftLabel_ = nullptr; // rich text inside shiftButton_
+    QPushButton* recomputeButton_ = nullptr;
+    QDialog* detailsDialog_ = nullptr;
+    QTableWidget* detailsTable_ = nullptr;
+    std::vector<std::pair<QString, QString>> details_;
     std::function<void()> onRecompute_;
+    std::function<void()> onParamsEdited_;
+
+    void matchButtonSizes();
+    void showDetails();
+};
+
+// Analysis > F-K: the 2D amplitude spectrum (dB) of the active panel's
+// selection box, or its visible data without one, power-averaged over its
+// gathers (prestack) or over sliding 256-trace panels (stacks). Frequency
+// 0..Nyquist upward, wavenumber -Nyquist..+Nyquist with 0 in the middle,
+// in cycles/km when the trace spacing is known (offsets, coordinates, or
+// typed in), otherwise cycles/trace. Colors as on the x-f display.
+struct FkDisplay {
+    int frequencies = 0;
+    int wavenumbers = 0;
+    double frequencyStepHz = 0.0;
+    double wavenumberMin = 0.0;  // display units (cycles/km or cycles/trace)
+    double wavenumberStep = 0.0;
+    bool spacingKnown = false;   // k in cycles/km
+    std::vector<float> db;       // frequencies x wavenumbers, row-major
+    QString panelText;           // above the chart, e.g. "Panel: CDP = 543"
+    QString rangeText;           // above the chart, e.g. "Range: offset = 0-3000"
+    QString info;
+    QString emptyReason;
+};
+
+class FkChart : public ZoomableChart {
+public:
+    explicit FkChart(QWidget* parent = nullptr);
+    void setData(const FkDisplay& display);
+    void setVelocityLinesVisible(bool visible);
+    void setCrosshairEnabled(bool enabled);
+    void setGridLinesVisible(bool visible);
+    // The dB legend is drawn by the last of several side-by-side plots only.
+    void setShowLegend(bool show);
+    // valid = false when the cursor leaves the plot.
+    void setHoverCallback(std::function<void(bool valid, double frequencyHz, double wavenumber, float db)> callback);
+    const FkDisplay& display() const { return data_; }
+
+protected:
+    QRect chartRect() const override;
+    void viewChanged() override;
+    void paintEvent(QPaintEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void leaveEvent(QEvent* event) override;
+
+private:
+    FkDisplay data_;
+    bool velocityLines_ = true;
+    bool crosshairEnabled_ = true;
+    bool gridLinesVisible_ = false;
+    bool showLegend_ = true;
+    bool hovering_ = false;
+    QPointF hoverPos_;
+    QImage raster_;
+    std::function<void(bool, double, double, float)> onHover_;
+
+    float valueAt(double frequencyHz, double wavenumber, bool* inside) const;
+    void rebuildRaster(const QRect& chart);
+};
+
+class FkWindow : public QWidget {
+public:
+    explicit FkWindow(QWidget* parent = nullptr);
+    // One plot per panel (gather), side by side and zoomed together, or a
+    // single averaged plot. `rangeText` describes the k axis of all of them.
+    void setResult(const std::vector<FkDisplay>& panels, const QString& rangeText, const QString& info,
+                   const QString& emptyReason);
+    // Panel ident: 0 = auto, 1 = field record, 2 = CDP, 3 = none (sliding panels).
+    int gatherMode() const;
+    // Distance ident for k: 0 = auto, 1 = offset, 2 = CDP number.
+    int distanceMode() const;
+    double offsetScalar() const;  // metres per offset unit (prestack: 1)
+    double cdpDistance() const;   // metres per CDP number
+    bool averageGathers() const;  // one averaged plot instead of one per gather
+    // The CDP distance the trace coordinates imply, offered as the CDP
+    // distance until the user types one (<= 0: none found).
+    void proposeCdpDistance(double metres);
+    bool cdpDistanceTyped() const { return cdpDistanceTyped_; }
+    void setRecomputeCallback(std::function<void()> callback);
+    void setParamsEditedCallback(std::function<void()> callback);
+    void setRecomputeUseful(bool useful);
+
+private:
+    std::vector<FkChart*> charts_;
+    QVBoxLayout* mainLayout_ = nullptr;
+    QToolBar* zoomBar_ = nullptr;
+    QScrollArea* scroll_ = nullptr;
+    QWidget* chartsHost_ = nullptr;
+    QHBoxLayout* chartsLayout_ = nullptr;
+    QLabel* emptyLabel_ = nullptr;
+    QComboBox* gatherCombo_ = nullptr;
+    QComboBox* distanceCombo_ = nullptr;
+    QLabel* scalarCaption_ = nullptr;
+    QDoubleSpinBox* scalarSpin_ = nullptr; // shows the offset scalar or the CDP distance
+    QCheckBox* averageCheck_ = nullptr;
+    QCheckBox* velocityCheck_ = nullptr;
+    QLabel* rangeLabel_ = nullptr;
+    QLabel* infoLabel_ = nullptr;
+    QPushButton* recomputeButton_ = nullptr;
+    QWidget* readout_ = nullptr;
+    QLabel* readPanel_ = nullptr;
+    QLabel* readFrequency_ = nullptr;
+    QLabel* readWavenumber_ = nullptr;
+    QLabel* readVelocity_ = nullptr;
+    QLabel* readLevel_ = nullptr;
+    double offsetScalar_ = 1.0;
+    double cdpDistance_ = 1.0;
+    bool cdpDistanceTyped_ = false;
+    bool showingCdp_ = false;
+    bool gridLinesVisible_ = false;
+    bool crosshairEnabled_ = true;
+    std::function<void()> onRecompute_;
+    std::function<void()> onParamsEdited_;
+    void syncScalarField();
 };
 
 // The density-plot canvas: owns drawing and mouse/keyboard input. Reuses
@@ -1170,14 +1388,23 @@ public:
     void setForegroundDataset(std::shared_ptr<Dataset> dataset);
     void setBackgroundDataset(std::shared_ptr<Dataset> dataset);
 
-    // x-F display toggle: park the seismic Foreground, view, display
+    // x-f display toggle: park the seismic Foreground, view, display
     // settings and selection boxes in AppState::xf and show `xfDataset`
-    // (trace 0 = seismic trace `traceOffset`) with the x-F display
+    // (trace 0 = seismic trace `traceOffset`) with the x-f display
     // settings; exitXfMode() restores everything as it was. Choosing a
-    // different Foreground while in x-F leaves x-F (display restored, the
+    // different Foreground while in x-f leaves x-f (display restored, the
     // parked dataset dropped).
     void enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOffset);
     void exitXfMode();
+
+    // Right-click on an axis (outside the plot): Axis Ranges... (trace and
+    // time/frequency min/max) and Reset View. Both go on the zoom history,
+    // so Mooz steps back.
+    void showAxisRangeMenu(const QPoint& globalPos);
+
+private:
+    std::function<void(const QPoint& globalPos)> colorScaleMenu_; // the color bar's right-click menu
+public:
 
     // MainWindow owns the status bar (and, via the callback, the Del
     // button's visibility); handed to the canvas as a plain pointer/
@@ -1433,10 +1660,24 @@ private:
     SaveSegyDialog* saveSegyDialog_ = nullptr;
     QAction* octaveBandAction_ = nullptr;
     OctaveBandDialog* octaveBandDialog_ = nullptr;
+    Panel* octaveSourcePanel_ = nullptr; // whose display clip the octave panels follow
     QAction* autocorrelationAction_ = nullptr;
     QAction* xfAction_ = nullptr;
+    QAction* signalNoiseAction_ = nullptr;
+    QAction* fkAction_ = nullptr;
+    FkWindow* fkWindow_ = nullptr;
+    bool fkComputed_ = false;
+    SignalNoiseSource fkLastSource_;
+    int fkLastGatherMode_ = 0;
+    int fkLastDistanceMode_ = 0;
+    bool fkLastAverage_ = false;
+    double fkLastOffsetScalar_ = 1.0;
+    double fkLastCdpDistance_ = 1.0;
     AutocorrelationDialog* autocorrelationDialog_ = nullptr;
     SignalNoiseWindow* signalNoiseWindow_ = nullptr;
+    bool signalNoiseComputed_ = false; // false until the first compute: Recompute is then always useful
+    SignalNoiseSource signalNoiseLastSource_;
+    segy::SigcorParams signalNoiseLastParams_;
 
     // Dataset pool: every dataset either panel has ever loaded/computed,
     // kept alive here independent of which panel's Foreground/Background
@@ -1467,6 +1708,8 @@ private:
     EbcdicHeaderWidget* ebcdicHeaderWidget_ = nullptr;
     QAction* binaryHeaderAction_ = nullptr;
     BinaryHeaderWidget* binaryHeaderWidget_ = nullptr;
+    QWidget* headerRangesWidget_ = nullptr; // File > Trace Header Ranges
+    void openTraceHeaderRanges();
 
     // Shows/hides the right dock entirely -- the dock itself can't be
     // closed any other way (NoDockWidgetFeatures), so this button is the
@@ -1483,7 +1726,7 @@ private:
     QLabel* traceValueLabel_ = nullptr;
     QLabel* seqValueLabel_ = nullptr;
     QLabel* timeValueLabel_ = nullptr;
-    QLabel* timeCaptionLabel_ = nullptr; // "Time", or "Frequency" while hovering an x-F display
+    QLabel* timeCaptionLabel_ = nullptr; // "Time", or "Frequency" while hovering an x-f display
     QLabel* amplitudeValueLabel_ = nullptr;
 
     // Edit > Preferences -- app-wide, persisted to $HOME/.segyread_settings
@@ -1642,7 +1885,15 @@ private:
     // shown in signalNoiseWindow_.
     void computeAndShowSignalNoise(Panel* sourcePanel);
     void ensureSignalNoiseWindow();
-    // x-F toggle for the active panel: on computes the amplitude spectra
+    SignalNoiseSource resolveSignalNoiseSource(Panel* panel) const;
+    segy::SigcorParams currentSignalNoiseParams() const; // Preferences + the window's two fields
+    void refreshSignalNoiseRecompute();
+    // Recompute buttons of Signal/Noise and F-K: orange when stale.
+    void refreshRecomputeButtons();
+    void ensureFkWindow();
+    void computeAndShowFk(Panel* sourcePanel);
+    void refreshFkRecompute();
+    // x-f toggle for the active panel: on computes the amplitude spectra
     // of the visible traces over the visible time range (background task)
     // and swaps them in; off restores the seismic.
     void toggleXf(Panel* panel, bool on);

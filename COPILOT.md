@@ -32,4 +32,10 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 15. **Spectrum crosshair** — Crosshair with a value readout panel on the spectrum plots. *Status: done — Spectrum and Signal/Noise.*
 
-16. **x-F display** — Toggle on the seismic display: amplitude spectrum (dB, 0 to Nyquist) of every trace in view, variable density, green -40 dB to red 0 dB by default; toggling back restores the seismic and the selection boxes. *Status: done — toolbar/View > x-F Display.*
+16. **x-f display** — Toggle on the seismic display: amplitude spectrum (dB, 0 to Nyquist) of every trace in view, variable density, green -40 dB to red 0 dB by default; toggling back restores the seismic and the selection boxes. *Status: done — toolbar/View > x-f Display.*
+
+17. **Lock View (open)** — The user wants a way to fix an axis range set via Axis Ranges so zoom/unzoom can no longer change it. Conflicts with the existing Lock button, which links the two panels. *Status: parked — decide whether this is a separate Lock View button or a new meaning for Lock.*
+
+18. **f-k display** — Separate window: one f-k plot per gather in view (or averaged), selectable panel and distance idents with scalar, velocity fan. *Status: done — Analysis > f-k display.*
+
+19. **Read Attribute SEG-Y (open)** — Separate input for velocity models and other attributes (interval, average, RMS velocity, delta, epsilon, eta), tagged at load, listed in the dataset list, not shown automatically, meant as background. *Status: to do.*

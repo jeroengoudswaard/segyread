@@ -89,8 +89,12 @@ struct TraceHeader {
     int32_t fieldRecord = 0;
     int32_t traceNumber = 0;
     int32_t cdp = 0;
+    int32_t offset = 0; // bytes 37-40: source-receiver distance (signed for split spreads)
     int32_t x = 0;
     int32_t y = 0;
+    int16_t coordinateScalar = 0; // bytes 71-72: < 0 divide by |s|, > 0 multiply, 0 = 1
+    int32_t cdpX = 0;             // bytes 181-184 (SEG-Y rev1)
+    int32_t cdpY = 0;             // bytes 185-188
 };
 
 // `traceHeaderBase` must point at the start of a 240-byte trace header.
