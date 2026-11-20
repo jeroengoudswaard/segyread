@@ -27,3 +27,9 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 12. **Spectral shaping** — Add spectral shaping as a processing step. Discuss the algorithm, controls, and performance needs before implementation.
 
 13. **Autocorrelation** — Show the autocorrelation of the data in a popup window. The user parameter is the filter length L; the display runs from -L to +L, with the peak at t=0 in the middle. *Status: done — Analysis > Autocorrelation (autocorrelogram per trace plus average curve).*
+
+14. **Signal/Noise** — Estimate signal and noise spectra of a section after SIPMAP SIGCOR (SPECTR and AUTCOR), with toggles for trace/signal/noise/S-N and the 1-sigma of the time shifts. *Status: done — Analysis > Signal/Noise; parameters in Preferences.*
+
+15. **Spectrum crosshair** — Crosshair with a value readout panel on the spectrum plots. *Status: done — Spectrum and Signal/Noise.*
+
+16. **x-F display** — Toggle on the seismic display: amplitude spectrum (dB, 0 to Nyquist) of every trace in view, variable density, green -40 dB to red 0 dB by default; toggling back restores the seismic and the selection boxes. *Status: done — toolbar/View > x-F Display.*

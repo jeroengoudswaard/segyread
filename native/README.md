@@ -1528,7 +1528,8 @@ lines" each used to draw independently:
   `QWidget`s, not `QMainWindow`, so this is a `QMenuBar` added as an
   ordinary child widget in a `QVBoxLayout` above the actual chart (which
   moved into its own inner widget, `HistogramChartArea`/
-  `SpectrumChartArea`, for exactly this reason: painting onto `this`
+  `SpectrumChartArea` -- the latter since replaced by the shared
+  `DbCurveChart`, see "Signal/Noise" -- for exactly this reason: painting onto `this`
   stopped being correct once something else needed the top of the
   window). File > Close; Edit is intentionally empty, matching this app's
   own convention for a menu bar slot with nothing to do yet; View > Grid
@@ -2630,6 +2631,151 @@ lag 0 in the middle.
 
 The time-tick formatter shared with the octave plots now prints "0", not
 "0.0000", for a zero tick.
+
+### Signal/Noise (Analysis > Signal/Noise, after SIPMAP SIGCOR)
+
+Estimates the signal and noise power spectra of a section the way Shell
+SIPMAP's SIGCOR does. The data is the active panel's selection box, or its
+visible data when there is no box. The box sets both the traces and the
+time gate.
+
+- **Pairs:** trace *i* is paired with trace *i + NSKIP + r*, where *r* is
+  uniform in 0..IRANSK (seeded, so a recompute gives the same answer).
+  Above `maxPairs` (2000) start traces are strided evenly.
+- **Time alignment:** gate A on trace *i* is crosscorrelated with trace
+  *j* over lags −SHMAX..+SHMAX. TCROSS=BASIC takes the plain sum;
+  NORMALIZED divides each lag by the RMS of the overlapping part of
+  trace *j*. A maximum at ±SHMAX rejects the pair (counted "at SHMAX").
+  SHMAX of 0 or 1 sample means no shift estimate (the data is taken as
+  already aligned), as in SIGCOR. Parabolic interpolation through the peak
+  gives a fractional shift, applied as a band-limited phase ramp. This
+  replaces SIGCOR's NIPOL interpolation and is exact for band-limited data.
+- **Gates at the trace ends:** SIGCOR extends the second gate by SHMAX on
+  both sides. When the gate already reaches the top or bottom of the
+  trace (the default whole-visible-trace case), gate A is trimmed by
+  SHMAX at that end *for the shift estimate only*. The spectra still use
+  the whole gate. Before this fix every pair of a full-trace gate was
+  rejected.
+- **Acceptance:** the correlation coefficient of the aligned gates must
+  reach CCMIN, otherwise the pair is counted "below CCMIN". The trace,
+  signal and noise means are all taken over the accepted pairs only, so
+  noise = trace − signal stays consistent.
+- **Per pair:** remove DC, equalize energy (Normalise: unit RMS per gate),
+  then apply a cosine-squared window (`cosineSquaredWindow`, the flat part
+  in %, sin² ramps). This gives:
+  - SPECTR: trace = (|A|² + |B|²)/2 and signal = Re(A·B\*), the cospectrum,
+    averaged in the frequency domain on the gate's next power of two.
+  - AUTCOR: the averaged trace autocorrelation (r_aa + r_bb)/2 and the
+    symmetrized crosscorrelation (c_ab(k) + c_ab(−k))/2 (the signal
+    autocorrelation), averaged in the time domain over lags 0..n−1 and
+    transformed once at the end, on twice the frequency density. Without
+    a lag window this gives the same spectra as SPECTR (tested to 1e-4).
+  - noise = trace − signal.
+- **Display:** a `SignalNoiseWindow` with toggles for Trace, Signal, Noise
+  (dB relative to the trace spectrum's peak) and S/N (10·log10 S/N, dB).
+  Signal and noise are on by default. All four share one dB axis. Bins
+  where a value is ≤ 0 (noise can dip below zero) leave a gap. The 1σ of
+  the accepted pairs' time shifts is always shown above the chart, next
+  to the pair counts, gate, method and mean shift. Recompute re-reads the
+  active panel with the parameters below.
+- **Colors:** the dark-surface steps of the dataviz reference palette,
+  validated for lightness, chroma, CVD separation and contrast:
+  signal blue `#3987e5`, noise orange `#d95926`, S/N aqua `#199e70`
+  (also dashed), and trace neutral `#c3c2b7`.
+- **Parameters:** in the window itself, beside Recompute, under plain
+  names. The SIGCOR card name is in each tooltip:
+
+  | In the window | SIGCOR |
+  |---|---|
+  | Method: Spectrum / Autocorrelation | OPTION SPECTR / AUTCOR |
+  | Trace distance | NSKIP |
+  | Random extra | IRANSK |
+  | Max shift | SHMAX |
+  | Min correlation | CCMIN |
+  | Shift pick: Plain / Normalized | TCROSS BASIC / NORMALIZED |
+  | Taper flat part | SGGATE cosine window |
+  | Equalize energy, Remove DC | IGNORM |
+
+  They are persisted under `signalNoise/*` in `~/.segyread_settings` on
+  every compute. The defaults are the user's own SIPMAP deck: Spectrum,
+  distance 3, random extra 2, plain shift pick, max shift 30 ms, min
+  correlation 0.3, 5% flat, and Equalize energy and Remove DC on. An
+  earlier version put these in Edit > Preferences, next to the toolbar
+  buttons. The user moved them, since they belong with the computation.
+  The window's menu bar has no Utilities > Parameters.
+- **Left out of SIGCOR:** horizon-following gates, RANDTB, MEM/AR
+  estimation, the TCROSS optimum filter, substacks, and card/trace output.
+- **Tests:** window shape, fractional shift of a sine, exact shifts and
+  σ ≈ 0 on noise-free dipping data, IRANSK spreading σ, a full-trace gate,
+  the noise level matching σ²·Σw² above the signal band, SPECTR = AUTCOR,
+  pure noise rejected by CCMIN, steep dip rejected at SHMAX, and too few
+  traces.
+- **Verified by screenshot** on the PARAGON 12.5 m inline: 2000/2000 pairs,
+  1σ 0.78 ms, S/N about 12–15 dB across 10–90 Hz.
+
+### x-F display (toolbar toggle, View > x-F Display)
+
+A toggle on the seismic display. When switched on, the active panel shows
+the amplitude spectrum of every trace in view. It uses the traces and time
+range currently on screen, not the selection box. The vertical axis runs
+from 0 to Nyquist.
+
+- **Computation** (background task, `makeXfGrid`/`xfAmplitudeSpectrum` in
+  `analysis.*`):
+  - each trace's visible gate is mean-removed, tapered (cosine-squared,
+    80% flat) and FFT'd (power of two, at least 64);
+  - |A(f)| is converted to dB relative to the largest amplitude in view
+    (0 dB = max). Silent bins floor at −120 dB.
+  - The result is all dB. There is no linear amplitude variant, by the
+    user's choice.
+- **A dataset, not a special renderer:** the spectra are written as a
+  temporary float32 SEG-Y (`segyread_scratch/<name>_xF.sgy`) with one
+  sample per frequency bin. It is loaded on its own thread pool, so the
+  seismic keeps rendering meanwhile. Zoom, pan, hover, color scales, clip,
+  idents and Flip Horizontal therefore all work unchanged.
+  - The trace headers are copied from the seismic, with the delay zeroed
+    and the sample count and interval set to the x-F values.
+  - The dataset is not added to the dataset pool.
+- **Hz on the axis:** the bin spacing is chosen as a whole number of
+  millihertz and stored as the sample interval in µs, so where the seismic
+  reads ms the x-F reads Hz exactly. The FFT spectrum is linearly
+  interpolated onto that grid. SEG-Y's int16 count and interval are
+  respected: long, finely sampled gates are coarsened to at most 32767
+  bins (tested).
+  - `DisplaySettings::frequencyAxis` changes only the axis title
+    ("Frequency (Hz)"). Trace Info shows "Frequency … Hz" and
+    "Amplitude … dB", and the original seismic trace number.
+- **Colors:** variable density by default, with the Red-Yellow-Green
+  scale flipped so −40 dB is green and 0 dB is red.
+  - This needed one renderer addition: `ManualClip::center`, the data
+    value at the middle of the color scale (0 for seismic). x-F uses
+    center −20 dB, ±20 dB, no gain or AGC.
+  - The amplitude legend shows the centred values (0 / −20 / −40) under a
+    "dB" heading. The heading sits on its own line, since the fixed legend
+    column only fits a number.
+  - The user may change the color scale while in x-F. That choice is
+    remembered for the next x-F of the session.
+- **Selection boxes:** they disappear. On entry the seismic Foreground,
+  view, display settings, selection boxes and zoom history are parked in
+  `AppState::xf`. Toggling off restores all of them verbatim, so the boxes
+  come back. Picking a different Foreground while in x-F leaves x-F: the
+  seismic display settings come back, but the parked dataset and boxes
+  do not.
+- **Toolbar:** customizable item `xf` in the Display group, with a
+  per-trace-spectrum glyph. The toggle follows the active panel.
+- **Verified by screenshot** on the PARAGON 12.5 m inline (15082 traces,
+  0–10 s): x-F on, then off, gives back the original seismic display and
+  color scale.
+
+### Crosshair readout on spectrum plots (`DbCurveChart`)
+
+Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`
+(`viewer_qt.h`). Hovering shows a crosshair in the Octave Band Display's
+style (black underlay, white dashes). It snaps to the nearest frequency
+bin and puts a marker, with a surface-colored ring, on every visible
+curve. A `CurveReadoutPanel` beside the chart, styled like the Trace Info
+dock, shows the frequency, the dB level under the cursor, and each visible
+curve's value at that frequency. View > Crosshair switches both off.
 
 ### Dark title bars (Windows)
 

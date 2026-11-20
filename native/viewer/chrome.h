@@ -64,6 +64,10 @@ struct DisplaySettings {
     // applied by both render paths to each decoded trace; see amplitude.h.
     // Set from View > Amplitude Processing / the toolbar's AGC toggle.
     AmplitudeProcessing processing;
+    // x-F display: the vertical axis is frequency. Samples are frequency
+    // bins and the sample interval in us is chosen so that "ms" reads as
+    // Hz, so this only changes the axis title/unit to "Frequency (Hz)".
+    bool frequencyAxis = false;
 };
 
 struct TimeTick {

@@ -34,8 +34,8 @@ ChromeLayout renderFrameWithChrome(const RenderContext& ctx, const ViewRange& vi
 
     double sampleIntervalMs = ctx.binHeader.sampleIntervalUs / 1000.0;
     double totalRecordMs = double(ctx.binHeader.samplesPerTrace) * sampleIntervalMs;
-    TimeUnit unit = chooseTimeUnit(totalRecordMs);
-    result.axisTitle = std::string("Time (") + unit.suffix + ")";
+    TimeUnit unit = settings.frequencyAxis ? TimeUnit{"Hz", 1.0} : chooseTimeUnit(totalRecordMs);
+    result.axisTitle = std::string(settings.frequencyAxis ? "Frequency (" : "Time (") + unit.suffix + ")";
 
     // Color bar encodes amplitude-as-color, which wiggle mode doesn't use --
     // showing it next to a black-and-white wiggle plot would be confusing

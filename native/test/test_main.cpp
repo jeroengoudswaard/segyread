@@ -1395,6 +1395,194 @@ void testButterworthCornerGain() {
     CHECK(gainAt(200.0) < 1e-3);
 }
 
+// Synthetic section for the SIGCOR tests: Ricker reflections (peak `fPeak`
+// Hz) at random times, dipping `dipSamples` per trace, plus independent
+// white noise of standard deviation `noiseSigma` on every trace.
+struct SigcorSynthetic {
+    int traces = 0;
+    int samples = 0;
+    std::vector<std::vector<float>> data;
+};
+
+SigcorSynthetic makeSigcorSynthetic(int traces, int samples, double dtSeconds, double fPeak, double dipSamples,
+                                    double signalScale, double noiseSigma, uint32_t seed) {
+    SigcorSynthetic syn;
+    syn.traces = traces;
+    syn.samples = samples;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    std::normal_distribution<double> gauss(0.0, 1.0);
+    struct Spike { double timeSamples, amplitude; };
+    std::vector<Spike> spikes;
+    for (int k = 0; k < samples / 3; ++k) spikes.push_back({uniform(rng) * (samples + 200) - 100, gauss(rng)});
+    const double pi = 3.14159265358979323846;
+    syn.data.assign(size_t(traces), std::vector<float>(size_t(samples), 0.0f));
+    for (int tr = 0; tr < traces; ++tr) {
+        for (const Spike& s : spikes) {
+            double centre = s.timeSamples + dipSamples * tr;
+            int lo = std::max(0, int(centre) - 40), hi = std::min(samples - 1, int(centre) + 40);
+            for (int i = lo; i <= hi; ++i) {
+                double t = (i - centre) * dtSeconds;
+                double arg = pi * fPeak * t;
+                syn.data[size_t(tr)][size_t(i)] += float(signalScale * s.amplitude * (1.0 - 2.0 * arg * arg) * std::exp(-arg * arg));
+            }
+        }
+        for (int i = 0; i < samples; ++i) syn.data[size_t(tr)][size_t(i)] += float(noiseSigma * gauss(rng));
+    }
+    return syn;
+}
+
+void testSigcorHelpers() {
+    section("Signal/Noise: cosine-squared window and fractional shift");
+    std::vector<float> w = segy::cosineSquaredWindow(100, 5.0);
+    CHECK(w.size() == 100);
+    CHECK_NEAR(w[49], 1.0, 1e-6);
+    CHECK_NEAR(w[50], 1.0, 1e-6);
+    CHECK(w[0] < 0.01f);
+    CHECK(w[0] > 0.0f);
+    bool symmetric = true;
+    for (int i = 0; i < 100; ++i) symmetric = symmetric && std::fabs(w[size_t(i)] - w[size_t(99 - i)]) < 1e-6f;
+    CHECK(symmetric);
+    std::vector<float> flat = segy::cosineSquaredWindow(10, 100.0);
+    CHECK(std::all_of(flat.begin(), flat.end(), [](float v) { return v == 1.0f; }));
+
+    // A slow sine shifted by 0.3 samples: out[i] = sin(2 pi f (i + 0.3)) away from the ends.
+    const double pi = 3.14159265358979323846;
+    std::vector<float> x(200);
+    for (int i = 0; i < 200; ++i) x[size_t(i)] = float(std::sin(2.0 * pi * 0.03 * i));
+    std::vector<float> y = segy::fractionalShift(x, 0.3);
+    double maxErr = 0.0;
+    for (int i = 40; i < 160; ++i) maxErr = std::max(maxErr, std::fabs(y[size_t(i)] - std::sin(2.0 * pi * 0.03 * (i + 0.3))));
+    CHECK(maxErr < 0.02);
+}
+
+void testSigcorEstimates() {
+    section("Signal/Noise: SIGCOR shifts, signal/noise split, SPECTR == AUTCOR");
+    const double dt = 0.002; // 2 ms, Nyquist 250 Hz
+    const int traces = 120, samples = 600;
+    auto fetchFrom = [](const SigcorSynthetic& syn) {
+        return [&syn](int64_t idx, float* out) {
+            std::copy(syn.data[size_t(idx)].begin(), syn.data[size_t(idx)].end(), out);
+        };
+    };
+
+    // 1. Noise-free, dip 0.4 samples/trace, fixed distance 3: every shift is
+    //    1.2 samples = 2.4 ms, sigma ~0, and signal ~= trace.
+    SigcorSynthetic clean = makeSigcorSynthetic(traces, samples, dt, 30.0, 0.4, 1.0, 0.0, 11);
+    segy::SigcorParams p;
+    p.nskip = 3;
+    p.iransk = 0;
+    p.shmaxMs = 30.0;
+    p.ccmin = 0.3;
+    segy::SigcorResult r = segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 450, dt * 1e6, p);
+    CHECK(r.pairsTotal == traces - 3);
+    CHECK(r.pairsUsed == r.pairsTotal);
+    CHECK_NEAR(r.shiftMeanMs, 2.4, 0.05);
+    CHECK(r.shiftSigmaMs < 0.05);
+    size_t peak = 0;
+    for (size_t m = 0; m < r.tracePower.size(); ++m) if (r.tracePower[m] > r.tracePower[peak]) peak = m;
+    CHECK(r.frequencyHz[peak] > 15.0f && r.frequencyHz[peak] < 45.0f);
+    CHECK_NEAR(r.signalPower[peak] / r.tracePower[peak], 1.0, 0.02);
+
+    // Gate = the whole trace (the default "visible data" case): no room
+    // beyond it for the second gate, so the shift estimate trims gate A by
+    // SHMAX at both ends instead of rejecting every pair.
+    r = segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 0, samples, dt * 1e6, p);
+    CHECK(r.pairsAtShiftLimit == 0);
+    CHECK(r.pairsUsed == r.pairsTotal);
+    CHECK_NEAR(r.shiftMeanMs, 2.4, 0.05);
+
+    // IRANSK = 2 spreads the pair distance over 3..5 traces: shifts 2.4..4.0 ms, sigma > 0.
+    p.iransk = 2;
+    r = segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 450, dt * 1e6, p);
+    CHECK_NEAR(r.shiftMeanMs, 3.2, 0.3);
+    CHECK(r.shiftSigmaMs > 0.4 && r.shiftSigmaMs < 0.9); // uniform over {2.4, 3.2, 4.0}: 0.65
+
+    // 2. Signal + white noise, no energy normalisation: above the Ricker's
+    //    band the signal estimate is ~0 and the noise estimate matches the
+    //    known white-noise power sigma^2 * sum(w^2).
+    const double sigma = 0.3;
+    SigcorSynthetic noisy = makeSigcorSynthetic(traces, samples, dt, 30.0, 0.4, 1.0, sigma, 12);
+    p.iransk = 0;
+    p.normalise = false;
+    r = segy::computeSigcor(fetchFrom(noisy), samples, 0, traces, 150, 450, dt * 1e6, p);
+    CHECK(r.pairsUsed > traces / 2);
+    std::vector<float> w = segy::cosineSquaredWindow(300, p.flatPercent);
+    double windowPower = 0.0;
+    for (float v : w) windowPower += double(v) * v;
+    double noiseHigh = 0.0, signalHigh = 0.0;
+    int count = 0;
+    for (size_t m = 0; m < r.frequencyHz.size(); ++m) {
+        if (r.frequencyHz[m] < 120.0f || r.frequencyHz[m] > 240.0f) continue;
+        noiseHigh += r.noisePower[m];
+        signalHigh += r.signalPower[m];
+        ++count;
+    }
+    noiseHigh /= count;
+    signalHigh /= count;
+    CHECK_NEAR(noiseHigh / (sigma * sigma * windowPower), 1.0, 0.15);
+    CHECK(std::fabs(signalHigh) < 0.1 * noiseHigh);
+    // In the signal band, signal dominates.
+    size_t at30 = size_t(std::lround(30.0 / r.frequencyHz[1]));
+    CHECK(r.signalPower[at30] > 5.0 * r.noisePower[at30]);
+
+    // 3. AUTCOR (time-domain averaging) gives the same spectra as SPECTR on
+    //    a twice-as-fine grid: n = 300 -> SPECTR 512, AUTCOR 1024 points.
+    p.normalise = true;
+    segy::SigcorResult spectr = segy::computeSigcor(fetchFrom(noisy), samples, 0, traces, 150, 450, dt * 1e6, p);
+    p.option = segy::SigcorOption::Autcor;
+    segy::SigcorResult autcor = segy::computeSigcor(fetchFrom(noisy), samples, 0, traces, 150, 450, dt * 1e6, p);
+    CHECK(autcor.tracePower.size() == 2 * spectr.tracePower.size() - 1);
+    CHECK(autcor.pairsUsed == spectr.pairsUsed);
+    double maxRel = 0.0;
+    double tracePeak = *std::max_element(spectr.tracePower.begin(), spectr.tracePower.end());
+    for (size_t m = 0; m < spectr.tracePower.size(); ++m) {
+        maxRel = std::max(maxRel, std::fabs(autcor.tracePower[2 * m] - spectr.tracePower[m]) / tracePeak);
+        maxRel = std::max(maxRel, std::fabs(autcor.signalPower[2 * m] - spectr.signalPower[m]) / tracePeak);
+    }
+    CHECK(maxRel < 1e-4);
+    CHECK_NEAR(autcor.frequencyHz[2], spectr.frequencyHz[1], 1e-4);
+
+    // 4. Pure noise: correlation coefficients are small, CCMIN 0.3 rejects
+    //    nearly every pair. Steep dip beyond SHMAX: maxima at the limit.
+    SigcorSynthetic noiseOnly = makeSigcorSynthetic(traces, samples, dt, 30.0, 0.0, 0.0, 1.0, 13);
+    p.option = segy::SigcorOption::Spectr;
+    r = segy::computeSigcor(fetchFrom(noiseOnly), samples, 0, traces, 150, 450, dt * 1e6, p);
+    CHECK(r.pairsLowCorrelation + r.pairsAtShiftLimit > r.pairsTotal * 9 / 10);
+    SigcorSynthetic steep = makeSigcorSynthetic(traces, samples, dt, 30.0, 4.0, 1.0, 0.0, 14);
+    p.shmaxMs = 10.0; // 5 samples, true shift 12
+    r = segy::computeSigcor(fetchFrom(steep), samples, 0, traces, 150, 450, dt * 1e6, p);
+    CHECK(r.pairsAtShiftLimit > r.pairsTotal / 2);
+    // Too few traces for one pair: empty result, no crash.
+    r = segy::computeSigcor(fetchFrom(clean), samples, 0, 3, 150, 450, dt * 1e6, p);
+    CHECK(r.pairsTotal == 0 && r.tracePower.empty());
+}
+
+void testXfSpectrum() {
+    section("x-F: frequency grid in whole us-as-mHz steps, peak of a sine, DC removed");
+    segy::XfGrid grid = segy::makeXfGrid(1000, 4000.0); // 4 ms, Nyquist 125 Hz
+    CHECK(grid.fftLength == 1024);
+    CHECK(grid.binIntervalUs == 244); // 0.2441 Hz rounded to 244 mHz
+    CHECK(grid.bins == 513);           // 0..124.928 Hz
+    CHECK((grid.bins - 1) * grid.binIntervalUs <= 125000);
+
+    // SEG-Y's int16 sample count: a long, finely sampled gate is coarsened to fit.
+    segy::XfGrid big = segy::makeXfGrid(60000, 125.0); // Nyquist 4000 Hz
+    CHECK(big.bins <= 32767);
+    CHECK(big.binIntervalUs == 123);
+    CHECK(segy::makeXfGrid(1, 4000.0).bins == 0);
+
+    const double pi = 3.14159265358979323846;
+    std::vector<float> x(1000);
+    for (int i = 0; i < 1000; ++i) x[size_t(i)] = float(5.0 + std::sin(2.0 * pi * 30.0 * i * 0.004));
+    std::vector<float> window = segy::cosineSquaredWindow(1000, 80.0);
+    std::vector<float> amp(size_t(grid.bins));
+    segy::xfAmplitudeSpectrum(x.data(), 1000, window, grid, amp.data());
+    size_t peak = size_t(std::max_element(amp.begin(), amp.end()) - amp.begin());
+    CHECK_NEAR(peak * grid.binIntervalUs / 1000.0, 30.0, 0.3);
+    CHECK(amp[0] < 0.01f * amp[peak]); // the +5 offset is removed
+}
+
 void testNormalizedAutocorrelation() {
     section("Analysis: normalized autocorrelation -- hand-computed values, spike, dead trace, lag clamp, periodicity");
     // x = 1,2,3,4: r0 = 30, r1 = 1*2+2*3+3*4 = 20, r2 = 1*3+2*4 = 11, r3 = 1*4 = 4.
@@ -1522,6 +1710,9 @@ int main() {
     testBandpassFilterIsolatesPassband();
     testWriteSegyFileRoundTrips();
     testNormalizedAutocorrelation();
+    testSigcorHelpers();
+    testSigcorEstimates();
+    testXfSpectrum();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

@@ -57,6 +57,10 @@ struct ManualClip {
     bool enabled = false;
     float posMagnitude = 1.0f;
     float negMagnitude = 1.0f;
+    // The data value mapped to the middle of the color scale (applied
+    // whether or not `enabled`; 0 for seismic). The x-F display stores dB
+    // and centres -40..0 dB with center = -20, magnitudes 20.
+    float center = 0.0f;
 };
 
 // The clip magnitudes (positive and negative) a display maps to the color

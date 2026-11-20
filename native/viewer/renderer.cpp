@@ -181,7 +181,7 @@ void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pix
 
                 float vTop = decoded[size_t(lt) * size_t(decodedHeight) + size_t(ls0)];
                 float vBot = decoded[size_t(lt) * size_t(decodedHeight) + size_t(ls1)];
-                float value = vTop + (vBot - vTop) * sf;
+                float value = vTop + (vBot - vTop) * sf - manualClip.center;
                 if (reversePolarity) value = -value;
 
                 uint8_t r, g, b;

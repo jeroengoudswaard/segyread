@@ -240,6 +240,23 @@ QIcon iconAutocorrelation() {
 
 // Tabler Icons "arrows-horizontal" (https://tabler.io/icons/icon/arrows-horizontal),
 // MIT licensed -- Flip Horizontal toolbar button.
+// x-F display toggle: three traces with a spectrum-like bulge across them
+// -- the "per-trace spectrum" view. Drawn in the Tabler outline style used
+// by the other toolbar icons (24x24, stroke 2, round caps).
+QIcon iconXf() {
+    static const QString kSvg = QStringLiteral(R"(
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 4v16h16" />
+          <path d="M8 4v12" />
+          <path d="M12 4v12" />
+          <path d="M16 4v12" />
+          <path d="M5 13c2 -1 3 -6 6 -6s4 4 8 5" />
+        </svg>
+    )");
+    return renderSvgIcon(kSvg);
+}
+
 QIcon iconArrowsHorizontal() {
     static const QString kSvg = QStringLiteral(R"(
         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"

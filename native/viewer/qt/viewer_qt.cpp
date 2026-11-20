@@ -784,6 +784,12 @@ void AmplitudeScaleWidget::setClipRange(float posClip, float negClip) {
     update();
 }
 
+void AmplitudeScaleWidget::setCenter(float center, const QString& unit) {
+    center_ = center;
+    unit_ = unit;
+    update();
+}
+
 void AmplitudeScaleWidget::setColorScale(segy::ColorScale scale, bool flipped) {
     colorScale_ = scale;
     colorScaleFlipped_ = flipped;
@@ -806,8 +812,11 @@ void AmplitudeScaleWidget::paintEvent(QPaintEvent*) {
     constexpr int kPad = 6;
     int barW = 8;
     int barX = kPad;
-    int barY = kPad + textH / 2;
-    int barH = h - 2 * (kPad + textH / 2);
+    // A unit (x-F: "dB") goes on its own line above the scale -- the
+    // labels beside the bar have room for a number only.
+    const int headerH = unit_.isEmpty() ? 0 : textH;
+    int barY = kPad + textH / 2 + headerH;
+    int barH = h - 2 * (kPad + textH / 2) - headerH;
 
     // Same colormap the plot itself uses (segy::applyColorScale), so the
     // legend always matches what's actually on screen -- sampled at a
@@ -845,11 +854,21 @@ void AmplitudeScaleWidget::paintEvent(QPaintEvent*) {
     painter.setPen(kSecondaryTextColor);
     int textX = barX + barW + kPad;
     int textW = w - textX - kPad;
-    QString topLabel = QString("+%1").arg(int(posClip_));
-    QString bottomLabel = QString::fromUtf8("\xe2\x88\x92") + QString::number(int(negClip_)); // U+2212 minus
+    // Signed labels with a real minus sign (U+2212); "+" only around a zero centre.
+    auto signedLabel = [this](float value, bool plusSign) {
+        int rounded = int(std::lround(value));
+        QString text = rounded < 0 ? QString(QChar(0x2212)) + QString::number(-rounded)
+                                   : (plusSign && rounded > 0 ? "+" : "") + QString::number(rounded);
+        return text;
+    };
+    const bool zeroCentre = center_ == 0.0f;
+    QString topLabel = signedLabel(center_ + posClip_, zeroCentre);
+    QString midLabel = signedLabel(center_, false);
+    QString bottomLabel = signedLabel(center_ - negClip_, zeroCentre);
     int zeroY = barY + int(zeroFrac * barH);
-    painter.drawText(QRect(textX, 0, textW, textH), Qt::AlignLeft | Qt::AlignTop, topLabel);
-    painter.drawText(QRect(textX, zeroY - textH / 2, textW, textH), Qt::AlignLeft | Qt::AlignVCenter, "0");
+    if (headerH > 0) painter.drawText(QRect(kPad, 0, w - 2 * kPad, textH), Qt::AlignLeft | Qt::AlignTop, unit_);
+    painter.drawText(QRect(textX, headerH, textW, textH), Qt::AlignLeft | Qt::AlignTop, topLabel);
+    painter.drawText(QRect(textX, zeroY - textH / 2, textW, textH), Qt::AlignLeft | Qt::AlignVCenter, midLabel);
     painter.drawText(QRect(textX, h - textH, textW, textH), Qt::AlignLeft | Qt::AlignBottom, bottomLabel);
 }
 
@@ -2270,7 +2289,8 @@ namespace {
 // nothing to do yet; View > Grid Lines; Utilities > Parameters...), so
 // it's built once here instead of duplicated per window.
 QMenuBar* buildResultWindowMenuBar(QWidget* window, std::function<void(bool)> onGridLinesToggled,
-                                    std::function<void()> onParameters) {
+                                    std::function<void()> onParameters,
+                                    std::function<void(bool)> onCrosshairToggled = nullptr) {
     QMenuBar* menuBar = new QMenuBar(window);
     QMenu* fileMenu = menuBar->addMenu("&File");
     QAction* closeAction = fileMenu->addAction("&Close");
@@ -2281,9 +2301,17 @@ QMenuBar* buildResultWindowMenuBar(QWidget* window, std::function<void(bool)> on
     gridAction->setCheckable(true);
     gridAction->setChecked(true);
     QObject::connect(gridAction, &QAction::toggled, window, std::move(onGridLinesToggled));
-    QMenu* utilitiesMenu = menuBar->addMenu("&Utilities");
-    QAction* paramsAction = utilitiesMenu->addAction("&Parameters...");
-    QObject::connect(paramsAction, &QAction::triggered, window, std::move(onParameters));
+    if (onCrosshairToggled) {
+        QAction* crosshairAction = viewMenu->addAction("&Crosshair");
+        crosshairAction->setCheckable(true);
+        crosshairAction->setChecked(true);
+        QObject::connect(crosshairAction, &QAction::toggled, window, std::move(onCrosshairToggled));
+    }
+    if (onParameters) {
+        QMenu* utilitiesMenu = menuBar->addMenu("&Utilities");
+        QAction* paramsAction = utilitiesMenu->addAction("&Parameters...");
+        QObject::connect(paramsAction, &QAction::triggered, window, std::move(onParameters));
+    }
     return menuBar;
 }
 
@@ -2459,103 +2487,536 @@ void HistogramPlotWidget::setResult(const segy::HistogramResult& result, QColor 
 
 void HistogramPlotWidget::setParametersCallback(std::function<void()> callback) { onParameters_ = std::move(callback); }
 
-SpectrumChartArea::SpectrumChartArea(QWidget* parent) : QWidget(parent) {}
+DbCurveChart::DbCurveChart(QWidget* parent) : QWidget(parent) {
+    setMouseTracking(true);
+    setMinimumSize(360, 260);
+}
 
-void SpectrumChartArea::setResult(const segy::SpectrumResult& result, QColor sourceColor) {
-    result_ = result;
-    sourceColor_ = sourceColor;
+void DbCurveChart::setCurves(std::vector<float> frequencyHz, std::vector<DbCurve> curves) {
+    frequencyHz_ = std::move(frequencyHz);
+    curves_ = std::move(curves);
+    hoverIndex_ = -1;
+    updateRange();
+    update();
+    if (onHover_) onHover_(-1, 0.0);
+}
+
+void DbCurveChart::setCurveVisible(int index, bool visible) {
+    if (index < 0 || index >= int(curves_.size())) return;
+    curves_[size_t(index)].visible = visible;
+    updateRange();
     update();
 }
 
-void SpectrumChartArea::setGridLinesVisible(bool visible) {
+void DbCurveChart::setTitle(const QString& title) {
+    title_ = title;
+    update();
+}
+
+void DbCurveChart::setEmptyText(const QString& text) {
+    emptyText_ = text;
+    update();
+}
+
+void DbCurveChart::setGridLinesVisible(bool visible) {
     gridLinesVisible_ = visible;
     update();
 }
 
-void SpectrumChartArea::paintEvent(QPaintEvent*) {
+void DbCurveChart::setCrosshairEnabled(bool enabled) {
+    crosshairEnabled_ = enabled;
+    if (!enabled && hoverIndex_ >= 0) {
+        hoverIndex_ = -1;
+        if (onHover_) onHover_(-1, 0.0);
+    }
+    update();
+}
+
+void DbCurveChart::setHoverCallback(std::function<void(int, double)> callback) { onHover_ = std::move(callback); }
+
+QRect DbCurveChart::chartRect() const {
+    const int marginLeft = 60, marginRight = 20, marginTop = 30, marginBottom = 54;
+    return QRect(marginLeft, marginTop, width() - marginLeft - marginRight, height() - marginTop - marginBottom);
+}
+
+void DbCurveChart::updateRange() {
+    float lo = std::numeric_limits<float>::infinity(), hi = -std::numeric_limits<float>::infinity();
+    for (const DbCurve& curve : curves_) {
+        if (!curve.visible) continue;
+        for (float v : curve.db) {
+            if (!std::isfinite(v)) continue;
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+    }
+    if (!std::isfinite(lo) || !std::isfinite(hi)) {
+        lo = -60.0f;
+        hi = 0.0f;
+    }
+    // A near-empty bin (e.g. DC after DC removal) shouldn't flatten everything else.
+    lo = std::max(lo, hi - 120.0f);
+    maxDb_ = std::ceil(double(hi) / 5.0) * 5.0 + 5.0;
+    minDb_ = std::floor(double(lo) / 10.0) * 10.0;
+    if (maxDb_ - minDb_ < 10.0) minDb_ = maxDb_ - 10.0;
+}
+
+void DbCurveChart::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
     painter.fillRect(rect(), kCanvasSurroundColor);
-    QColor gridColor(0x3c, 0x3f, 0x41);
+    const QColor gridColor(0x3c, 0x3f, 0x41);
 
-    if (result_.amplitudeDb.empty() || result_.frequencyHz.back() <= 0.0f) {
+    if (frequencyHz_.size() < 2 || frequencyHz_.back() <= 0.0f || curves_.empty()) {
         painter.setPen(kSecondaryTextColor);
-        painter.drawText(rect(), Qt::AlignCenter,
-                          "No data yet -- open a file, then click Apply or OK in Spectrum Parameters.");
+        painter.drawText(rect().adjusted(20, 0, -20, 0), Qt::AlignCenter | Qt::TextWordWrap, emptyText_);
         return;
     }
 
     QFont font = axisFont();
     painter.setFont(font);
     QFontMetrics fm(font);
-    auto measureWidth = [&fm](const std::string& s) {
-        return s.empty() ? 0 : fm.horizontalAdvance(QString::fromStdString(s));
+    auto measureWidth = [&fm](const std::string& text) {
+        return text.empty() ? 0 : fm.horizontalAdvance(QString::fromStdString(text));
     };
 
-    int w = width(), h = height();
-    int marginLeft = 60, marginRight = 20, marginTop = 30, marginBottom = 54;
-    QRect chart(marginLeft, marginTop, w - marginLeft - marginRight, h - marginTop - marginBottom);
-
-    float minDb = 0.0f, maxDb = 0.0f;
-    for (float db : result_.amplitudeDb) {
-        minDb = std::min(minDb, db);
-        maxDb = std::max(maxDb, db);
-    }
-    minDb = std::floor(minDb / 10.0f) * 10.0f - 10.0f;
-    maxDb = std::max(maxDb, 0.0f) + 5.0f;
-    float maxFreq = result_.frequencyHz.back();
+    const QRect chart = chartRect();
+    if (chart.width() <= 0 || chart.height() <= 0) return;
+    const double maxFreq = frequencyHz_.back();
+    auto xFor = [&](double f) { return chart.left() + f / maxFreq * chart.width(); };
+    auto yFor = [&](double db) { return chart.bottom() - (db - minDb_) / (maxDb_ - minDb_) * chart.height(); };
 
     constexpr int kMaxLines = 11;
-    std::vector<segy::AxisTick> yTicks =
-        segy::computeNiceAxisTicks(double(minDb), double(maxDb), chart.height(), kMaxLines, measureWidth);
-    std::vector<segy::AxisTick> xTicks =
-        segy::computeNiceAxisTicks(0.0, double(maxFreq), chart.width(), kMaxLines, measureWidth);
+    std::vector<segy::AxisTick> yTicks = segy::computeNiceAxisTicks(minDb_, maxDb_, chart.height(), kMaxLines, measureWidth);
+    std::vector<segy::AxisTick> xTicks = segy::computeNiceAxisTicks(0.0, maxFreq, chart.width(), kMaxLines, measureWidth);
 
     painter.setPen(kSecondaryTextColor);
-    painter.drawText(QRect(0, chart.top() - 22, w, 20), Qt::AlignHCenter, "Amplitude (dB) vs. Frequency (Hz)");
-    drawHorizontalGridlinesAndLabels(painter, chart, yTicks, gridColor, kSecondaryTextColor, marginLeft - 6,
+    painter.drawText(QRect(0, chart.top() - 22, width(), 20), Qt::AlignHCenter, title_);
+    drawHorizontalGridlinesAndLabels(painter, chart, yTicks, gridColor, kSecondaryTextColor, chart.left() - 6,
                                       gridLinesVisible_);
     drawVerticalGridlines(painter, chart, xTicks, gridColor, gridLinesVisible_);
     painter.setPen(gridColor);
     painter.setBrush(Qt::NoBrush);
     painter.drawRect(chart);
 
-    QPolygonF curve;
-    for (size_t i = 0; i < result_.amplitudeDb.size(); ++i) {
-        float x = chart.left() + result_.frequencyHz[i] / maxFreq * chart.width();
-        float y = chart.bottom() - (result_.amplitudeDb[i] - minDb) / (maxDb - minDb) * chart.height();
-        curve << QPointF(x, y);
+    painter.save();
+    painter.setClipRect(chart.adjusted(1, 1, -1, -1));
+    for (const DbCurve& curve : curves_) {
+        if (!curve.visible) continue;
+        QPen pen(curve.color, 2.0);
+        if (curve.dashed) pen.setStyle(Qt::DashLine);
+        painter.setPen(pen);
+        QPolygonF run;
+        const size_t count = std::min(curve.db.size(), frequencyHz_.size());
+        for (size_t i = 0; i <= count; ++i) {
+            bool valid = i < count && std::isfinite(curve.db[i]);
+            if (valid) {
+                run << QPointF(xFor(frequencyHz_[i]), yFor(curve.db[i]));
+            } else if (!run.isEmpty()) {
+                // NaN breaks the line: draw what we have, start a new run.
+                if (run.size() > 1) painter.drawPolyline(run);
+                run.clear();
+            }
+        }
     }
-    QPen linePen(sourceColor_);
-    linePen.setWidthF(1.5);
-    painter.setPen(linePen);
-    painter.drawPolyline(curve);
+    painter.restore();
 
     drawXAxisTicksAndLabels(painter, chart, xTicks, kSecondaryTextColor, measureWidth);
     painter.setPen(kSecondaryTextColor);
-    painter.drawText(QRect(marginLeft, h - 20, chart.width(), 20), Qt::AlignHCenter, "Frequency (Hz)");
+    painter.drawText(QRect(chart.left(), height() - 20, chart.width(), 20), Qt::AlignHCenter, "Frequency (Hz)");
+
+    // Crosshair: same black-underlay + white-dash look as the Octave Band
+    // Display's, snapped to the hovered frequency bin, with a marker on
+    // every visible curve there.
+    if (crosshairEnabled_ && hoverIndex_ >= 0 && hoverIndex_ < int(frequencyHz_.size())) {
+        const double x = xFor(frequencyHz_[size_t(hoverIndex_)]);
+        const double y = std::clamp(hoverY_, double(chart.top()), double(chart.bottom()));
+        painter.save();
+        painter.setClipRect(chart);
+        for (const QPen& pen : {QPen(QColor(0, 0, 0, 190), 3), QPen(Qt::white, 1, Qt::DashLine)}) {
+            painter.setPen(pen);
+            painter.drawLine(QPointF(x, chart.top()), QPointF(x, chart.bottom()));
+            painter.drawLine(QPointF(chart.left(), y), QPointF(chart.right(), y));
+        }
+        for (const DbCurve& curve : curves_) {
+            if (!curve.visible || size_t(hoverIndex_) >= curve.db.size()) continue;
+            const float v = curve.db[size_t(hoverIndex_)];
+            if (!std::isfinite(v) || v < minDb_ || v > maxDb_) continue;
+            painter.setPen(QPen(kCanvasSurroundColor, 2)); // surface ring
+            painter.setBrush(curve.color);
+            painter.drawEllipse(QPointF(x, yFor(v)), 4.5, 4.5);
+        }
+        painter.restore();
+    }
+}
+
+void DbCurveChart::mouseMoveEvent(QMouseEvent* event) {
+    const QRect chart = chartRect();
+    const QPointF pos = event->position();
+    if (!crosshairEnabled_ || frequencyHz_.size() < 2 || frequencyHz_.back() <= 0.0f || !chart.contains(pos.toPoint())) {
+        if (hoverIndex_ >= 0) {
+            hoverIndex_ = -1;
+            update();
+            if (onHover_) onHover_(-1, 0.0);
+        }
+        return;
+    }
+    // Frequencies are evenly spaced (FFT bins): nearest bin directly.
+    const double f = (pos.x() - chart.left()) / chart.width() * frequencyHz_.back();
+    const double df = frequencyHz_[1] - frequencyHz_[0];
+    hoverIndex_ = std::clamp(int(std::lround((f - frequencyHz_[0]) / df)), 0, int(frequencyHz_.size()) - 1);
+    hoverY_ = pos.y();
+    const double cursorDb = minDb_ + (chart.bottom() - pos.y()) / chart.height() * (maxDb_ - minDb_);
+    update();
+    if (onHover_) onHover_(hoverIndex_, cursorDb);
+}
+
+void DbCurveChart::leaveEvent(QEvent*) {
+    if (hoverIndex_ < 0) return;
+    hoverIndex_ = -1;
+    update();
+    if (onHover_) onHover_(-1, 0.0);
+}
+
+namespace {
+// Trace Info dock look (see MainWindow's dock): small caps section heading,
+// caption left, monospace value right.
+QLabel* readoutSectionLabel(const QString& text) {
+    QLabel* label = new QLabel(text);
+    label->setStyleSheet("color: #7a7c82; font-size: 11px; letter-spacing: 1px; font-weight: 600;");
+    return label;
+}
+
+QWidget* readoutValueRow(QWidget* swatch, const QString& caption, QLabel*& valueOut) {
+    QWidget* row = new QWidget;
+    QHBoxLayout* rowLayout = new QHBoxLayout(row);
+    rowLayout->setContentsMargins(0, 0, 0, 0);
+    rowLayout->setSpacing(6);
+    if (swatch) rowLayout->addWidget(swatch);
+    QLabel* captionLabel = new QLabel(caption);
+    captionLabel->setStyleSheet("color: #9a9ca3;");
+    rowLayout->addWidget(captionLabel);
+    rowLayout->addStretch();
+    valueOut = new QLabel("--");
+    valueOut->setStyleSheet("color: #d4d4d8; font-family: monospace;");
+    rowLayout->addWidget(valueOut);
+    return row;
+}
+
+// A short line sample in the curve's color (dashed for dashed curves) --
+// identity for the readout rows and the Signal/Noise toggles.
+QPixmap curveSwatch(const QColor& color, bool dashed) {
+    QPixmap pixmap(18, 10);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    QPen pen(color, 2.5);
+    if (dashed) pen.setDashPattern({2.0, 1.5});
+    painter.setPen(pen);
+    painter.drawLine(QPointF(1, 5), QPointF(17, 5));
+    return pixmap;
+}
+} // namespace
+
+CurveReadoutPanel::CurveReadoutPanel(QWidget* parent) : QWidget(parent) {
+    setObjectName("curveReadout");
+    setAttribute(Qt::WA_StyledBackground, true);
+    setStyleSheet("#curveReadout { background-color: #1a1b1e; border-left: 1px solid #2b2d31; }");
+    setFixedWidth(210);
+    QVBoxLayout* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(16, 16, 16, 16);
+    layout->setSpacing(8);
+    layout->addWidget(readoutSectionLabel("CURSOR"));
+    layout->addWidget(readoutValueRow(nullptr, "Frequency", frequencyValue_));
+    layout->addWidget(readoutValueRow(nullptr, "Level", cursorValue_));
+    layout->addSpacing(12);
+    layout->addWidget(readoutSectionLabel("AT FREQUENCY"));
+    curveRows_ = new QWidget;
+    QVBoxLayout* rowsLayout = new QVBoxLayout(curveRows_);
+    rowsLayout->setContentsMargins(0, 0, 0, 0);
+    rowsLayout->setSpacing(8);
+    layout->addWidget(curveRows_);
+    layout->addStretch();
+    QLabel* hint = new QLabel("Hover over the chart to read values.");
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color: #68696e; font-style: italic; font-size: 11px;");
+    layout->addWidget(hint);
+}
+
+void CurveReadoutPanel::syncRows(const DbCurveChart& chart) {
+    const std::vector<DbCurve>& curves = chart.curves();
+    bool sameShape = rows_.size() == curves.size();
+    if (!sameShape) {
+        for (auto& row : rows_) delete row.first;
+        rows_.clear();
+        for (const DbCurve& curve : curves) {
+            QLabel* swatch = new QLabel;
+            swatch->setPixmap(curveSwatch(curve.color, curve.dashed));
+            QLabel* value = nullptr;
+            QWidget* row = readoutValueRow(swatch, curve.name, value);
+            curveRows_->layout()->addWidget(row);
+            rows_.push_back({row, value});
+        }
+    }
+    for (size_t i = 0; i < curves.size(); ++i) rows_[i].first->setVisible(curves[i].visible);
+    showValues(chart, -1, 0.0);
+}
+
+void CurveReadoutPanel::showValues(const DbCurveChart& chart, int frequencyIndex, double cursorDb) {
+    const std::vector<float>& freqs = chart.frequencies();
+    const std::vector<DbCurve>& curves = chart.curves();
+    const bool valid = frequencyIndex >= 0 && frequencyIndex < int(freqs.size());
+    frequencyValue_->setText(valid ? QString("%1 Hz").arg(freqs[size_t(frequencyIndex)], 0, 'f', 1) : "--");
+    cursorValue_->setText(valid ? QString("%1 dB").arg(cursorDb, 0, 'f', 1) : "--");
+    for (size_t i = 0; i < rows_.size() && i < curves.size(); ++i) {
+        QString text = "--";
+        if (valid && size_t(frequencyIndex) < curves[i].db.size()) {
+            float v = curves[i].db[size_t(frequencyIndex)];
+            if (std::isfinite(v)) text = QString("%1 dB").arg(double(v), 0, 'f', 1);
+        }
+        rows_[i].second->setText(text);
+    }
 }
 
 SpectrumPlotWidget::SpectrumPlotWidget(QWidget* parent) : QWidget(parent) {
     setWindowTitle("Spectrum");
-    resize(700, 480);
+    resize(900, 480);
     QVBoxLayout* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
-    chart_ = new SpectrumChartArea(this);
+    chart_ = new DbCurveChart(this);
+    chart_->setEmptyText("No data yet -- open a file, then click Apply or OK in Spectrum Parameters.");
+    readout_ = new CurveReadoutPanel(this);
+    chart_->setHoverCallback([this](int index, double cursorDb) { readout_->showValues(*chart_, index, cursorDb); });
     layout->addWidget(buildResultWindowMenuBar(
         this, [this](bool checked) { chart_->setGridLinesVisible(checked); },
         [this]() {
             if (onParameters_) onParameters_();
+        },
+        [this](bool checked) {
+            chart_->setCrosshairEnabled(checked);
+            readout_->setVisible(checked);
         }));
-    layout->addWidget(chart_, 1);
+    QHBoxLayout* body = new QHBoxLayout();
+    body->setContentsMargins(0, 0, 0, 0);
+    body->setSpacing(0);
+    body->addWidget(chart_, 1);
+    body->addWidget(readout_);
+    layout->addLayout(body, 1);
 }
 
 void SpectrumPlotWidget::setResult(const segy::SpectrumResult& result, QColor sourceColor) {
-    chart_->setResult(result, sourceColor);
+    DbCurve curve;
+    curve.name = "Amplitude";
+    curve.color = sourceColor;
+    curve.db = result.amplitudeDb;
+    chart_->setCurves(result.frequencyHz, {curve});
+    readout_->syncRows(*chart_);
 }
 
 void SpectrumPlotWidget::setParametersCallback(std::function<void()> callback) { onParameters_ = std::move(callback); }
+
+namespace {
+// Dark-surface categorical steps (validated: lightness, chroma, CVD and
+// contrast against the dark chart surface). Trace is the neutral context
+// line; S/N is also dashed so it never relies on hue alone.
+const QColor kSnTraceColor(0xc3, 0xc2, 0xb7);
+const QColor kSnSignalColor(0x39, 0x87, 0xe5);
+const QColor kSnNoiseColor(0xd9, 0x59, 0x26);
+const QColor kSnRatioColor(0x19, 0x9e, 0x70);
+} // namespace
+
+SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
+    setWindowTitle("Signal/Noise");
+    resize(1000, 620);
+    QVBoxLayout* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    chart_ = new DbCurveChart(this);
+    chart_->setTitle("Level (dB re trace peak) and S/N (dB) vs. Frequency (Hz)");
+    chart_->setEmptyText("Computing...");
+    readout_ = new CurveReadoutPanel(this);
+    chart_->setHoverCallback([this](int index, double cursorDb) { readout_->showValues(*chart_, index, cursorDb); });
+    layout->addWidget(buildResultWindowMenuBar(
+        this, [this](bool checked) { chart_->setGridLinesVisible(checked); }, nullptr,
+        [this](bool checked) {
+            chart_->setCrosshairEnabled(checked);
+            readout_->setVisible(checked);
+        }));
+
+    QWidget* header = new QWidget(this);
+    header->setStyleSheet("background-color: #141416;");
+    QVBoxLayout* headerLayout = new QVBoxLayout(header);
+    headerLayout->setContentsMargins(14, 10, 14, 6);
+    headerLayout->setSpacing(6);
+
+    QHBoxLayout* toggles = new QHBoxLayout();
+    toggles->setSpacing(18);
+    const char* names[4] = {"Trace", "Signal", "Noise", "S/N"};
+    const QColor colors[4] = {kSnTraceColor, kSnSignalColor, kSnNoiseColor, kSnRatioColor};
+    for (int i = 0; i < 4; ++i) {
+        QCheckBox* check = new QCheckBox(names[i]);
+        check->setIcon(QIcon(curveSwatch(colors[i], i == 3)));
+        check->setIconSize(QSize(18, 10));
+        check->setChecked(i == 1 || i == 2); // signal and noise by default
+        connect(check, &QCheckBox::toggled, this, [this, i](bool on) {
+            chart_->setCurveVisible(i, on);
+            readout_->syncRows(*chart_);
+        });
+        curveChecks_[i] = check;
+        toggles->addWidget(check);
+    }
+    toggles->addStretch();
+    headerLayout->addLayout(toggles);
+
+    // Estimation parameters, beside Recompute. Plain names; the SIGCOR
+    // card names (OPTION, NSKIP, ...) are in the tooltips.
+    QGridLayout* paramGrid = new QGridLayout();
+    paramGrid->setHorizontalSpacing(8);
+    paramGrid->setVerticalSpacing(4);
+    int paramColumn = 0, paramRow = 0;
+    auto addParam = [&](const QString& label, QWidget* field, const QString& tip) {
+        QLabel* caption = new QLabel(label);
+        caption->setStyleSheet("color: #9a9ca3;");
+        caption->setToolTip(tip);
+        field->setToolTip(tip);
+        paramGrid->addWidget(caption, paramRow, paramColumn * 2, Qt::AlignRight);
+        paramGrid->addWidget(field, paramRow, paramColumn * 2 + 1);
+        if (++paramColumn == 4) {
+            paramColumn = 0;
+            ++paramRow;
+        }
+    };
+    methodCombo_ = new QComboBox();
+    methodCombo_->addItem("Spectrum", int(segy::SigcorOption::Spectr));
+    methodCombo_->addItem("Autocorrelation", int(segy::SigcorOption::Autcor));
+    addParam("Method", methodCombo_,
+             "Spectrum: average the power spectra of the gates. Autocorrelation: average the auto- and "
+             "crosscorrelations, transform once at the end. (SIGCOR OPTION SPECTR/AUTCOR)");
+    distanceSpin_ = new QSpinBox();
+    distanceSpin_->setRange(1, 200);
+    distanceSpin_->setSuffix(" traces");
+    addParam("Trace distance", distanceSpin_, "Distance between the two traces of a pair. (SIGCOR NSKIP)");
+    randomSpin_ = new QSpinBox();
+    randomSpin_->setRange(0, 200);
+    randomSpin_->setPrefix("+0..");
+    addParam("Random extra", randomSpin_,
+             "A random 0..N traces added to the distance per pair, against a constant dip. (SIGCOR IRANSK)");
+    maxShiftSpin_ = new QDoubleSpinBox();
+    maxShiftSpin_->setRange(0.0, 1000.0);
+    maxShiftSpin_->setDecimals(1);
+    maxShiftSpin_->setSuffix(" ms");
+    addParam("Max shift", maxShiftSpin_,
+             "Largest time shift searched between the two traces. A best match at the limit rejects the pair; "
+             "0 or 1 sample means the data is taken as already aligned. (SIGCOR SHMAX)");
+    minCorrelationSpin_ = new QDoubleSpinBox();
+    minCorrelationSpin_->setRange(-1.0, 1.0);
+    minCorrelationSpin_->setDecimals(2);
+    minCorrelationSpin_->setSingleStep(0.05);
+    addParam("Min correlation", minCorrelationSpin_,
+             "Pairs whose aligned gates correlate less than this are left out. (SIGCOR CCMIN)");
+    shiftPickCombo_ = new QComboBox();
+    shiftPickCombo_->addItem("Plain", int(segy::SigcorCrossCorrelator::Basic));
+    shiftPickCombo_->addItem("Normalized", int(segy::SigcorCrossCorrelator::Normalized));
+    addParam("Shift pick", shiftPickCombo_,
+             "Cross-correlation used to find the shift: plain, or normalized by the RMS of the overlapping part "
+             "of the other trace (better for short gates). (SIGCOR TCROSS BASIC/NORMALIZED)");
+    flatSpin_ = new QDoubleSpinBox();
+    flatSpin_->setRange(0.0, 100.0);
+    flatSpin_->setDecimals(0);
+    flatSpin_->setSuffix(" %");
+    addParam("Taper flat part", flatSpin_,
+             "Cosine-squared taper: the share of the gate left untapered. (SIGCOR SGGATE cosine window)");
+    QHBoxLayout* checks = new QHBoxLayout();
+    checks->setSpacing(12);
+    equalizeCheck_ = new QCheckBox("Equalize energy");
+    equalizeCheck_->setToolTip("Scale both gates of a pair to the same energy. (SIGCOR IGNORM)");
+    removeDcCheck_ = new QCheckBox("Remove DC");
+    removeDcCheck_->setToolTip("Remove each gate's mean before tapering. (SIGCOR IGNORM)");
+    checks->addWidget(equalizeCheck_);
+    checks->addWidget(removeDcCheck_);
+    checks->addStretch();
+    paramGrid->addLayout(checks, paramRow, paramColumn * 2, 1, 2);
+    QHBoxLayout* paramRowLayout = new QHBoxLayout();
+    paramRowLayout->addLayout(paramGrid);
+    paramRowLayout->addStretch();
+    QPushButton* recompute = new QPushButton("Recompute");
+    recompute->setToolTip("Recompute with these settings from the active panel's selection box, or its visible "
+                          "data without one");
+    connect(recompute, &QPushButton::clicked, this, [this]() {
+        if (onRecompute_) onRecompute_();
+    });
+    paramRowLayout->addWidget(recompute, 0, Qt::AlignBottom);
+    headerLayout->addLayout(paramRowLayout);
+    setParams(segy::SigcorParams{});
+
+    QHBoxLayout* stats = new QHBoxLayout();
+    stats->setSpacing(16);
+    sigmaLabel_ = new QLabel();
+    sigmaLabel_->setStyleSheet("color: #f0f2f5; font-size: 14px; font-weight: 600;");
+    stats->addWidget(sigmaLabel_);
+    infoLabel_ = new QLabel();
+    infoLabel_->setStyleSheet("color: #9a9ca3;");
+    infoLabel_->setWordWrap(true);
+    stats->addWidget(infoLabel_, 1);
+    headerLayout->addLayout(stats);
+    layout->addWidget(header);
+
+    QHBoxLayout* body = new QHBoxLayout();
+    body->setContentsMargins(0, 0, 0, 0);
+    body->setSpacing(0);
+    body->addWidget(chart_, 1);
+    body->addWidget(readout_);
+    layout->addLayout(body, 1);
+
+    setResult(SignalNoiseDisplay{});
+}
+
+void SignalNoiseWindow::setResult(const SignalNoiseDisplay& display) {
+    const QString sigmaText = QString("Time-shift 1%1:").arg(QChar(0x03C3));
+    if (display.frequencyHz.empty()) {
+        chart_->setEmptyText(display.emptyReason.isEmpty() ? QString("Computing...") : display.emptyReason);
+        chart_->setCurves({}, {});
+        sigmaLabel_->setText(sigmaText + " --");
+    } else {
+        std::vector<DbCurve> curves(4);
+        curves[0] = {"Trace", kSnTraceColor, display.traceDb, curveChecks_[0]->isChecked(), false};
+        curves[1] = {"Signal", kSnSignalColor, display.signalDb, curveChecks_[1]->isChecked(), false};
+        curves[2] = {"Noise", kSnNoiseColor, display.noiseDb, curveChecks_[2]->isChecked(), false};
+        curves[3] = {"S/N", kSnRatioColor, display.snDb, curveChecks_[3]->isChecked(), true};
+        chart_->setCurves(display.frequencyHz, std::move(curves));
+        sigmaLabel_->setText(QString("%1 %2 ms").arg(sigmaText).arg(display.shiftSigmaMs, 0, 'f', 2));
+    }
+    infoLabel_->setText(display.info);
+    readout_->syncRows(*chart_);
+}
+
+void SignalNoiseWindow::setRecomputeCallback(std::function<void()> callback) { onRecompute_ = std::move(callback); }
+
+void SignalNoiseWindow::setParams(const segy::SigcorParams& params) {
+    methodCombo_->setCurrentIndex(params.option == segy::SigcorOption::Autcor ? 1 : 0);
+    distanceSpin_->setValue(params.nskip);
+    randomSpin_->setValue(params.iransk);
+    maxShiftSpin_->setValue(params.shmaxMs);
+    minCorrelationSpin_->setValue(params.ccmin);
+    shiftPickCombo_->setCurrentIndex(params.tcross == segy::SigcorCrossCorrelator::Normalized ? 1 : 0);
+    flatSpin_->setValue(params.flatPercent);
+    equalizeCheck_->setChecked(params.normalise);
+    removeDcCheck_->setChecked(params.removeDc);
+}
+
+segy::SigcorParams SignalNoiseWindow::params() const {
+    segy::SigcorParams p;
+    p.option = segy::SigcorOption(methodCombo_->currentData().toInt());
+    p.nskip = distanceSpin_->value();
+    p.iransk = randomSpin_->value();
+    p.shmaxMs = maxShiftSpin_->value();
+    p.ccmin = minCorrelationSpin_->value();
+    p.tcross = segy::SigcorCrossCorrelator(shiftPickCombo_->currentData().toInt());
+    p.flatPercent = flatSpin_->value();
+    p.normalise = equalizeCheck_->isChecked();
+    p.removeDc = removeDcCheck_->isChecked();
+    return p;
+}
 
 namespace {
 // Splits "<dir>/<pattern>[ <pattern>...]" into the directory and the list
@@ -3294,6 +3755,7 @@ void SegyCanvas::setAmplitudeScale(float posClip, float negClip, bool visible, s
                                     bool colorScaleFlipped) {
     amplitudeScale_->setClipRange(posClip, negClip);
     amplitudeScale_->setColorScale(colorScale, colorScaleFlipped);
+    amplitudeScale_->setCenter(app_.display.manualClip.center, app_.display.frequencyAxis ? "dB" : QString());
     amplitudeScale_->setVisible(visible);
 }
 
@@ -3485,10 +3947,11 @@ HoverInfo SegyCanvas::currentHoverInfo() const {
     segy::decodeSamples(sampleBase, &value, 1, app_.foreground->binHeader.formatCode);
 
     info.valid = true;
-    info.traceIdx = traceIdx;
+    info.traceIdx = traceIdx + (app_.xf.active ? app_.xf.traceOffset : 0);
     info.seqNum = th.traceSequenceLine;
     info.timeMs = double(sampleIdx) * (app_.foreground->binHeader.sampleIntervalUs / 1000.0);
     info.amplitude = value;
+    info.frequencyAxis = app_.display.frequencyAxis;
     return info;
 }
 
@@ -4191,7 +4654,74 @@ void SegyCanvas::leaveEvent(QEvent*) {
     notifyHoverChanged(); // clears the dock's Trace Info section
 }
 
+void SegyCanvas::enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOffset) {
+    if (!app_.loaded || !xfDataset) return;
+    XfState& xf = app_.xf;
+    if (!xf.active) {
+        xf.seismic = app_.foreground;
+        xf.view = app_.view;
+        xf.display = app_.display;
+        xf.selectionBoxes = app_.selectionBoxes;
+        xf.activeBoxIndex = app_.activeBoxIndex;
+        xf.zoomHistory = app_.zoomHistory;
+    }
+    xf.active = true;
+    xf.traceOffset = traceOffset;
+    app_.foreground = std::move(xfDataset);
+    segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
+    // Variable density, -40 dB (green) .. 0 dB (red) by default: clip 20 dB
+    // either side of -20 dB. No gain/AGC -- the values are already dB.
+    segy::DisplaySettings& d = app_.display;
+    d.seismicMode = segy::SeismicDisplayMode::VariableDensity;
+    d.colorScale = xf.colorScale;
+    d.colorScaleFlipped = xf.colorScaleFlipped;
+    d.gainDb = 0.0;
+    d.manualClip = segy::ManualClip{true, 20.0f, 20.0f, -20.0f};
+    d.clipLocked = false;
+    d.reversePolarity = false;
+    d.processing = segy::AmplitudeProcessing{};
+    d.frequencyAxis = true;
+    app_.selectionBoxes.clear();
+    app_.activeBoxIndex = -1;
+    app_.draggingBoxIndex = -1;
+    app_.draggingCorner = -1;
+    app_.zoomHistory.clear();
+    notifyStateChanged();
+    updateStatusBar();
+    update();
+}
+
+void SegyCanvas::exitXfMode() {
+    XfState& xf = app_.xf;
+    if (!xf.active) return;
+    // Remembered for the next x-F of this session.
+    xf.colorScale = app_.display.colorScale;
+    xf.colorScaleFlipped = app_.display.colorScaleFlipped;
+    app_.foreground = std::move(xf.seismic);
+    app_.view = xf.view;
+    app_.display = xf.display;
+    app_.selectionBoxes = std::move(xf.selectionBoxes);
+    app_.activeBoxIndex = xf.activeBoxIndex;
+    app_.draggingBoxIndex = -1;
+    app_.draggingCorner = -1;
+    app_.zoomHistory = std::move(xf.zoomHistory);
+    xf.active = false;
+    xf.seismic.reset();
+    notifyStateChanged();
+    updateStatusBar();
+    update();
+}
+
 void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
+    if (app_.xf.active) {
+        // A different Foreground ends x-F: back to the seismic display
+        // settings, but the parked dataset and boxes are not restored.
+        app_.display = app_.xf.display;
+        app_.xf.active = false;
+        app_.xf.seismic.reset();
+        app_.xf.selectionBoxes.clear();
+        app_.xf.zoomHistory.clear();
+    }
     // Never mutate a Dataset's fields in place -- it may be shared with
     // the pool or another panel's Background slot, so this only ever
     // reassigns the pointer (an O(1) swap, whether the dataset is brand
@@ -4359,34 +4889,7 @@ MainWindow::MainWindow() : QMainWindow() {
     editMenu->addAction("&Paste");
     editMenu->addSeparator();
     QAction* preferencesAction = editMenu->addAction("&Preferences...");
-    connect(preferencesAction, &QAction::triggered, this, [this]() {
-        if (!preferencesDialog_) {
-            std::vector<ToolbarItemInfo> items;
-            // Grouped by what the buttons do, for Preferences' Toolbar
-            // Buttons section (finer than the toolbar's own separators,
-            // which lump analysis, headers and panel controls together).
-            auto categoryFor = [](const QString& id) -> QString {
-                if (id == "zoom" || id == "mooz") return "Zoom";
-                if (id == "pan" || id == "boxSelect") return "Tools";
-                if (id == "seismicMode" || id == "flipHorizontal" || id == "idents") return "Display";
-                if (id == "displayParameters" || id == "gain" || id == "agc") return "Amplitude";
-                if (id == "spectrum" || id == "histogram" || id == "octaveBands" || id == "autocorrelation")
-                    return "Analysis";
-                if (id == "textHeader" || id == "binaryHeader") return "Headers";
-                return "Panels"; // splitView, lock, sidebar
-            };
-            for (const ToolbarItem& item : toolbarItems_) items.push_back({item.id, item.label, categoryFor(item.id)});
-            preferencesDialog_ = new PreferencesDialog(prefs_, items, this);
-            preferencesDialog_->setAppliedCallback([this](const Preferences& newPrefs) {
-                prefs_ = newPrefs;
-                applyToolbarPosition(prefs_.toolbarPosition); // also applies prefs_.drawerPosition
-                savePreferences();
-            });
-        }
-        preferencesDialog_->show();
-        preferencesDialog_->raise();
-        preferencesDialog_->activateWindow();
-    });
+    connect(preferencesAction, &QAction::triggered, this, &MainWindow::openPreferencesDialog);
 
     QMenu* selectionMenu = menuBar()->addMenu("&Selection");
     selectionMenu->addAction("Select &All");
@@ -4537,6 +5040,13 @@ MainWindow::MainWindow() : QMainWindow() {
         for (Panel* p : targetPanels()) p->app.display.flipHorizontal = checked;
         refreshToolChrome();
     });
+
+    // x-F display: per-trace amplitude spectra of what's on screen, in dB
+    // (see native/README.md). Toggling off restores the seismic display.
+    xfAction_ = toolbar->addAction(iconXf(), "x-F Display");
+    xfAction_->setCheckable(true);
+    xfAction_->setToolTip("x-F display: amplitude spectrum (dB) of every trace in view, 0 to Nyquist");
+    connect(xfAction_, &QAction::triggered, this, [this](bool checked) { toggleXf(activePanel_, checked); });
 
     // Idents: trace-header reference rows/plot above and below the plot,
     // plus up to two colored lines drawn directly on the seismic -- see
@@ -4807,7 +5317,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // in both the toolbar and a menu at once -- it would just move).
     toolbarOverflowCandidates_ = {
         zoomAction_,          moozAction_,         panAction_,         boxSelectAction_,
-        seismicModeToolbarAction_, flipHorizontalAction_, identsAction_,  gainDetailAction_, gainUpAction_,
+        seismicModeToolbarAction_, flipHorizontalAction_, xfAction_, identsAction_,  gainDetailAction_, gainUpAction_,
         gainDownAction_,      agcAction_,          spectrumAction_,     histogramAction_,   octaveBandAction_,
         autocorrelationAction_,
         ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_,
@@ -4860,6 +5370,7 @@ MainWindow::MainWindow() : QMainWindow() {
         {"boxSelect", "Box Select", 1, {boxSelectAction_}},
         {"seismicMode", "Seismic Display Toggle", 2, {seismicModeToolbarAction_}},
         {"flipHorizontal", "Flip Horizontal", 2, {flipHorizontalAction_}},
+        {"xf", "x-F Display", 2, {xfAction_}},
         {"idents", "Idents", 2, {identsAction_}},
         {"displayParameters", "Display Parameters", 3, {gainDetailAction_}},
         {"gain", "Gain", 3, {gainSliderAction_, gainUpAction_, gainValueLabelAction_, gainDownAction_}},
@@ -4907,6 +5418,7 @@ MainWindow::MainWindow() : QMainWindow() {
     viewMenu->addSeparator();
     addMenuMirror(viewMenu, panAction_, "&Pan Tool");
     addMenuMirror(viewMenu, flipHorizontalAction_, "Flip &Horizontal");
+    addMenuMirror(viewMenu, xfAction_, "&x-F Display");
     addMenuMirror(viewMenu, gainDetailAction_, "Display &Parameters...");
 
     QMenu* gainMenu = viewMenu->addMenu("&Gain");
@@ -4958,6 +5470,14 @@ MainWindow::MainWindow() : QMainWindow() {
     addMenuMirror(analysisMenu, histogramAction_, "&Histogram...");
     addMenuMirror(analysisMenu, octaveBandAction_, "&Octave Bands");
     addMenuMirror(analysisMenu, autocorrelationAction_, "&Autocorrelation...");
+    QAction* signalNoiseAction = analysisMenu->addAction("Signal/&Noise...");
+    connect(signalNoiseAction, &QAction::triggered, this, [this]() {
+        if (!activePanel_->app.loaded) {
+            flashStatusMessage("No data selected");
+            return;
+        }
+        computeAndShowSignalNoise(activePanel_);
+    });
 
     // Right dock: relocated color bar (Amplitude Scale) and hover readout
     // (Trace Info), plus a QC Notes placeholder -- see native/README.md
@@ -4992,7 +5512,9 @@ MainWindow::MainWindow() : QMainWindow() {
     dockLayout->addWidget(sectionLabel("TRACE INFO"));
     dockLayout->addWidget(valueRow("Trace", traceValueLabel_));
     dockLayout->addWidget(valueRow("Seq #", seqValueLabel_));
-    dockLayout->addWidget(valueRow("Time", timeValueLabel_));
+    QWidget* timeRow = valueRow("Time", timeValueLabel_);
+    timeCaptionLabel_ = timeRow->findChildren<QLabel*>().value(0); // the caption, created first
+    dockLayout->addWidget(timeRow);
     dockLayout->addWidget(valueRow("Amplitude", amplitudeValueLabel_));
 
     // Amplitude Scale used to be a section here; it's now an overlay
@@ -5200,6 +5722,20 @@ void MainWindow::loadPreferences() {
     }
     prefs_.hiddenToolbarItems = settings.value("toolbarHiddenItems").toStringList();
     prefs_.hiddenToolbarItems.removeAll(QString()); // an empty list can read back as {""}
+    segy::SigcorParams& sn = prefs_.signalNoise;
+    const segy::SigcorParams defaults;
+    sn.option = settings.value("signalNoise/option", "SPECTR").toString() == "AUTCOR" ? segy::SigcorOption::Autcor
+                                                                                       : segy::SigcorOption::Spectr;
+    sn.tcross = settings.value("signalNoise/tcross", "BASIC").toString() == "NORMALIZED"
+                    ? segy::SigcorCrossCorrelator::Normalized
+                    : segy::SigcorCrossCorrelator::Basic;
+    sn.nskip = std::max(1, settings.value("signalNoise/nskip", defaults.nskip).toInt());
+    sn.iransk = std::max(0, settings.value("signalNoise/iransk", defaults.iransk).toInt());
+    sn.shmaxMs = settings.value("signalNoise/shmaxMs", defaults.shmaxMs).toDouble();
+    sn.ccmin = settings.value("signalNoise/ccmin", defaults.ccmin).toDouble();
+    sn.flatPercent = settings.value("signalNoise/flatPercent", defaults.flatPercent).toDouble();
+    sn.normalise = settings.value("signalNoise/normalise", defaults.normalise).toBool();
+    sn.removeDc = settings.value("signalNoise/removeDc", defaults.removeDc).toBool();
 }
 
 void MainWindow::savePreferences() {
@@ -5209,6 +5745,17 @@ void MainWindow::savePreferences() {
     settings.setValue("uiScalePercent", prefs_.uiScalePercent);
     settings.setValue("datasetLabelPosition", int(datasetLabelPosition_));
     settings.setValue("toolbarHiddenItems", prefs_.hiddenToolbarItems);
+    const segy::SigcorParams& sn = prefs_.signalNoise;
+    settings.setValue("signalNoise/option", sn.option == segy::SigcorOption::Autcor ? "AUTCOR" : "SPECTR");
+    settings.setValue("signalNoise/tcross",
+                      sn.tcross == segy::SigcorCrossCorrelator::Normalized ? "NORMALIZED" : "BASIC");
+    settings.setValue("signalNoise/nskip", sn.nskip);
+    settings.setValue("signalNoise/iransk", sn.iransk);
+    settings.setValue("signalNoise/shmaxMs", sn.shmaxMs);
+    settings.setValue("signalNoise/ccmin", sn.ccmin);
+    settings.setValue("signalNoise/flatPercent", sn.flatPercent);
+    settings.setValue("signalNoise/normalise", sn.normalise);
+    settings.setValue("signalNoise/removeDc", sn.removeDc);
 }
 
 void MainWindow::applyDatasetLabelPosition(DatasetLabelPosition position) {
@@ -5470,6 +6017,7 @@ void MainWindow::setActivePanel(Panel* panel) {
     wiggleMenuAction_->setChecked(isWiggle);
     refreshSeismicModeToolbarIcon();
     refreshAmplitudeProcessingControls();
+    xfAction_->setChecked(app_->xf.active);
     refreshToolChrome();
 }
 
@@ -5619,6 +6167,12 @@ void MainWindow::updateHoverInfo(const HoverInfo& info) {
     }
     traceValueLabel_->setText(QString::number(info.traceIdx));
     seqValueLabel_->setText(QString::number(info.seqNum));
+    if (timeCaptionLabel_) timeCaptionLabel_->setText(info.frequencyAxis ? "Frequency" : "Time");
+    if (info.frequencyAxis) {
+        timeValueLabel_->setText(QString("%1 Hz").arg(info.timeMs, 0, 'f', 2));
+        amplitudeValueLabel_->setText(QString("%1 dB").arg(double(info.amplitude), 0, 'f', 1));
+        return;
+    }
     timeValueLabel_->setText(QString("%1 ms").arg(info.timeMs, 0, 'f', 1));
     amplitudeValueLabel_->setText(QString::number(info.amplitude, 'f', 2));
 }
@@ -6109,6 +6663,297 @@ void MainWindow::openOctaveBandDialog() {
     }
     octaveBandDialog_->refreshPanels(QString::fromStdString(panelA_.app.foreground->filePath.stem().string()), panelA_.app.loaded,
                                       QString::fromStdString(panelB_.app.foreground->filePath.stem().string()), panelB_.app.loaded);
+}
+
+void MainWindow::openPreferencesDialog() {
+    if (!preferencesDialog_) {
+        std::vector<ToolbarItemInfo> items;
+        // Grouped by what the buttons do, for Preferences' Toolbar
+        // Buttons section (finer than the toolbar's own separators,
+        // which lump analysis, headers and panel controls together).
+        auto categoryFor = [](const QString& id) -> QString {
+            if (id == "zoom" || id == "mooz") return "Zoom";
+            if (id == "pan" || id == "boxSelect") return "Tools";
+            if (id == "seismicMode" || id == "flipHorizontal" || id == "xf" || id == "idents") return "Display";
+            if (id == "displayParameters" || id == "gain" || id == "agc") return "Amplitude";
+            if (id == "spectrum" || id == "histogram" || id == "octaveBands" || id == "autocorrelation")
+                return "Analysis";
+            if (id == "textHeader" || id == "binaryHeader") return "Headers";
+            return "Panels"; // splitView, lock, sidebar
+        };
+        for (const ToolbarItem& item : toolbarItems_) items.push_back({item.id, item.label, categoryFor(item.id)});
+        preferencesDialog_ = new PreferencesDialog(prefs_, items, this);
+        preferencesDialog_->setAppliedCallback([this](const Preferences& newPrefs) {
+            const segy::SigcorParams signalNoise = prefs_.signalNoise; // edited in the Signal/Noise window, not here
+            prefs_ = newPrefs;
+            prefs_.signalNoise = signalNoise;
+            applyToolbarPosition(prefs_.toolbarPosition); // also applies prefs_.drawerPosition
+            savePreferences();
+        });
+    }
+    preferencesDialog_->show();
+    preferencesDialog_->raise();
+    preferencesDialog_->activateWindow();
+}
+
+void MainWindow::refreshAfterDisplaySwap() {
+    // Every toolbar/menu control mirrors the active panel's display
+    // settings, which an x-F swap replaces wholesale -- re-sync them all.
+    setActivePanel(activePanel_);
+}
+
+void MainWindow::toggleXf(Panel* panel, bool on) {
+    AppState& app = panel->app;
+    if (!on) {
+        panel->canvas->exitXfMode();
+        refreshAfterDisplaySwap();
+        return;
+    }
+    if (!app.loaded || app.xf.active) {
+        if (!app.loaded) flashStatusMessage("No data selected");
+        refreshAfterDisplaySwap();
+        return;
+    }
+    // Every trace in view (not the selection box), over the visible time range.
+    std::shared_ptr<Dataset> ds = app.foreground;
+    const int samplesPerTrace = ds->binHeader.samplesPerTrace;
+    const double intervalUs = ds->binHeader.sampleIntervalUs;
+    const int64_t t0 = std::clamp<int64_t>(int64_t(std::floor(app.view.traceStart)), 0, ds->traceCount);
+    const int64_t t1 = std::clamp<int64_t>(int64_t(std::ceil(app.view.traceEnd)), t0, ds->traceCount);
+    const int s0 = std::clamp(int(std::floor(app.view.sampleStart)), 0, samplesPerTrace);
+    const int s1 = std::clamp(int(std::ceil(app.view.sampleEnd)), s0, samplesPerTrace);
+    const segy::XfGrid grid = segy::makeXfGrid(s1 - s0, intervalUs);
+    if (t1 <= t0 || grid.bins < 2) {
+        flashStatusMessage("Not enough data in view for an x-F display");
+        refreshAfterDisplaySwap();
+        return;
+    }
+    xfAction_->setEnabled(false); // until the computation lands
+
+    const QString sourceName = QString::fromStdString(ds->filePath.stem().string());
+    const QString outputName = sourceName + "_xF";
+    const std::filesystem::path outPath = scratchSegyPath(outputName);
+    std::vector<std::string> history = ds->processingHistory;
+    history.push_back(QString("X-F: AMPLITUDE SPECTRUM DB RE MAX, TRACES %1-%2, %3-%4 MS, COS2 TAPER 80% FLAT")
+                          .arg(t0)
+                          .arg(t1 - 1)
+                          .arg(s0 * intervalUs / 1000.0, 0, 'f', 0)
+                          .arg(s1 * intervalUs / 1000.0, 0, 'f', 0)
+                          .toStdString());
+    QStringList inputBlocks;
+    inputBlocks << QString("FILE: %1  TRACES: %2-%3  GATE: %4-%5 MS  SAMPLE INTERVAL: %6 US")
+                       .arg(sourceName)
+                       .arg(t0)
+                       .arg(t1 - 1)
+                       .arg(s0 * intervalUs / 1000.0, 0, 'f', 0)
+                       .arg(s1 * intervalUs / 1000.0, 0, 'f', 0)
+                       .arg(intervalUs);
+    QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, t1 - t0, grid.bins, grid.binIntervalUs);
+    segy::BinaryHeader outHeader = ds->binHeader;
+    outHeader.samplesPerTrace = int16_t(grid.bins);
+    outHeader.sampleIntervalUs = int16_t(grid.binIntervalUs);
+
+    struct XfOutcome {
+        bool ok = false;
+        std::string error;
+        segy::LoadResult load;
+    };
+    auto outcome = std::make_shared<XfOutcome>();
+    runBackgroundTask(
+        QString("x-F: %1 traces").arg(t1 - t0),
+        [this, ds, samplesPerTrace, t0, t1, s0, s1, grid, outHeader, textHeader, outPath, outcome]() {
+            const int64_t count = t1 - t0;
+            backgroundTaskTotal_ = count + 1;
+            const int gate = s1 - s0;
+            const std::vector<float> window = segy::cosineSquaredWindow(gate, 80.0);
+            std::vector<segy::WriteTrace> traces(static_cast<size_t>(count));
+            std::vector<float> samples(static_cast<size_t>(samplesPerTrace));
+            float maxAmp = 0.0f;
+            for (int64_t i = 0; i < count; ++i) {
+                const uint8_t* traceBase =
+                    ds->file.data() + segy::kHeaderTotalSize + size_t(t0 + i) * ds->traceStrideBytes;
+                segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples.data(), size_t(samplesPerTrace),
+                                    ds->binHeader.formatCode);
+                segy::WriteTrace& out = traces[size_t(i)];
+                out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                // Trace header: no delay, the x-F sample count and interval
+                // (big-endian int16 at bytes 109, 115 and 117).
+                auto putInt16 = [&out](size_t offset, int value) {
+                    out.headerBytes[offset] = uint8_t((value >> 8) & 0xff);
+                    out.headerBytes[offset + 1] = uint8_t(value & 0xff);
+                };
+                putInt16(108, 0);
+                putInt16(114, grid.bins);
+                putInt16(116, grid.binIntervalUs);
+                out.samples.resize(size_t(grid.bins));
+                segy::xfAmplitudeSpectrum(samples.data() + s0, gate, window, grid, out.samples.data());
+                for (float a : out.samples) maxAmp = std::max(maxAmp, a);
+                backgroundTaskDone_ = i + 1;
+            }
+            // dB re the largest amplitude in view: 0 dB at the maximum.
+            // Silent bins bottom out at -120 dB instead of -inf.
+            for (segy::WriteTrace& tr : traces) {
+                for (float& a : tr.samples) {
+                    a = maxAmp > 0.0f && a > 0.0f ? std::max(-120.0f, float(20.0 * std::log10(double(a) / maxAmp)))
+                                                  : -120.0f;
+                }
+            }
+            if (!segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, &outcome->error)) return;
+            traces.clear();
+            // Own pool: the panel's pool keeps rendering the seismic meanwhile.
+            segy::ThreadPool pool{std::max(1u, std::thread::hardware_concurrency())};
+            outcome->load = segy::loadSegyFile(outPath, pool);
+            outcome->ok = outcome->load.ok;
+            if (!outcome->ok) outcome->error = outcome->load.error;
+            backgroundTaskDone_ = count + 1;
+        },
+        [this, panel, outcome, outPath, history, t0]() {
+            xfAction_->setEnabled(true);
+            if (!outcome->ok) {
+                QMessageBox::warning(this, "x-F Display", QString::fromStdString(outcome->error));
+                refreshAfterDisplaySwap();
+                return;
+            }
+            // The seismic may have changed while this ran (another file, or
+            // x-F already on): only swap onto a still-loaded, plain display.
+            if (!panel->app.loaded || panel->app.xf.active) {
+                refreshAfterDisplaySwap();
+                return;
+            }
+            auto dataset = std::make_shared<Dataset>();
+            dataset->name = outPath.stem().string();
+            dataset->filePath = outPath;
+            dataset->file = std::move(outcome->load.file);
+            dataset->binHeader = outcome->load.binHeader;
+            dataset->traceCount = outcome->load.traceCount;
+            dataset->traceStrideBytes = outcome->load.traceStrideBytes;
+            dataset->pyramid = std::move(outcome->load.pyramid);
+            dataset->processingHistory = history;
+            panel->canvas->enterXfMode(dataset, t0);
+            refreshAfterDisplaySwap();
+        });
+}
+
+void MainWindow::ensureSignalNoiseWindow() {
+    if (signalNoiseWindow_) return;
+    signalNoiseWindow_ = new SignalNoiseWindow(this);
+    signalNoiseWindow_->setParams(prefs_.signalNoise);
+    signalNoiseWindow_->setRecomputeCallback([this]() { computeAndShowSignalNoise(activePanel_); });
+}
+
+void MainWindow::computeAndShowSignalNoise(Panel* sourcePanel) {
+    AppState& app = sourcePanel->app;
+    if (!app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = app.foreground;
+    const int samplesPerTrace = ds->binHeader.samplesPerTrace;
+    const double intervalUs = ds->binHeader.sampleIntervalUs;
+    // The active selection box if there is one, else the visible data --
+    // same choice as everywhere else the user marks "what to analyze".
+    int64_t t0 = 0, t1 = 0;
+    int s0 = 0, s1 = 0;
+    QString sourceText;
+    const SelectionBox* box = activeBox(app);
+    if (box && box->complete) {
+        t0 = int64_t(std::min(box->traceA, box->traceB));
+        t1 = int64_t(std::max(box->traceA, box->traceB));
+        s0 = int(std::min(box->sampleA, box->sampleB));
+        s1 = int(std::max(box->sampleA, box->sampleB));
+        sourceText = "selection box";
+    } else {
+        t0 = int64_t(std::floor(app.view.traceStart));
+        t1 = int64_t(std::ceil(app.view.traceEnd));
+        s0 = int(std::floor(app.view.sampleStart));
+        s1 = int(std::ceil(app.view.sampleEnd));
+        sourceText = "visible data";
+    }
+    t0 = std::clamp<int64_t>(t0, 0, ds->traceCount);
+    t1 = std::clamp<int64_t>(t1, t0, ds->traceCount);
+    s0 = std::clamp(s0, 0, samplesPerTrace);
+    s1 = std::clamp(s1, s0, samplesPerTrace);
+    if (intervalUs <= 0) return;
+
+    ensureSignalNoiseWindow();
+    prefs_.signalNoise = signalNoiseWindow_->params();
+    savePreferences();
+    const segy::SigcorParams params = prefs_.signalNoise;
+    auto result = std::make_shared<segy::SigcorResult>();
+    runBackgroundTask(
+        QString("Signal/Noise: %1 traces").arg(t1 - t0),
+        [this, ds, samplesPerTrace, t0, t1, s0, s1, intervalUs, params, result]() {
+            backgroundTaskDone_ = 0;
+            backgroundTaskTotal_ = 1;
+            auto fetch = [ds, samplesPerTrace](int64_t traceIdx, float* out) {
+                const uint8_t* traceBase =
+                    ds->file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * ds->traceStrideBytes;
+                segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out, size_t(samplesPerTrace),
+                                    ds->binHeader.formatCode);
+            };
+            *result = segy::computeSigcor(fetch, samplesPerTrace, t0, t1, s0, s1, intervalUs, params,
+                                          [this](int done, int total) {
+                                              backgroundTaskTotal_ = total;
+                                              backgroundTaskDone_ = done;
+                                          });
+        },
+        [this, sourcePanel, result, t0, t1, s0, s1, intervalUs, params, sourceText]() {
+            const segy::SigcorResult& r = *result;
+            SignalNoiseDisplay display;
+            QString rejected =
+                QString("%1 below min correlation, %2 at max shift").arg(r.pairsLowCorrelation).arg(r.pairsAtShiftLimit);
+            if (r.pairsDead > 0) rejected += QString(", %1 dead").arg(r.pairsDead);
+            display.info = QString("%1 of %2 pairs (%3) | traces %4-%5, %6-%7 ms (%8) | %9")
+                               .arg(r.pairsUsed)
+                               .arg(r.pairsTotal)
+                               .arg(rejected)
+                               .arg(t0)
+                               .arg(std::max<int64_t>(t0, t1 - 1))
+                               .arg(s0 * intervalUs / 1000.0, 0, 'f', 0)
+                               .arg(s1 * intervalUs / 1000.0, 0, 'f', 0)
+                               .arg(sourceText)
+                               .arg(params.option == segy::SigcorOption::Autcor ? "autocorrelation" : "spectrum");
+            if (r.pairsUsed > 0) {
+                display.info += QString(" | mean shift %1 ms").arg(r.shiftMeanMs, 0, 'f', 2);
+            }
+            if (r.pairsTotal == 0) {
+                display.emptyReason =
+                    QString("Not enough data: need more traces than the trace distance (%1) and at least 8 samples.")
+                        .arg(params.nskip);
+            } else if (r.pairsUsed == 0) {
+                display.emptyReason =
+                    "No trace pair passed Min correlation and Max shift -- try a lower Min correlation or a "
+                    "larger Max shift.";
+            } else {
+                const double ref = *std::max_element(r.tracePower.begin(), r.tracePower.end());
+                const float nan = std::numeric_limits<float>::quiet_NaN();
+                auto toDb = [ref, nan](double power) {
+                    return power > 0.0 && ref > 0.0 ? float(10.0 * std::log10(power / ref)) : nan;
+                };
+                const size_t count = r.frequencyHz.size();
+                display.frequencyHz = r.frequencyHz;
+                display.traceDb.resize(count);
+                display.signalDb.resize(count);
+                display.noiseDb.resize(count);
+                display.snDb.resize(count);
+                for (size_t m = 0; m < count; ++m) {
+                    display.traceDb[m] = toDb(r.tracePower[m]);
+                    display.signalDb[m] = toDb(r.signalPower[m]);
+                    display.noiseDb[m] = toDb(r.noisePower[m]);
+                    display.snDb[m] = r.signalPower[m] > 0.0 && r.noisePower[m] > 0.0
+                                          ? float(10.0 * std::log10(r.signalPower[m] / r.noisePower[m]))
+                                          : nan;
+                }
+                display.shiftSigmaMs = r.shiftSigmaMs;
+                display.shiftMeanMs = r.shiftMeanMs;
+            }
+            ensureSignalNoiseWindow();
+            signalNoiseWindow_->setResult(display);
+            signalNoiseWindow_->setWindowTitle(QString("Signal/Noise") + datasetTitleSuffix(sourcePanel->app));
+            signalNoiseWindow_->show();
+            signalNoiseWindow_->raise();
+            signalNoiseWindow_->activateWindow();
+        });
 }
 
 void MainWindow::openAutocorrelationDialog() {

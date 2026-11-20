@@ -194,6 +194,11 @@ struct Preferences {
     // Toolbar buttons the user switched off (MainWindow::ToolbarItem ids),
     // edited only in Edit > Preferences > Toolbar Buttons.
     QStringList hiddenToolbarItems;
+    // Analysis > Signal/Noise (SIGCOR) parameters, edited in the
+    // Signal/Noise window itself (persisted here). Defaults are the user's own SIPMAP deck:
+    // NSKIP=3 IRANSK=2 SPECTR TCROSS=BASIC SHMAX=30 CCMIN=0.3, cosine-squared
+    // window 5% flat, normalise and remove DC on.
+    segy::SigcorParams signalNoise;
 };
 
 // One toolbar button as Preferences lists it: stable id + display label.
@@ -233,6 +238,25 @@ struct Dataset {
 
 // Same fields as the removed shells' AppState -- one shared struct instead
 // of two divergent copies. Owned by MainWindow, referenced by SegyCanvas.
+// The x-F display toggle (see native/README.md, "x-F display"): while
+// active, the panel shows a computed dataset of per-trace amplitude spectra
+// (dB) and everything the seismic view had is parked here, to be restored
+// verbatim when the toggle goes off.
+struct XfState {
+    bool active = false;
+    std::shared_ptr<Dataset> seismic; // the Foreground to go back to
+    segy::ViewRange view;
+    segy::DisplaySettings display;
+    std::vector<SelectionBox> selectionBoxes;
+    int activeBoxIndex = -1;
+    std::vector<segy::ViewRange> zoomHistory;
+    int64_t traceOffset = 0; // x-F trace 0 = this seismic trace
+    // The x-F color scale, remembered across toggles within a session
+    // (default green -40 dB .. red 0 dB; the user may change it in x-F).
+    segy::ColorScale colorScale = segy::ColorScale::RedYellowGreen;
+    bool colorScaleFlipped = true;
+};
+
 struct AppState {
     segy::ThreadPool pool{std::thread::hardware_concurrency()};
 
@@ -293,6 +317,8 @@ struct AppState {
     std::vector<segy::ViewRange> zoomHistory;
 
     std::vector<uint32_t> pixels;
+
+    XfState xf;
 };
 
 class SegyCanvas;
@@ -313,8 +339,9 @@ struct HoverInfo {
     bool valid = false;
     int64_t traceIdx = 0;
     int32_t seqNum = 0;
-    double timeMs = 0.0;
+    double timeMs = 0.0; // Hz on an x-F display (frequencyAxis)
     float amplitude = 0.0f;
+    bool frequencyAxis = false; // x-F: timeMs is Hz, amplitude is dB
 };
 
 // A tall, narrow amplitude-to-color legend (gradient plus +clip/0/-clip
@@ -338,6 +365,9 @@ public:
     // fraction and the two end labels show their own distinct values.
     void setClipRange(float posClip, float negClip);
     void setColorScale(segy::ColorScale scale, bool flipped);
+    // Value at the middle of the scale (ManualClip::center) and a unit
+    // suffix for the labels -- x-F shows "0 dB" / "-20 dB" / "-40 dB".
+    void setCenter(float center, const QString& unit);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -345,6 +375,8 @@ protected:
 private:
     float posClip_ = 1.0f;
     float negClip_ = 1.0f;
+    float center_ = 0.0f;
+    QString unit_;
     segy::ColorScale colorScale_ = segy::ColorScale::RedWhiteBlue;
     bool colorScaleFlipped_ = false;
 };
@@ -526,24 +558,71 @@ private:
     std::function<void()> onParameters_;
 };
 
-// Paint surface for SpectrumPlotWidget -- same split-out reasoning as
-// HistogramChartArea. Plots computeSpectrum()'s result: amplitude (dB) vs
-// frequency (Hz), one connected line, over regularly-ticked/gridlined axes
-// on both dimensions -- same axes as the reference tool's own Spectra1d
-// window.
-class SpectrumChartArea : public QWidget {
+// One curve of a DbCurveChart: dB values on the chart's shared frequency
+// axis (NaN = no value, the line breaks there).
+struct DbCurve {
+    QString name;
+    QColor color;
+    std::vector<float> db;
+    bool visible = true;
+    bool dashed = false;
+};
+
+// dB vs. frequency line chart shared by Spectrum and Signal/Noise: nice
+// 1-2-5 ticks and gridlines on both axes, one dB axis for every curve, and
+// an optional crosshair that snaps to the nearest frequency bin, marks each
+// visible curve there and reports it through the hover callback (index -1
+// when the cursor leaves) so a CurveReadoutPanel beside it can show values.
+class DbCurveChart : public QWidget {
 public:
-    explicit SpectrumChartArea(QWidget* parent = nullptr);
-    void setResult(const segy::SpectrumResult& result, QColor sourceColor);
+    explicit DbCurveChart(QWidget* parent = nullptr);
+    void setCurves(std::vector<float> frequencyHz, std::vector<DbCurve> curves);
+    void setCurveVisible(int index, bool visible);
+    void setTitle(const QString& title);
+    void setEmptyText(const QString& text);
     void setGridLinesVisible(bool visible);
+    void setCrosshairEnabled(bool enabled);
+    void setHoverCallback(std::function<void(int frequencyIndex, double cursorDb)> callback);
+    const std::vector<float>& frequencies() const { return frequencyHz_; }
+    const std::vector<DbCurve>& curves() const { return curves_; }
 
 protected:
     void paintEvent(QPaintEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void leaveEvent(QEvent* event) override;
 
 private:
-    segy::SpectrumResult result_;
-    QColor sourceColor_ = Qt::white;
+    std::vector<float> frequencyHz_;
+    std::vector<DbCurve> curves_;
+    QString title_ = "Amplitude (dB) vs. Frequency (Hz)";
+    QString emptyText_;
     bool gridLinesVisible_ = true;
+    bool crosshairEnabled_ = true;
+    int hoverIndex_ = -1;
+    double hoverY_ = 0.0;
+    double minDb_ = -60.0, maxDb_ = 0.0;
+    std::function<void(int, double)> onHover_;
+
+    QRect chartRect() const;
+    void updateRange();
+};
+
+// Side panel beside a DbCurveChart, styled like the main window's Trace
+// Info dock: the frequency and dB level under the cursor, then each
+// visible curve's value at that frequency (with its color swatch).
+class CurveReadoutPanel : public QWidget {
+public:
+    explicit CurveReadoutPanel(QWidget* parent = nullptr);
+    // Rebuilds the rows from the chart's curves (names, colors, visibility).
+    void syncRows(const DbCurveChart& chart);
+    // frequencyIndex -1 = cursor outside the chart: every value shows "--".
+    void showValues(const DbCurveChart& chart, int frequencyIndex, double cursorDb);
+
+private:
+    QLabel* frequencyValue_ = nullptr;
+    QLabel* cursorValue_ = nullptr;
+    QWidget* curveRows_ = nullptr;
+    std::vector<std::pair<QWidget*, QLabel*>> rows_; // per curve: row, value label
 };
 
 // Same File/Edit/View/Utilities menu bar shape as HistogramPlotWidget,
@@ -555,7 +634,8 @@ public:
     void setParametersCallback(std::function<void()> callback);
 
 private:
-    SpectrumChartArea* chart_ = nullptr;
+    DbCurveChart* chart_ = nullptr;
+    CurveReadoutPanel* readout_ = nullptr;
     std::function<void()> onParameters_;
 };
 
@@ -1021,6 +1101,48 @@ private:
     std::function<void(double)> onApply_;
 };
 
+// Analysis > Signal/Noise: SIGCOR estimate (segy::computeSigcor) of the
+// active panel's selection box, or its visible data without one. Trace,
+// signal, noise (dB relative to the trace spectrum's peak) and S/N (dB)
+// can each be switched on/off; signal and noise are on by default. The 1
+// sigma of the pair time shifts is always shown above the chart.
+struct SignalNoiseDisplay {
+    std::vector<float> frequencyHz;
+    std::vector<float> traceDb, signalDb, noiseDb, snDb;
+    double shiftSigmaMs = 0.0;
+    double shiftMeanMs = 0.0;
+    QString info; // pairs used/rejected, gate, option
+    QString emptyReason; // non-empty: nothing to plot, show this instead
+};
+
+class SignalNoiseWindow : public QWidget {
+public:
+    explicit SignalNoiseWindow(QWidget* parent = nullptr);
+    void setResult(const SignalNoiseDisplay& display);
+    // The estimation parameters, edited in the window's own parameter rows
+    // beside Recompute (plain names; the SIGCOR card names are in the tooltips).
+    void setParams(const segy::SigcorParams& params);
+    segy::SigcorParams params() const;
+    void setRecomputeCallback(std::function<void()> callback);
+
+private:
+    DbCurveChart* chart_ = nullptr;
+    CurveReadoutPanel* readout_ = nullptr;
+    QCheckBox* curveChecks_[4] = {};
+    QLabel* sigmaLabel_ = nullptr;
+    QLabel* infoLabel_ = nullptr;
+    QComboBox* methodCombo_ = nullptr;
+    QSpinBox* distanceSpin_ = nullptr;
+    QSpinBox* randomSpin_ = nullptr;
+    QDoubleSpinBox* maxShiftSpin_ = nullptr;
+    QDoubleSpinBox* minCorrelationSpin_ = nullptr;
+    QComboBox* shiftPickCombo_ = nullptr;
+    QDoubleSpinBox* flatSpin_ = nullptr;
+    QCheckBox* equalizeCheck_ = nullptr;
+    QCheckBox* removeDcCheck_ = nullptr;
+    std::function<void()> onRecompute_;
+};
+
 // The density-plot canvas: owns drawing and mouse/keyboard input. Reuses
 // the exact same shared renderer/chrome calls the removed shells used.
 class SegyCanvas : public QWidget {
@@ -1047,6 +1169,15 @@ public:
     // it yet.
     void setForegroundDataset(std::shared_ptr<Dataset> dataset);
     void setBackgroundDataset(std::shared_ptr<Dataset> dataset);
+
+    // x-F display toggle: park the seismic Foreground, view, display
+    // settings and selection boxes in AppState::xf and show `xfDataset`
+    // (trace 0 = seismic trace `traceOffset`) with the x-F display
+    // settings; exitXfMode() restores everything as it was. Choosing a
+    // different Foreground while in x-F leaves x-F (display restored, the
+    // parked dataset dropped).
+    void enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOffset);
+    void exitXfMode();
 
     // MainWindow owns the status bar (and, via the callback, the Del
     // button's visibility); handed to the canvas as a plain pointer/
@@ -1303,7 +1434,9 @@ private:
     QAction* octaveBandAction_ = nullptr;
     OctaveBandDialog* octaveBandDialog_ = nullptr;
     QAction* autocorrelationAction_ = nullptr;
+    QAction* xfAction_ = nullptr;
     AutocorrelationDialog* autocorrelationDialog_ = nullptr;
+    SignalNoiseWindow* signalNoiseWindow_ = nullptr;
 
     // Dataset pool: every dataset either panel has ever loaded/computed,
     // kept alive here independent of which panel's Foreground/Background
@@ -1350,6 +1483,7 @@ private:
     QLabel* traceValueLabel_ = nullptr;
     QLabel* seqValueLabel_ = nullptr;
     QLabel* timeValueLabel_ = nullptr;
+    QLabel* timeCaptionLabel_ = nullptr; // "Time", or "Frequency" while hovering an x-F display
     QLabel* amplitudeValueLabel_ = nullptr;
 
     // Edit > Preferences -- app-wide, persisted to $HOME/.segyread_settings
@@ -1503,6 +1637,17 @@ private:
     // `lengthMs`, shown in autocorrelationDialog_ (background task).
     void computeAndShowAutocorrelation(Panel* sourcePanel, double lengthMs);
     void openAutocorrelationDialog();
+    // Signal/Noise (SIGCOR, prefs_.signalNoise) of `sourcePanel`'s active
+    // selection box, or its visible data without one; background task,
+    // shown in signalNoiseWindow_.
+    void computeAndShowSignalNoise(Panel* sourcePanel);
+    void ensureSignalNoiseWindow();
+    // x-F toggle for the active panel: on computes the amplitude spectra
+    // of the visible traces over the visible time range (background task)
+    // and swaps them in; off restores the seismic.
+    void toggleXf(Panel* panel, bool on);
+    void refreshAfterDisplaySwap();
+    void openPreferencesDialog();
 
     void openCalculatorDialog();
     void openBandpassDialog();
