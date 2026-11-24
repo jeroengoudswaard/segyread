@@ -31,6 +31,7 @@
 #include "iirfilter.h"
 #include "trace_header_defs.h"
 #include "horizons.h"
+#include "depth_conversion.h"
 #include <complex>
 
 namespace {
@@ -1768,6 +1769,60 @@ void testCrossCorrelationAndSidePeak() {
     CHECK(std::isnan(segy::nearestSidePeakLag(noise, -40, 0.5)));
 }
 
+void testDepthConversion() {
+    // Constant interval velocity 2000 m/s, 4 ms: 1 s TWT = 1000 m.
+    std::vector<float> constant(1001, 2000.0f);
+    segy::TimeDepthMap map = segy::buildTimeDepthMap(constant.data(), 1001, 0.004, false, segy::VelocityType::Interval);
+    CHECK_NEAR(map.depthAt(1.0), 1000.0, 1e-6);
+    CHECK_NEAR(map.timeAt(500.0), 0.5, 1e-9);
+    CHECK_NEAR(map.depthAt(5.0), 5000.0, 1e-6); // past the end: the tail velocity
+    // Two layers: 1500 m/s to 1 s, then 2500 m/s. 2 s TWT = 750 + 1250 m.
+    const int n = 751;
+    const double dt = 0.004;
+    std::vector<float> rms(n), average(n), interval(n);
+    for (int i = 0; i < n; ++i) {
+        const double t = i * dt;
+        interval[size_t(i)] = t <= 1.0 + 1e-9 ? 1500.0f : 2500.0f;
+        const double z = 750.0 * std::min(t, 1.0) + 1250.0 * std::max(0.0, t - 1.0);
+        average[size_t(i)] = i == 0 ? 1500.0f : float(2.0 * z / t);
+        const double sum = 1500.0 * 1500.0 * std::min(t, 1.0) + 2500.0 * 2500.0 * std::max(0.0, t - 1.0);
+        rms[size_t(i)] = i == 0 ? 1500.0f : float(std::sqrt(sum / t));
+    }
+    for (auto [trace, type] : {std::pair{&interval, segy::VelocityType::Interval},
+                               std::pair{&average, segy::VelocityType::Average},
+                               std::pair{&rms, segy::VelocityType::Rms}}) {
+        segy::TimeDepthMap m = segy::buildTimeDepthMap(trace->data(), n, dt, false, type);
+        CHECK_NEAR(m.depthAt(1.0), 750.0, 0.5);
+        CHECK_NEAR(m.depthAt(2.0), 2000.0, 0.5);
+        CHECK_NEAR(m.timeAt(2000.0), 2.0, 1e-3);
+    }
+    // Velocity in depth: 2000 m/s every 5 m -- 1000 m is 1 s TWT.
+    std::vector<float> inDepth(401, 2000.0f);
+    segy::TimeDepthMap depthMap = segy::buildTimeDepthMap(inDepth.data(), 401, 5.0, true, segy::VelocityType::Interval);
+    CHECK_NEAR(depthMap.timeAt(1000.0), 1.0, 1e-9);
+    std::string error;
+    CHECK(segy::buildTimeDepthMap(inDepth.data(), 401, 5.0, true, segy::VelocityType::Rms, &error).time.empty());
+    CHECK(!error.empty());
+    // A spike at 1 s goes to 1000 m and back to 1 s.
+    std::vector<float> timeTrace(1001, 0.0f);
+    timeTrace[250] = 1.0f;
+    std::vector<float> depthTrace(301), back(1001);
+    segy::convertTrace(timeTrace.data(), 1001, 0.004, map, true, depthTrace.data(), 301, 8.0);
+    const auto peakAt = [](const std::vector<float>& v) { return int(std::max_element(v.begin(), v.end()) - v.begin()); };
+    CHECK(peakAt(depthTrace) == 125); // 1000 m / 8 m
+    segy::convertTrace(depthTrace.data(), 301, 8.0, map, false, back.data(), 1001, 0.004);
+    CHECK(peakAt(back) == 250);
+    // CDP interpolation: halfway, and the nearest outside the range.
+    std::vector<std::vector<float>> velocities = {std::vector<float>(3, 1000.0f), std::vector<float>(3, 2000.0f)};
+    float v[3];
+    segy::interpolateVelocity({100, 200}, velocities, 150, 3, v);
+    CHECK_NEAR(v[1], 1500.0, 1e-3);
+    segy::interpolateVelocity({100, 200}, velocities, 50, 3, v);
+    CHECK_NEAR(v[1], 1000.0, 1e-3);
+    segy::interpolateVelocity({100, 200}, velocities, 900, 3, v);
+    CHECK_NEAR(v[1], 2000.0, 1e-3);
+}
+
 void testHorizons() {
     section("Horizons: snap to event, seabed auto-pick with outlier repair, point-to-point picks, flatten");
     const double pi = 3.14159265358979323846;
@@ -2031,6 +2086,7 @@ int main() {
     testTraceHeaderDefinitions();
     testCrossCorrelationAndSidePeak();
     testHorizons();
+    testDepthConversion();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

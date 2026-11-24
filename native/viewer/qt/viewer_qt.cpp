@@ -68,6 +68,7 @@
 #include <map>
 #include <complex>
 #include "fft.h"
+#include "depth_conversion.h"
 #include <atomic>
 #include <QRegularExpression>
 #include <QToolButton>
@@ -5145,6 +5146,7 @@ HoverInfo SegyCanvas::currentHoverInfo() const {
     info.timeMs = double(sampleIdx) * (app_.foreground->binHeader.sampleIntervalUs / 1000.0);
     info.amplitude = value;
     info.frequencyAxis = app_.display.frequencyAxis;
+    info.depthAxis = app_.display.depthAxis;
     info.dataset = app_.foreground.get();
     info.sourceCanvas = this;
     info.traceCoord = traceCoord;
@@ -5901,7 +5903,9 @@ void SegyCanvas::showAxisRangeMenu(const QPoint& globalPos) {
         const double offset = app_.xf.active ? double(app_.xf.traceOffset) : 0.0;
         double x0 = app_.view.traceStart + offset, x1 = app_.view.traceEnd + offset;
         double y0 = app_.view.sampleStart * sampleMs, y1 = app_.view.sampleEnd * sampleMs;
-        const QString yName = app_.display.frequencyAxis ? "Frequency (Hz)" : "Time (ms)";
+        const QString yName = app_.display.frequencyAxis ? "Frequency (Hz)"
+                              : app_.display.depthAxis   ? "Depth (m)"
+                                                         : "Time (ms)";
         if (!editAxisRanges(this, "Axis Ranges", "Trace", yName, x0, x1, y0, y1, 0, 2)) return;
         next.traceStart = x0 - offset;
         next.traceEnd = x1 - offset;
@@ -6115,6 +6119,7 @@ void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
     app_.foreground = std::move(dataset);
     app_.loaded = true;
     app_.flatten = FlattenState{}; // a flattened display ends with any new Foreground
+    app_.display.depthAxis = app_.foreground->depth;
     applyDefaultSortIdents(app_);
     segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
     // A newly-active dataset invalidates any boxes drawn against the
@@ -6187,6 +6192,14 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
                     dataset->traceStrideBytes = result.traceStrideBytes;
                     dataset->pyramid = std::move(result.pyramid);
                     dataset->processingHistory = std::move(processingHistory);
+                    // The domain follows the last "DOMAIN: ..." history line
+                    // (a dataset derived from depth data is depth too).
+                    for (auto it = dataset->processingHistory.rbegin(); it != dataset->processingHistory.rend(); ++it) {
+                        if (it->rfind("DOMAIN: ", 0) == 0) {
+                            dataset->depth = it->find("DEPTH") != std::string::npos;
+                            break;
+                        }
+                    }
                     if (onLoaded) {
                         app_.loaded = true; // the current Foreground is still there
                         onLoaded(dataset);
@@ -6309,6 +6322,21 @@ MainWindow::MainWindow() : QMainWindow() {
     viewMenu->addAction("&Fit to Window");
     viewMenu->addSeparator();
 
+    QMenu* domainMenu = viewMenu->addMenu("Data &Domain");
+    {
+        QActionGroup* domainGroup = new QActionGroup(this);
+        domainTimeAction_ = domainMenu->addAction("&Time");
+        domainDepthAction_ = domainMenu->addAction("&Depth");
+        for (QAction* a : {domainTimeAction_, domainDepthAction_}) {
+            a->setCheckable(true);
+            domainGroup->addAction(a);
+        }
+        domainTimeAction_->setChecked(true);
+        domainTimeAction_->setToolTip("The Foreground's samples are two-way time (ms)");
+        domainDepthAction_->setToolTip("The Foreground's samples are depth (m)");
+        connect(domainTimeAction_, &QAction::triggered, this, [this]() { setDatasetDomain(activePanel_, false); });
+        connect(domainDepthAction_, &QAction::triggered, this, [this]() { setDatasetDomain(activePanel_, true); });
+    }
     QMenu* datasetLabelsMenu = viewMenu->addMenu("Dataset Labels");
     QActionGroup* datasetLabelsGroup = new QActionGroup(this);
     const std::pair<const char*, DatasetLabelPosition> labelPositions[] = {
@@ -6401,6 +6429,8 @@ MainWindow::MainWindow() : QMainWindow() {
         QAction* importAction = horizonsMenu->addAction("&Import Horizon (CSV)...");
         connect(importAction, &QAction::triggered, this, [this]() { importHorizon(activePanel_); });
     }
+    QAction* timeDepthAction = processingMenu->addAction("&Time-Depth Conversion...");
+    connect(timeDepthAction, &QAction::triggered, this, &MainWindow::openTimeDepthConversion);
     QMenu* traceMathMenu = processingMenu->addMenu("Trace &Math");
     QAction* scaleAction = traceMathMenu->addAction("&Scale...");
     connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
@@ -7529,6 +7559,9 @@ void MainWindow::setActivePanel(Panel* panel) {
     refreshAmplitudeProcessingControls();
     xfAction_->setChecked(app_->xf.active);
     if (flattenAction_) flattenAction_->setChecked(app_->flatten.active);
+    if (domainDepthAction_) {
+        (app_->foreground->depth ? domainDepthAction_ : domainTimeAction_)->setChecked(true);
+    }
     lockViewAction_->setChecked(app_->viewLocked);
     // Analyses that assume a time series mean nothing on an x-f display
     // (its samples are frequency bins in dB). Histogram stays: a
@@ -7786,13 +7819,13 @@ void MainWindow::updateHoverInfo(const HoverInfo& info) {
     }
     traceValueLabel_->setText(QString::number(info.traceIdx));
     seqValueLabel_->setText(QString::number(info.seqNum));
-    if (timeCaptionLabel_) timeCaptionLabel_->setText(info.frequencyAxis ? "Frequency" : "Time");
+    if (timeCaptionLabel_) timeCaptionLabel_->setText(info.frequencyAxis ? "Frequency" : info.depthAxis ? "Depth" : "Time");
     if (info.frequencyAxis) {
         timeValueLabel_->setText(QString("%1 Hz").arg(info.timeMs, 0, 'f', 2));
         amplitudeValueLabel_->setText(QString("%1 dB").arg(double(info.amplitude), 0, 'f', 1));
         return;
     }
-    timeValueLabel_->setText(QString("%1 ms").arg(info.timeMs, 0, 'f', 1));
+    timeValueLabel_->setText(QString(info.depthAxis ? "%1 m" : "%1 ms").arg(info.timeMs, 0, 'f', 1));
     amplitudeValueLabel_->setText(QString::number(info.amplitude, 'f', 2));
 }
 
@@ -10163,6 +10196,7 @@ void MainWindow::runFlatten(Panel* panel, std::vector<double> sourceMs, double r
             panel->canvas->startLoading(outPath, history, [this, panel, ds, filled, referenceMs](std::shared_ptr<Dataset> flat) {
                 const segy::ViewRange view = panel->app.view;
                 flat->name = ds->name + " (flattened)";
+                flat->depth = ds->depth;
                 // The horizons, flattened along: horizon time - (source - reference).
                 for (const Horizon& h : ds->horizons) {
                     Horizon copy = h;
@@ -10269,6 +10303,253 @@ void MainWindow::writeHorizonToHeader(Panel* panel) {
         [this, panel, outPath, history, outcome]() {
             if (!outcome->ok) {
                 QMessageBox::warning(this, "Write Horizon to Header", QString::fromStdString(outcome->error));
+                return;
+            }
+            panel->canvas->startLoading(outPath, history);
+        });
+}
+
+void MainWindow::setDatasetDomain(Panel* panel, bool depth) {
+    if (!panel->app.loaded || panel->app.xf.active) {
+        setActivePanel(activePanel_);
+        return;
+    }
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    if (ds->depth != depth) {
+        // An annotation like the horizons (UI thread only): derived datasets
+        // inherit it through the history line.
+        ds->depth = depth;
+        ds->processingHistory.push_back(depth ? "DOMAIN: DEPTH" : "DOMAIN: TIME");
+        for (Panel* p : {&panelA_, &panelB_}) {
+            if (p->app.foreground != ds) continue;
+            p->app.display.depthAxis = depth;
+            p->canvas->update();
+        }
+        flashStatusMessage(QString("%1 is now %2 data").arg(QString::fromStdString(ds->name), depth ? "depth" : "time"));
+    }
+    setActivePanel(activePanel_);
+}
+
+void MainWindow::openTimeDepthConversion() {
+    Panel* panel = activePanel_;
+    if (!panel->app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    if (panel->app.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    const bool toDepth = !ds->depth;
+    std::vector<std::shared_ptr<Dataset>> candidates;
+    for (const auto& d : datasetPool_) {
+        if (d != ds && QString::fromStdString(d->attribute).contains("velocity", Qt::CaseInsensitive)) candidates.push_back(d);
+    }
+    for (const auto& d : datasetPool_) { // other datasets too, after the tagged velocities
+        if (d != ds && std::find(candidates.begin(), candidates.end(), d) == candidates.end()) candidates.push_back(d);
+    }
+    if (candidates.empty()) {
+        QMessageBox::information(this, "Time-Depth Conversion",
+                                 "Load a velocity model first (File > Read Attribute SEG-Y).");
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QString(toDepth ? "Time to Depth" : "Depth to Time") + datasetTitleSuffix(panel->app));
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    QLabel* intro = new QLabel(
+        toDepth ? "The Foreground is time data: converts it to depth (below sea level, no datum correction)."
+                : "The Foreground is depth data: converts it to two-way time.");
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+    QGridLayout* grid = new QGridLayout();
+    QComboBox* velocityCombo = new QComboBox();
+    for (const auto& d : candidates) {
+        QString label = QString::fromStdString(d->name);
+        if (!d->attribute.empty()) label += "  (" + QString::fromStdString(d->attribute) + ")";
+        velocityCombo->addItem(label);
+    }
+    QComboBox* typeCombo = new QComboBox();
+    typeCombo->addItem("Interval velocity", int(segy::VelocityType::Interval));
+    typeCombo->addItem("Average velocity", int(segy::VelocityType::Average));
+    typeCombo->addItem("RMS velocity (Dix)", int(segy::VelocityType::Rms));
+    QComboBox* velocityDomain = new QComboBox();
+    velocityDomain->addItem("in time", 0);
+    velocityDomain->addItem("in depth", 1);
+    QDoubleSpinBox* intervalSpin = new QDoubleSpinBox();
+    intervalSpin->setRange(0.1, 32.0);
+    intervalSpin->setDecimals(1);
+    intervalSpin->setSuffix(toDepth ? " m" : " ms");
+    intervalSpin->setValue(toDepth ? 8.0 : 4.0); // decided defaults
+    QDoubleSpinBox* lengthSpin = new QDoubleSpinBox();
+    lengthSpin->setRange(1.0, 1e6);
+    lengthSpin->setDecimals(0);
+    lengthSpin->setSuffix(toDepth ? " m" : " ms");
+    grid->addWidget(new QLabel("Velocity"), 0, 0);
+    grid->addWidget(velocityCombo, 0, 1, 1, 2);
+    grid->addWidget(new QLabel("Type"), 1, 0);
+    grid->addWidget(typeCombo, 1, 1);
+    grid->addWidget(velocityDomain, 1, 2);
+    grid->addWidget(new QLabel("Output sample interval"), 2, 0);
+    grid->addWidget(intervalSpin, 2, 1);
+    grid->addWidget(new QLabel(toDepth ? "Maximum depth" : "Maximum time"), 3, 0);
+    grid->addWidget(lengthSpin, 3, 1);
+    layout->addLayout(grid);
+    QLabel* note = new QLabel("The velocity model is matched on CDP and interpolated between CDPs; "
+                              "its own sampling is interpolated linearly. Velocities in m/s.");
+    note->setWordWrap(true);
+    note->setStyleSheet("color: #9a9ca3;");
+    layout->addWidget(note);
+    QLineEdit* nameEdit = new QLineEdit(QString::fromStdString(ds->name) + (toDepth ? "_depth" : "_time"));
+    layout->addWidget(nameEdit);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    buttons->addStretch();
+    QPushButton* ok = new QPushButton("Convert");
+    QPushButton* cancel = new QPushButton("Cancel");
+    ok->setDefault(true);
+    buttons->addWidget(ok);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+
+    const double inputUnit = ds->binHeader.sampleIntervalUs / (toDepth ? 1e6 : 1000.0); // s or m
+    const double inputLength = inputUnit * std::max(0, ds->binHeader.samplesPerTrace - 1);
+    auto velocityInterval = [](const Dataset& v, bool inDepth) {
+        return v.binHeader.sampleIntervalUs / (inDepth ? 1000.0 : 1e6);
+    };
+    // Defaults from the chosen velocity: its tag, its domain flag, and the
+    // output length that covers the input (from its first trace).
+    auto refreshDefaults = [&](bool fromTag) {
+        const std::shared_ptr<Dataset>& v = candidates[size_t(velocityCombo->currentIndex())];
+        if (fromTag) {
+            const QString tag = QString::fromStdString(v->attribute);
+            if (tag.contains("RMS", Qt::CaseInsensitive)) typeCombo->setCurrentIndex(2);
+            else if (tag.contains("Average", Qt::CaseInsensitive)) typeCombo->setCurrentIndex(1);
+            else typeCombo->setCurrentIndex(0);
+            velocityDomain->setCurrentIndex(v->depth ? 1 : 0);
+        }
+        const int count = v->binHeader.samplesPerTrace;
+        std::string error;
+        segy::TimeDepthMap map;
+        if (v->traceCount > 0 && count > 0) {
+            std::vector<float> trace(static_cast<size_t>(count));
+            segy::decodeSamples(v->file.data() + segy::kHeaderTotalSize + segy::kTraceHeaderSize, trace.data(),
+                                size_t(count), v->binHeader.formatCode);
+            map = segy::buildTimeDepthMap(trace.data(), count, velocityInterval(*v, velocityDomain->currentIndex() == 1),
+                                          velocityDomain->currentIndex() == 1,
+                                          segy::VelocityType(typeCombo->currentData().toInt()), &error);
+        }
+        ok->setEnabled(!map.time.empty());
+        ok->setToolTip(map.time.empty() ? QString::fromStdString(error) : QString());
+        if (map.time.empty()) return;
+        lengthSpin->setValue(toDepth ? std::ceil(map.depthAt(inputLength) / 100.0) * 100.0
+                                     : std::ceil(map.timeAt(inputLength) * 1000.0 / 100.0) * 100.0);
+    };
+    refreshDefaults(true);
+    connect(velocityCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&](int) { refreshDefaults(true); });
+    connect(typeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&](int) { refreshDefaults(false); });
+    connect(velocityDomain, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog,
+            [&](int) { refreshDefaults(false); });
+    connect(ok, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    std::shared_ptr<Dataset> velocity = candidates[size_t(velocityCombo->currentIndex())];
+    const auto type = segy::VelocityType(typeCombo->currentData().toInt());
+    const bool velocityInDepth = velocityDomain->currentIndex() == 1;
+    const double velocityStep = velocityInterval(*velocity, velocityInDepth);
+    const double outputStep = toDepth ? intervalSpin->value() : intervalSpin->value() / 1000.0; // m or s
+    const int outputCount = std::clamp(int(std::floor(lengthSpin->value() / intervalSpin->value())) + 1, 2, 32767);
+    const int16_t outputIntervalHeader = int16_t(std::lround(intervalSpin->value() * 1000.0)); // mm or us
+    const QString outputName = nameEdit->text();
+    std::vector<std::string> history = ds->processingHistory;
+    history.push_back(QString("%1 CONVERSION, %2 %3 (%4), D%5 %6")
+                          .arg(toDepth ? "TIME TO DEPTH" : "DEPTH TO TIME")
+                          .arg(typeCombo->currentText().toUpper())
+                          .arg(QString::fromStdString(velocity->name).toUpper())
+                          .arg(velocityInDepth ? "IN DEPTH" : "IN TIME")
+                          .arg(toDepth ? "Z" : "T")
+                          .arg(toDepth ? QString("%1 M").arg(intervalSpin->value()) : QString("%1 MS").arg(intervalSpin->value()))
+                          .toStdString());
+    history.push_back(toDepth ? "DOMAIN: DEPTH" : "DOMAIN: TIME");
+    const std::filesystem::path outPath = scratchSegyPath(outputName);
+    struct Outcome {
+        bool ok = false;
+        std::string error;
+    };
+    auto outcome = std::make_shared<Outcome>();
+    runBackgroundTask(
+        QString("%1: %2").arg(toDepth ? "Time to depth" : "Depth to time", QString::fromStdString(ds->name)),
+        [this, ds, velocity, type, velocityInDepth, velocityStep, toDepth, inputUnit, outputStep, outputCount,
+         outputIntervalHeader, outPath, history, outputName, outcome]() {
+            // The velocity traces by CDP (ascending; the first of equal CDPs).
+            const int vCount = velocity->binHeader.samplesPerTrace;
+            std::vector<std::pair<int64_t, int64_t>> byCdp; // cdp, trace
+            for (int64_t t = 0; t < velocity->traceCount; ++t) {
+                const uint8_t* base = velocity->file.data() + segy::kHeaderTotalSize + size_t(t) * velocity->traceStrideBytes;
+                byCdp.push_back({segy::parseTraceHeader(base).cdp, t});
+            }
+            std::stable_sort(byCdp.begin(), byCdp.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            byCdp.erase(std::unique(byCdp.begin(), byCdp.end(), [](const auto& a, const auto& b) { return a.first == b.first; }),
+                        byCdp.end());
+            std::vector<int64_t> cdps;
+            std::vector<std::vector<float>> velocities;
+            for (const auto& [cdp, t] : byCdp) {
+                cdps.push_back(cdp);
+                std::vector<float> v(static_cast<size_t>(vCount));
+                const uint8_t* base = velocity->file.data() + segy::kHeaderTotalSize + size_t(t) * velocity->traceStrideBytes;
+                segy::decodeSamples(base + segy::kTraceHeaderSize, v.data(), size_t(vCount), velocity->binHeader.formatCode);
+                velocities.push_back(std::move(v));
+            }
+            if (velocities.empty() || vCount < 1) {
+                outcome->error = "The velocity dataset has no traces.";
+                return;
+            }
+            const int samplesPerTrace = ds->binHeader.samplesPerTrace;
+            backgroundTaskTotal_ = ds->traceCount;
+            std::vector<segy::WriteTrace> traces(size_t(ds->traceCount));
+            std::atomic<int64_t> done{0};
+            std::mutex errorMutex;
+            segy::ThreadPool pool;
+            pool.parallelFor(size_t(ds->traceCount), 32, [&](size_t begin, size_t end) {
+                std::vector<float> v(static_cast<size_t>(vCount)), input(static_cast<size_t>(samplesPerTrace));
+                for (size_t t = begin; t < end; ++t) {
+                    const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
+                    segy::interpolateVelocity(cdps, velocities, segy::parseTraceHeader(base).cdp, vCount, v.data());
+                    std::string error;
+                    const segy::TimeDepthMap map =
+                        segy::buildTimeDepthMap(v.data(), vCount, velocityStep, velocityInDepth, type, &error);
+                    segy::WriteTrace& out = traces[t];
+                    out.headerBytes.assign(base, base + segy::kTraceHeaderSize);
+                    writeHeaderIntBigEndian(out.headerBytes, 115, 2, outputCount);
+                    writeHeaderIntBigEndian(out.headerBytes, 117, 2, outputIntervalHeader);
+                    out.samples.assign(size_t(outputCount), 0.0f);
+                    if (map.time.empty()) {
+                        std::lock_guard<std::mutex> lock(errorMutex);
+                        outcome->error = error;
+                    } else {
+                        segy::decodeSamples(base + segy::kTraceHeaderSize, input.data(), size_t(samplesPerTrace),
+                                            ds->binHeader.formatCode);
+                        segy::convertTrace(input.data(), samplesPerTrace, inputUnit, map, toDepth, out.samples.data(),
+                                           outputCount, outputStep);
+                    }
+                    backgroundTaskDone_ = done.fetch_add(1) + 1;
+                }
+            });
+            if (!outcome->error.empty()) return;
+            segy::BinaryHeader binHeader = ds->binHeader;
+            binHeader.samplesPerTrace = int16_t(outputCount);
+            binHeader.sampleIntervalUs = outputIntervalHeader;
+            QStringList inputBlocks;
+            inputBlocks << QString("FILE: %1  VELOCITY: %2")
+                               .arg(QString::fromStdString(ds->name), QString::fromStdString(velocity->name));
+            const QString textHeader =
+                buildSegyTextHeader(inputBlocks, history, outputName, ds->traceCount, outputCount, outputIntervalHeader);
+            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), binHeader, traces, &outcome->error);
+        },
+        [this, panel, outPath, history, outcome]() {
+            if (!outcome->ok) {
+                QMessageBox::warning(this, "Time-Depth Conversion", QString::fromStdString(outcome->error));
                 return;
             }
             panel->canvas->startLoading(outPath, history);

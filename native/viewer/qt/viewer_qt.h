@@ -260,6 +260,11 @@ struct Dataset {
     // exception to "never mutate a Dataset in place".
     std::vector<Horizon> horizons;
     int activeHorizon = -1;
+    // Domain flag (SEG-Y does not record it): false = time (the default),
+    // true = depth (samples in m, sample interval in mm). Set by View >
+    // Data Domain or by Time-Depth Conversion; derived datasets inherit it
+    // through the "DOMAIN: ..." line of their processing history.
+    bool depth = false;
 };
 
 // Same fields as the removed shells' AppState -- one shared struct instead
@@ -381,6 +386,7 @@ struct HoverInfo {
     double timeMs = 0.0; // Hz on an x-f display (frequencyAxis)
     float amplitude = 0.0f;
     bool frequencyAxis = false; // x-f: timeMs is Hz, amplitude is dB
+    bool depthAxis = false;     // depth data: timeMs is m
     const Dataset* dataset = nullptr; // the hovered panel's Foreground (Trace Inspector's Follow cursor)
     const void* sourceCanvas = nullptr; // the hovered SegyCanvas (linked crosshair)
     double traceCoord = 0.0;            // continuous trace position under the cursor
@@ -1799,6 +1805,11 @@ private:
     void runFlatten(Panel* panel, std::vector<double> sourceMs, double referenceMs, bool newDataset,
                     const QString& outputName, const QString& historyLine);
     void writeHorizonToHeader(Panel* panel);
+    // Data domain (View > Data Domain) and Processing > Time-Depth Conversion.
+    QAction* domainTimeAction_ = nullptr;
+    QAction* domainDepthAction_ = nullptr;
+    void setDatasetDomain(Panel* panel, bool depth);
+    void openTimeDepthConversion();
     QAction* linkedCrosshairAction_ = nullptr;
     bool pendingBoxZoom_ = false; // Zoom clicked without a box: zoom once one is drawn
     void sendZoomToOtherPanel();

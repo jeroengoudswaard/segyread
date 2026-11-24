@@ -3217,6 +3217,52 @@ segytest; the Qt shell converts samples to ms.
   picking with the mouse (covered by the `pickBetween` test), the
   Horizon Manager buttons, CSV round trip, Write Horizon to Header.
 
+### Time-depth conversion and the data domain
+
+**Domain flag.** SEG-Y does not say whether samples are time or depth, so
+every dataset has a flag, `Dataset::depth`, time by default. View > Data
+Domain sets it for the Foreground. Depth data keeps the convention that
+the sample interval field holds mm (8 m = 8000), so all the "ms"
+arithmetic reads as metres. Only the labels change: the axis says
+"Depth (m)" (`DisplaySettings::depthAxis`, `chrome.cpp`), and so do
+Trace Info and Axis Ranges. The flag is stored as a `DOMAIN: DEPTH` or
+`DOMAIN: TIME` line in the processing history. A dataset derived from
+depth data (bandpass, flatten, ...) inherits that line, so it is depth
+too. `SegyCanvas::startLoading` reads the last such line.
+
+**Processing > Time-Depth Conversion.** The direction follows the
+Foreground's domain: time data goes to depth, depth data to two-way time.
+The core is `viewer/depth_conversion.h/.cpp` (Qt-free, tested):
+
+- **Velocity:** any dataset in the list. Datasets read with Read Attribute
+  SEG-Y and tagged as a velocity come first. The type is interval,
+  average or RMS (default from the tag), in time or in depth (default
+  from the velocity dataset's own flag). RMS is turned into interval
+  velocity with Dix; RMS in depth is refused. Velocities are in m/s.
+- **Matching:** velocity traces are sorted on CDP. Each seismic trace gets
+  the linear interpolation between the two neighbouring velocity CDPs,
+  or the nearest one outside their range. The velocity's own sampling is
+  interpolated linearly. Past its end, the last interval velocity
+  continues.
+- **Mapping:** per trace a monotonic (two-way time, depth) table
+  (`buildTimeDepthMap`). The seismic is resampled through it with linear
+  interpolation (`convertTrace`). Depth is below the data's zero (sea
+  level); there is no datum correction, as decided.
+- **Output:** a new dataset, 8 m (depth) or 4 ms (time) by default, both
+  adjustable. The default length covers the input, using the first
+  velocity trace. Trace header bytes 115-118 and the binary header get
+  the new sample count and interval.
+- **Tests:** constant velocity (1 s = 1000 m at 2000 m/s, and past the
+  end); a two-layer model given as interval, average and RMS gives the
+  same depths (750 m at 1 s, 2000 m at 2 s); velocity in depth; RMS in
+  depth refused; a spike at 1 s lands at 1000 m and comes back at 1 s;
+  CDP interpolation.
+- **Checked by screenshot** on PARAGON with a synthetic velocity model
+  (five CDPs, 8 ms sampling, water 1500 m/s down to the seabed). The
+  seabed lands at about 3040 m on the left (4.05 s) and 1400 m on the
+  right. The depth axis reads "Depth (m)". Converting back to time gives
+  the original section.
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`

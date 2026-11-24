@@ -68,6 +68,10 @@ struct DisplaySettings {
     // bins and the sample interval in us is chosen so that "ms" reads as
     // Hz, so this only changes the axis title/unit to "Frequency (Hz)".
     bool frequencyAxis = false;
+    // Depth data (the dataset's domain flag, see "Time-depth conversion"):
+    // samples are metres and the sample interval in us is mm, so "ms"
+    // reads as m; only the axis title/unit change to "Depth (m)".
+    bool depthAxis = false;
 };
 
 struct TimeTick {
