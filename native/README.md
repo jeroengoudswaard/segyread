@@ -2991,6 +2991,41 @@ average velocity, RMS velocity, delta, epsilon or eta.
   modal and couldn't be driven from a script. The load path is the same
   as Open's.
 
+### File > Trace Inspector
+
+One trace at a time.
+
+- **Left:** its 240-byte header, decoded field by field: name, bytes,
+  value and description. Unused bytes are dimmed and shown as hex, or 0.
+- **Right:** its samples (number, time, value) and a small wiggle, with
+  positive lobes filled and scaled to the trace's own peak.
+
+**Definition** (drop-down), in `viewer/trace_header_defs.*` (Qt-free):
+- **Shell V2.1** (default): from Shell's "SEGY trace identing" document,
+  e.g. tidal static at 41-44, seabed TWT at 57-60, surface-consistent
+  amplitude scalars at 141-156, gun volume, edit flags at 223-224,
+  sailed line at 235-238.
+- **SEG-Y rev 1.0.**
+- **SEG-Y rev 2.0:** rev 1.0 with bytes 233-240 as the trace header name
+  ("SEG00000" or zeros) and the longer trace-identification code list.
+- **Field kinds:** 2- and 4-byte integers, 6-byte mantissa × 10^exponent
+  (transduction constant, source measurement), three 2-byte values
+  (source energy direction), text and unassigned.
+- **Tested:** each definition tiles bytes 1-240 with no gaps or overlaps.
+  Reading works in both byte orders.
+
+**Controls:**
+- **Trace:** a 1-based number. **Follow cursor** (on by default) shows
+  the trace under the mouse on either panel, but not on an x-f display.
+- **Header byte order:** big endian (the default) or little endian.
+- **Samples:** decoded in the file's own sample format.
+
+**Verified** against the user's RadExPro screenshot of the same PARAGON
+trace: depths 800/1800, seabed TWT 405097, water depths
+302397/301937, scalars −100, source X 35233554, and so on. Follow cursor
+was not checked by script: the inspector window covers the seismic, so
+the scripted mouse never reached it.
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`

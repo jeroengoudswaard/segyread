@@ -40,7 +40,7 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 19. **Read Attribute SEG-Y** — Separate input for velocity models and other attributes (interval, average, RMS velocity, delta, epsilon, eta), tagged at load, listed in the dataset list, not shown automatically, meant as background. *Status: done — File > Read Attribute SEG-Y; Background display itself is still to come.*
 
-20. **Trace Inspector (open)** — Per-trace header table (name, byte offset, value, description) plus the trace's samples with a small wiggle, after the user's RadExPro screenshot. Header definition selectable: SEG-Y rev 1.0, rev 2.0, Shell V2.1 (default; from the user's "SEGY trace identing" document, bytes 1-240). *Status: to do.*
+20. **Trace Inspector (open)** — Per-trace header table (name, byte offset, value, description) plus the trace's samples with a small wiggle, after the user's RadExPro screenshot. Header definition selectable: SEG-Y rev 1.0, rev 2.0, Shell V2.1 (default; from the user's "SEGY trace identing" document, bytes 1-240). *Status: done — File > Trace Inspector.*
 
 ## Ideas to implement (registered 2026-11-24, to clarify with the user before building)
 

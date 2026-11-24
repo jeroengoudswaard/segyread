@@ -4931,6 +4931,7 @@ HoverInfo SegyCanvas::currentHoverInfo() const {
     info.timeMs = double(sampleIdx) * (app_.foreground->binHeader.sampleIntervalUs / 1000.0);
     info.amplitude = value;
     info.frequencyAxis = app_.display.frequencyAxis;
+    info.dataset = app_.foreground.get();
     return info;
 }
 
@@ -6482,6 +6483,9 @@ MainWindow::MainWindow() : QMainWindow() {
         QAction* rangesAction = new QAction("Trace Header &Ranges...", fileMenu);
         fileMenu->insertAction(fileExitSeparator, rangesAction);
         connect(rangesAction, &QAction::triggered, this, &MainWindow::openTraceHeaderRanges);
+        QAction* inspectorAction = new QAction("Trace &Inspector...", fileMenu);
+        fileMenu->insertAction(fileExitSeparator, inspectorAction);
+        connect(inspectorAction, &QAction::triggered, this, &MainWindow::openTraceInspector);
     }
     addMenuMirror(fileMenu, binaryHeaderAction_, "&Binary Header", fileExitSeparator);
 
@@ -7263,6 +7267,20 @@ void MainWindow::refreshAmplitudeScale() {
 }
 
 void MainWindow::updateHoverInfo(const HoverInfo& info) {
+    // Trace Inspector, Follow cursor: the trace under the mouse (not on an
+    // x-f display, whose traces are spectra).
+    if (info.valid && !info.frequencyAxis && traceInspector_ && traceInspector_->isVisible() &&
+        traceInspector_->followCursor()) {
+        for (Panel* p : {&panelA_, &panelB_}) {
+            if (p->app.loaded && p->app.foreground.get() == info.dataset) {
+                if (traceInspector_->dataset() != info.dataset) {
+                    traceInspector_->setDataset(p->app.foreground, datasetTitleSuffix(p->app));
+                }
+                traceInspector_->showTrace(info.traceIdx);
+                break;
+            }
+        }
+    }
     if (!info.valid) {
         traceValueLabel_->setText("--");
         seqValueLabel_->setText("--");
@@ -8634,6 +8652,221 @@ void MainWindow::computeAndShowFk(Panel* sourcePanel) {
             fkWindow_->activateWindow();
             refreshFkRecompute();
         });
+}
+
+namespace {
+// The inspected trace as a vertical wiggle (time down), positive lobes
+// filled, scaled to its own peak -- a quick look beside the sample table.
+class TraceWiggleWidget : public QWidget {
+public:
+    explicit TraceWiggleWidget(QWidget* parent = nullptr) : QWidget(parent) { setMinimumWidth(150); }
+    void setSamples(std::vector<float> samples, double sampleIntervalMs) {
+        samples_ = std::move(samples);
+        sampleIntervalMs_ = sampleIntervalMs;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
+        const QRect plot = rect().adjusted(8, 10, -8, -10);
+        painter.fillRect(plot, Qt::white);
+        if (samples_.size() < 2 || plot.height() <= 0) return;
+        float peak = 0.0f;
+        for (float v : samples_) peak = std::max(peak, std::fabs(v));
+        const double centre = plot.center().x();
+        const double half = plot.width() / 2.0 - 2.0;
+        auto xFor = [&](float v) { return centre + (peak > 0.0f ? double(v) / peak : 0.0) * half; };
+        auto yFor = [&](size_t i) { return plot.top() + double(i) / double(samples_.size() - 1) * plot.height(); };
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        QPainterPath fill;
+        fill.moveTo(centre, yFor(0));
+        for (size_t i = 0; i < samples_.size(); ++i) fill.lineTo(std::max(centre, xFor(samples_[i])), yFor(i));
+        fill.lineTo(centre, yFor(samples_.size() - 1));
+        painter.fillPath(fill, Qt::black);
+        QPolygonF line;
+        for (size_t i = 0; i < samples_.size(); ++i) line << QPointF(xFor(samples_[i]), yFor(i));
+        painter.setPen(QPen(Qt::black, 1.0));
+        painter.drawPolyline(line);
+        painter.setPen(QPen(QColor(0x9a, 0x9c, 0xa3), 1, Qt::DashLine));
+        painter.drawLine(QPointF(centre, plot.top()), QPointF(centre, plot.bottom()));
+    }
+
+private:
+    std::vector<float> samples_;
+    double sampleIntervalMs_ = 0.0;
+};
+} // namespace
+
+TraceInspectorWindow::TraceInspectorWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
+    setWindowTitle("Trace Inspector");
+    resize(1100, 760);
+    setStyleSheet("background-color: #1e1f22;");
+    QVBoxLayout* layout = new QVBoxLayout(this);
+    QHBoxLayout* top = new QHBoxLayout();
+    top->setSpacing(10);
+    top->addWidget(new QLabel("Trace"));
+    traceSpin_ = new QSpinBox();
+    traceSpin_->setRange(1, 1);
+    traceSpin_->setToolTip("Trace number in the file (1 = first trace)");
+    top->addWidget(traceSpin_);
+    followCheck_ = new QCheckBox("Follow cursor");
+    followCheck_->setChecked(true);
+    followCheck_->setToolTip("Show the trace under the mouse on the seismic display");
+    top->addWidget(followCheck_);
+    top->addSpacing(16);
+    top->addWidget(new QLabel("Definition"));
+    standardCombo_ = new QComboBox();
+    for (segy::HeaderStandard s : {segy::HeaderStandard::ShellV21, segy::HeaderStandard::SegyRev1,
+                                   segy::HeaderStandard::SegyRev2}) {
+        standardCombo_->addItem(segy::headerStandardName(s), int(s));
+    }
+    standardCombo_->setToolTip("Trace header definition: Shell V2.1 (default), SEG-Y rev 1.0 or rev 2.0");
+    top->addWidget(standardCombo_);
+    top->addSpacing(16);
+    top->addWidget(new QLabel("Header byte order"));
+    bigEndianRadio_ = new QRadioButton("Big endian");
+    QRadioButton* littleEndian = new QRadioButton("Little endian");
+    bigEndianRadio_->setChecked(true);
+    QButtonGroup* endianGroup = new QButtonGroup(this);
+    endianGroup->addButton(bigEndianRadio_);
+    endianGroup->addButton(littleEndian);
+    top->addWidget(bigEndianRadio_);
+    top->addWidget(littleEndian);
+    top->addStretch();
+    layout->addLayout(top);
+    summaryLabel_ = new QLabel();
+    summaryLabel_->setStyleSheet("color: #9a9ca3;");
+    layout->addWidget(summaryLabel_);
+
+    QSplitter* splitter = new QSplitter(Qt::Horizontal, this);
+    headerTable_ = new QTableWidget();
+    headerTable_->setColumnCount(4);
+    headerTable_->setHorizontalHeaderLabels({"Name", "Bytes", "Value", "Description"});
+    headerTable_->verticalHeader()->hide();
+    headerTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    headerTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    headerTable_->horizontalHeader()->setStretchLastSection(true);
+    headerTable_->verticalHeader()->setDefaultSectionSize(20);
+    samplesTable_ = new QTableWidget();
+    samplesTable_->setColumnCount(3);
+    samplesTable_->setHorizontalHeaderLabels({"#", "Time (ms)", "Value"});
+    samplesTable_->verticalHeader()->hide();
+    samplesTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    samplesTable_->horizontalHeader()->setStretchLastSection(true);
+    samplesTable_->verticalHeader()->setDefaultSectionSize(20);
+    samplesTable_->setMinimumWidth(300); // room for the value column beside the scroll bar
+    wiggle_ = new TraceWiggleWidget();
+    splitter->addWidget(headerTable_);
+    splitter->addWidget(samplesTable_);
+    splitter->addWidget(wiggle_);
+    splitter->setStretchFactor(0, 5);
+    splitter->setStretchFactor(1, 2);
+    splitter->setStretchFactor(2, 1);
+    layout->addWidget(splitter, 1);
+
+    connect(traceSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        trace_ = int64_t(value) - 1;
+        refresh();
+    });
+    connect(standardCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { refresh(); });
+    connect(bigEndianRadio_, &QRadioButton::toggled, this, [this](bool) { refresh(); });
+}
+
+bool TraceInspectorWindow::followCursor() const { return followCheck_->isChecked(); }
+
+void TraceInspectorWindow::setDataset(std::shared_ptr<Dataset> dataset, const QString& titleSuffix) {
+    dataset_ = std::move(dataset);
+    setWindowTitle(QString("Trace Inspector") + titleSuffix);
+    const int count = dataset_ ? int(std::min<int64_t>(dataset_->traceCount, std::numeric_limits<int>::max())) : 1;
+    QSignalBlocker block(traceSpin_);
+    traceSpin_->setRange(1, std::max(1, count));
+    trace_ = std::clamp<int64_t>(trace_, 0, std::max(0, count - 1));
+    traceSpin_->setValue(int(trace_) + 1);
+    refresh();
+}
+
+void TraceInspectorWindow::showTrace(int64_t traceIndex) {
+    if (!dataset_ || traceIndex == trace_) return;
+    trace_ = std::clamp<int64_t>(traceIndex, 0, std::max<int64_t>(0, dataset_->traceCount - 1));
+    QSignalBlocker block(traceSpin_);
+    traceSpin_->setValue(int(trace_) + 1);
+    refresh();
+}
+
+void TraceInspectorWindow::refresh() {
+    if (!dataset_ || dataset_->traceCount <= 0) {
+        headerTable_->setRowCount(0);
+        samplesTable_->setRowCount(0);
+        summaryLabel_->setText("No data");
+        return;
+    }
+    const uint8_t* traceBase = dataset_->file.data() + segy::kHeaderTotalSize + size_t(trace_) * dataset_->traceStrideBytes;
+    const bool bigEndian = bigEndianRadio_->isChecked();
+    const auto standard = segy::HeaderStandard(standardCombo_->currentData().toInt());
+    const std::vector<segy::HeaderFieldDef>& fields = segy::traceHeaderDefinition(standard);
+    headerTable_->setRowCount(int(fields.size()));
+    for (int row = 0; row < int(fields.size()); ++row) {
+        const segy::HeaderFieldDef& f = fields[size_t(row)];
+        const bool unused = f.kind == segy::HeaderFieldKind::Unassigned;
+        const QString bytes = f.size == 1 ? QString::number(f.firstByte)
+                                          : QString("%1-%2").arg(f.firstByte).arg(f.firstByte + f.size - 1);
+        const QStringList cells = {f.name, bytes, QString::fromStdString(segy::formatHeaderField(traceBase, f, bigEndian)),
+                                   f.description};
+        for (int col = 0; col < 4; ++col) {
+            QTableWidgetItem* item = new QTableWidgetItem(cells[col]);
+            if (col == 1 || col == 2) item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            if (unused) item->setForeground(QColor(0x7a, 0x7c, 0x82));
+            if (col == 3) item->setToolTip(f.description);
+            headerTable_->setItem(row, col, item);
+        }
+    }
+    headerTable_->resizeColumnToContents(0);
+    headerTable_->resizeColumnToContents(1);
+    headerTable_->resizeColumnToContents(2);
+
+    const int samples = dataset_->binHeader.samplesPerTrace;
+    const double intervalMs = dataset_->binHeader.sampleIntervalUs / 1000.0;
+    std::vector<float> values(static_cast<size_t>(std::max(0, samples)));
+    if (samples > 0) {
+        segy::decodeSamples(traceBase + segy::kTraceHeaderSize, values.data(), size_t(samples),
+                            dataset_->binHeader.formatCode);
+    }
+    samplesTable_->setRowCount(samples);
+    for (int i = 0; i < samples; ++i) {
+        const QString cells[3] = {QString::number(i), QString::number(i * intervalMs, 'f', 1),
+                                  QString::number(double(values[size_t(i)]), 'g', 6)};
+        for (int col = 0; col < 3; ++col) {
+            QTableWidgetItem* item = new QTableWidgetItem(cells[col]);
+            item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            samplesTable_->setItem(i, col, item);
+        }
+    }
+    samplesTable_->resizeColumnToContents(0);
+    samplesTable_->resizeColumnToContents(1);
+    static_cast<TraceWiggleWidget*>(wiggle_)->setSamples(values, intervalMs);
+    summaryLabel_->setText(QString("Trace %1 of %2  |  %3 samples, %4 us, data format %5  |  %6")
+                               .arg(trace_ + 1)
+                               .arg(dataset_->traceCount)
+                               .arg(samples)
+                               .arg(dataset_->binHeader.sampleIntervalUs)
+                               .arg(dataset_->binHeader.formatCode)
+                               .arg(segy::headerStandardName(standard)));
+}
+
+void MainWindow::openTraceInspector() {
+    if (!app_->loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    if (!traceInspector_) traceInspector_ = new TraceInspectorWindow(this);
+    if (traceInspector_->dataset() != app_->foreground.get()) {
+        traceInspector_->setDataset(app_->foreground, datasetTitleSuffix(*app_));
+    }
+    traceInspector_->show();
+    traceInspector_->raise();
+    traceInspector_->activateWindow();
 }
 
 void MainWindow::openTraceHeaderRanges() {

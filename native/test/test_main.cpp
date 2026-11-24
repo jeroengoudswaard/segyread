@@ -29,6 +29,7 @@
 #include "segy_writer.h"
 #include "amplitude.h"
 #include "iirfilter.h"
+#include "trace_header_defs.h"
 #include <complex>
 
 namespace {
@@ -1668,6 +1669,33 @@ void testTraceDerivative() {
     CHECK(x == same);
 }
 
+void testTraceHeaderDefinitions() {
+    section("Trace Inspector: header definitions tile bytes 1-240; field reading in both byte orders");
+    for (segy::HeaderStandard standard :
+         {segy::HeaderStandard::ShellV21, segy::HeaderStandard::SegyRev1, segy::HeaderStandard::SegyRev2}) {
+        const std::vector<segy::HeaderFieldDef>& fields = segy::traceHeaderDefinition(standard);
+        int next = 1;
+        bool tiles = true;
+        for (const segy::HeaderFieldDef& f : fields) {
+            tiles = tiles && f.firstByte == next && f.size > 0;
+            next = f.firstByte + f.size;
+        }
+        CHECK(tiles);
+        CHECK(next == 241);
+    }
+    uint8_t header[240] = {};
+    header[20] = 0x00; header[21] = 0x01; header[22] = 0xE2; header[23] = 0x40; // CDP (21-24) = 123456
+    header[70] = 0xFF; header[71] = 0xF6;                                    // coordinate scalar (71-72) = -10
+    CHECK(segy::readHeaderInt(header, 21, 4, true) == 123456);
+    CHECK(segy::readHeaderInt(header, 71, 2, true) == -10);
+    CHECK(segy::readHeaderInt(header, 71, 2, false) == int16_t(0xF6FF));
+    const std::vector<segy::HeaderFieldDef>& rev2 = segy::traceHeaderDefinition(segy::HeaderStandard::SegyRev2);
+    std::memcpy(header + 232, "SEG00000", 8);
+    CHECK(segy::formatHeaderField(header, rev2.back(), true) == "SEG00000");
+    CHECK(segy::formatHeaderField(header, segy::traceHeaderDefinition(segy::HeaderStandard::SegyRev1).back(), true) ==
+          "5345473030303030");
+}
+
 void testNormalizedAutocorrelation() {
     section("Analysis: normalized autocorrelation -- hand-computed values, spike, dead trace, lag clamp, periodicity");
     // x = 1,2,3,4: r0 = 30, r1 = 1*2+2*3+3*4 = 20, r2 = 1*3+2*4 = 11, r3 = 1*4 = 4.
@@ -1800,6 +1828,7 @@ int main() {
     testXfSpectrum();
     testFk();
     testTraceDerivative();
+    testTraceHeaderDefinitions();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "analysis.h"
+#include "trace_header_defs.h"
 #include "iirfilter.h"
 #include "chrome.h"
 #include "colormap.h"
@@ -350,6 +351,7 @@ struct HoverInfo {
     double timeMs = 0.0; // Hz on an x-f display (frequencyAxis)
     float amplitude = 0.0f;
     bool frequencyAxis = false; // x-f: timeMs is Hz, amplitude is dB
+    const Dataset* dataset = nullptr; // the hovered panel's Foreground (Trace Inspector's Follow cursor)
 };
 
 // A tall, narrow amplitude-to-color legend (gradient plus +clip/0/-clip
@@ -1366,6 +1368,33 @@ private:
     void syncScalarField();
 };
 
+// File > Trace Inspector: one trace's 240-byte header decoded per a chosen
+// definition (Shell V2.1 by default, SEG-Y rev 1.0 or rev 2.0) -- name,
+// bytes, value, description -- beside the trace's samples (table and a
+// small wiggle). The trace is picked by number, or follows the cursor on
+// the seismic.
+class TraceInspectorWindow : public QWidget {
+public:
+    explicit TraceInspectorWindow(QWidget* parent = nullptr);
+    void setDataset(std::shared_ptr<Dataset> dataset, const QString& titleSuffix);
+    const Dataset* dataset() const { return dataset_.get(); }
+    void showTrace(int64_t traceIndex); // 0-based
+    bool followCursor() const;
+
+private:
+    std::shared_ptr<Dataset> dataset_;
+    int64_t trace_ = 0;
+    QSpinBox* traceSpin_ = nullptr;
+    QComboBox* standardCombo_ = nullptr;
+    QRadioButton* bigEndianRadio_ = nullptr;
+    QCheckBox* followCheck_ = nullptr;
+    QLabel* summaryLabel_ = nullptr;
+    QTableWidget* headerTable_ = nullptr;
+    QTableWidget* samplesTable_ = nullptr;
+    QWidget* wiggle_ = nullptr; // TraceWiggleWidget (viewer_qt.cpp)
+    void refresh();
+};
+
 // The density-plot canvas: owns drawing and mouse/keyboard input. Reuses
 // the exact same shared renderer/chrome calls the removed shells used.
 class SegyCanvas : public QWidget {
@@ -1714,6 +1743,8 @@ private:
     QAction* binaryHeaderAction_ = nullptr;
     BinaryHeaderWidget* binaryHeaderWidget_ = nullptr;
     QWidget* headerRangesWidget_ = nullptr; // File > Trace Header Ranges
+    TraceInspectorWindow* traceInspector_ = nullptr; // File > Trace Inspector
+    void openTraceInspector();
     void openTraceHeaderRanges();
 
     // Shows/hides the right dock entirely -- the dock itself can't be
