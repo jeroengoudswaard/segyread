@@ -1723,6 +1723,37 @@ void testTraceHeaderDefinitions() {
           "5345473030303030");
 }
 
+void testCrossCorrelationAndSidePeak() {
+    section("Correlation: asymmetric lag window, cross-correlation shift, nearest side peak");
+    const double pi = 3.14159265358979323846;
+    // A sine with a 20-sample period: side peaks at +-20, value about (n - 20) / n.
+    const int n = 400;
+    std::vector<float> sine(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) sine[size_t(i)] = float(std::sin(2.0 * pi * i / 20.0));
+    std::vector<float> c = segy::normalizedCrossCorrelation(sine.data(), sine.data(), n, -30, 50);
+    CHECK(c.size() == 81);
+    CHECK_NEAR(c[30], 1.0, 1e-6); // lag 0
+    // Matches the one-sided autocorrelation for positive lags.
+    std::vector<float> r = segy::normalizedAutocorrelation(sine.data(), n, 50);
+    CHECK_NEAR(c[30 + 37], r[37], 1e-6);
+    CHECK_NEAR(c[30 - 13], r[13], 1e-6); // symmetric: r[-k] = r[k]
+    const double peak = segy::nearestSidePeakLag(c, -30, 0.5);
+    CHECK_NEAR(std::fabs(peak), 20.0, 0.1);
+    CHECK(std::isnan(segy::nearestSidePeakLag(c, -30, 0.99))); // side peak below the threshold
+    // b = a delayed by 7 samples: the cross-correlation peaks at +7.
+    std::vector<float> a(300, 0.0f), b(300, 0.0f);
+    std::mt19937 rng(3);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    for (int i = 0; i < 293; ++i) a[size_t(i)] = g(rng);
+    for (int i = 0; i < 293; ++i) b[size_t(i + 7)] = a[size_t(i)];
+    std::vector<float> x = segy::normalizedCrossCorrelation(a.data(), b.data(), 300, -20, 20);
+    const int best = int(std::max_element(x.begin(), x.end()) - x.begin()) - 20;
+    CHECK(best == 7);
+    // White noise: no side peak reaches 0.5.
+    std::vector<float> noise = segy::normalizedCrossCorrelation(a.data(), a.data(), 300, -40, 40);
+    CHECK(std::isnan(segy::nearestSidePeakLag(noise, -40, 0.5)));
+}
+
 void testNormalizedAutocorrelation() {
     section("Analysis: normalized autocorrelation -- hand-computed values, spike, dead trace, lag clamp, periodicity");
     // x = 1,2,3,4: r0 = 30, r1 = 1*2+2*3+3*4 = 20, r2 = 1*3+2*4 = 11, r3 = 1*4 = 4.
@@ -1856,6 +1887,7 @@ int main() {
     testFk();
     testTraceDerivative();
     testTraceHeaderDefinitions();
+    testCrossCorrelationAndSidePeak();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

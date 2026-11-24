@@ -54,6 +54,21 @@ SpectrumResult computeSpectrum(const RenderContext& ctx, int64_t traceStart, int
 // and cheap at autocorrelogram sizes (a few hundred traces/lags).
 std::vector<float> normalizedAutocorrelation(const float* samples, int count, int maxLag);
 
+// Normalized cross-correlation of a with b for lags minLag..maxLag (in
+// samples, either may be negative; the result has maxLag - minLag + 1
+// values):  c[k] = sum_i a[i] * b[i + k] / sqrt(sum a^2 * sum b^2).
+// Positive k: b lags a (an event in b comes k samples later). With a == b
+// this is the normalized autocorrelation over an asymmetric lag window.
+// Zero energy in either gives zeros.
+std::vector<float> normalizedCrossCorrelation(const float* a, const float* b, int count, int minLag, int maxLag);
+
+// Peak-to-peak distance from a correlation over lags minLag..maxLag: the
+// side peak nearest to lag 0 -- the first local maximum past the central
+// lobe, on either side -- whose value is at least `threshold`. Returns its
+// lag in samples (parabolic refinement, sign kept), or NaN when there is
+// none.
+double nearestSidePeakLag(const std::vector<float>& correlation, int minLag, double threshold);
+
 // ---------------------------------------------------------------------------
 // Signal/noise estimation after Shell SIPMAP's SIGCOR (see native/README.md,
 // "Signal/Noise"). Pairs of traces a lateral distance NSKIP (+ a random

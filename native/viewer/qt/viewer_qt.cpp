@@ -63,6 +63,8 @@
 #include <QTableWidget>
 #include <QSignalBlocker>
 #include <map>
+#include <complex>
+#include "fft.h"
 #include <atomic>
 #include <QRegularExpression>
 #include <QToolButton>
@@ -1733,12 +1735,16 @@ CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
     opRow->addWidget(new QLabel("Operation:"));
     addRadio_ = new QRadioButton("Add");
     subtractRadio_ = new QRadioButton("Subtract");
+    crossRadio_ = new QRadioButton("Cross-correlate");
+    crossRadio_->setToolTip("A x B trace by trace (normalized), shown like the autocorrelation; no new dataset");
     addRadio_->setChecked(true);
     QButtonGroup* opGroup = new QButtonGroup(this);
     opGroup->addButton(addRadio_);
     opGroup->addButton(subtractRadio_);
+    opGroup->addButton(crossRadio_);
     opRow->addWidget(addRadio_);
     opRow->addWidget(subtractRadio_);
+    opRow->addWidget(crossRadio_);
     opRow->addStretch();
     layout->addLayout(opRow);
 
@@ -1753,6 +1759,7 @@ CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
     connect(datasetBCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this](int) { updateDefaultOutputName(); });
     connect(addRadio_, &QRadioButton::toggled, this, [this](bool) { updateDefaultOutputName(); });
+    connect(crossRadio_, &QRadioButton::toggled, this, [this](bool on) { outputNameEdit_->setEnabled(!on); });
     connect(outputNameEdit_, &QLineEdit::textEdited, this, [this](const QString&) { outputNameEdited_ = true; });
 
     addButtonRow(this, layout,
@@ -1767,34 +1774,27 @@ CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
                  });
 }
 
-void CalculatorDialog::refreshPanels(const QString& nameA, bool loadedA, const QString& nameB, bool loadedB) {
+void CalculatorDialog::refreshDatasets(const QStringList& names, int defaultA, int defaultB) {
     datasetACombo_->clear();
     datasetBCombo_->clear();
-    if (loadedA) {
-        datasetACombo_->addItem(nameA, 0);
-        datasetBCombo_->addItem(nameA, 0);
+    for (int i = 0; i < names.size(); ++i) {
+        datasetACombo_->addItem(names[i], i);
+        datasetBCombo_->addItem(names[i], i);
     }
-    if (loadedB) {
-        datasetACombo_->addItem(nameB, 1);
-        datasetBCombo_->addItem(nameB, 1);
-    }
-    // Defaults to A vs. B when both exist, rather than leaving both combos
-    // pointed at the same one -- combining a dataset with itself is legal
-    // (Add doubles it, Subtract zeroes it) but not the useful default case.
-    if (loadedA && loadedB) datasetBCombo_->setCurrentIndex(1);
+    if (defaultA >= 0 && defaultA < names.size()) datasetACombo_->setCurrentIndex(defaultA);
+    if (defaultB >= 0 && defaultB < names.size()) datasetBCombo_->setCurrentIndex(defaultB);
     outputNameEdited_ = false;
     updateDefaultOutputName();
 }
 
-void CalculatorDialog::setApplyCallback(
-    std::function<void(int, int, bool, QString)> callback) {
+void CalculatorDialog::setApplyCallback(std::function<void(int, int, int, QString)> callback) {
     onApply_ = std::move(callback);
 }
 
 void CalculatorDialog::updateDefaultOutputName() {
     if (outputNameEdited_) return;
-    QString a = datasetACombo_->currentText();
-    QString b = datasetBCombo_->currentText();
+    QString a = datasetACombo_->currentText().section("   [", 0, 0);
+    QString b = datasetBCombo_->currentText().section("   [", 0, 0);
     if (a.isEmpty() || b.isEmpty()) return;
     QString op = addRadio_->isChecked() ? "Plus" : "Minus";
     outputNameEdit_->setText(QString("%1_%2_%3").arg(a, op, b));
@@ -1802,9 +1802,8 @@ void CalculatorDialog::updateDefaultOutputName() {
 
 void CalculatorDialog::emitApply() {
     if (!onApply_ || datasetACombo_->count() == 0 || datasetBCombo_->count() == 0) return;
-    int a = datasetACombo_->currentData().toInt();
-    int b = datasetBCombo_->currentData().toInt();
-    onApply_(a, b, subtractRadio_->isChecked(), outputNameEdit_->text());
+    const int op = crossRadio_->isChecked() ? 2 : subtractRadio_->isChecked() ? 1 : 0;
+    onApply_(datasetACombo_->currentData().toInt(), datasetBCombo_->currentData().toInt(), op, outputNameEdit_->text());
 }
 
 BandpassDialog::BandpassDialog(QWidget* parent) : QDialog(parent) {
@@ -2176,24 +2175,83 @@ namespace {
 class AutocorrelationAverageWidget : public QWidget {
 public:
     explicit AutocorrelationAverageWidget(QWidget* parent = nullptr) : QWidget(parent) {
-        setMinimumWidth(160);
+        setMinimumWidth(170);
         setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+        setMouseTracking(true);
     }
     // `sampleStart`..`sampleEnd` (lags in samples) and the interval give it
-    // the same tick/grid positions as the autocorrelogram beside it.
+    // the same tick/grid positions as the correlogram beside it.
     void setAverage(std::vector<float> average, int sampleStart, int sampleEnd, double sampleIntervalUs) {
         average_ = std::move(average);
         sampleStart_ = sampleStart;
         sampleEnd_ = sampleEnd;
         sampleIntervalUs_ = sampleIntervalUs;
+        measureCount_ = 0;
         update();
     }
+    void setPeak(double lagSamples) {
+        peakLag_ = lagSamples;
+        update();
+    }
+    // Box mode: a vertical drag selects a lag range (ms) for Zoom.
+    void setBoxMode(bool on) {
+        boxMode_ = on;
+        setCursor(on ? Qt::CrossCursor : Qt::ArrowCursor);
+    }
+    std::function<void(double fromMs, double toMs)> onLagBox;
+    std::function<void(const QString&)> onMeasure; // delta-t text, empty when cleared
 
 protected:
+    QRect plotRect() const { return rect().adjusted(10, 24, -10, -38); }
+    double lagMsAt(double y) const {
+        const QRect plot = plotRect();
+        const int n = sampleEnd_ - sampleStart_ + 1;
+        const double sample = sampleStart_ + (y - plot.top()) / std::max(1, plot.height()) * n - 0.5;
+        return sample * sampleIntervalUs_ / 1000.0;
+    }
+    double yForLagMs(double ms) const {
+        const QRect plot = plotRect();
+        const int n = sampleEnd_ - sampleStart_ + 1;
+        const double sample = ms * 1000.0 / std::max(1e-9, sampleIntervalUs_);
+        return plot.top() + (sample - sampleStart_ + 0.5) / std::max(1, n) * plot.height();
+    }
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton || average_.size() < 2) return;
+        const double ms = lagMsAt(event->position().y());
+        if (boxMode_) {
+            dragging_ = true;
+            dragA_ = dragB_ = ms;
+            update();
+            return;
+        }
+        // Delta-t measuring: first click, second click, third click clears.
+        if (measureCount_ >= 2) measureCount_ = 0;
+        measure_[measureCount_++] = ms;
+        if (onMeasure) {
+            onMeasure(measureCount_ == 2 ? QString("%1t = %2 ms (%3 to %4 ms)")
+                                               .arg(QChar(0x0394))
+                                               .arg(std::fabs(measure_[1] - measure_[0]), 0, 'f', 1)
+                                               .arg(measure_[0], 0, 'f', 1)
+                                               .arg(measure_[1], 0, 'f', 1)
+                                         : QString("Click a second lag to measure %1t").arg(QChar(0x0394)));
+        }
+        update();
+    }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (!dragging_) return;
+        dragB_ = lagMsAt(event->position().y());
+        update();
+    }
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if (!dragging_ || event->button() != Qt::LeftButton) return;
+        dragging_ = false;
+        if (std::fabs(dragB_ - dragA_) > 0.0 && onLagBox) onLagBox(std::min(dragA_, dragB_), std::max(dragA_, dragB_));
+        update();
+    }
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this);
         painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
-        QRect plot = rect().adjusted(10, 24, -10, -38);
+        QRect plot = plotRect();
         if (plot.width() <= 0 || plot.height() <= 0) return;
         painter.fillRect(plot, Qt::white);
         painter.setPen(QPen(kPlotGridColor, 1));
@@ -2207,7 +2265,12 @@ protected:
         for (double guide : {-0.5, 0.5}) painter.drawLine(QPointF(xFor(guide), plot.top()), QPointF(xFor(guide), plot.bottom()));
         painter.setPen(QPen(QColor(0x9a, 0x9c, 0xa3), 1));
         painter.drawLine(QPointF(xFor(0.0), plot.top()), QPointF(xFor(0.0), plot.bottom()));
-        painter.drawLine(QPointF(plot.left(), plot.center().y()), QPointF(plot.right(), plot.center().y()));
+        if (sampleStart_ <= 0 && sampleEnd_ >= 0) {
+            const double y0 = yForLagMs(0.0);
+            painter.drawLine(QPointF(plot.left(), y0), QPointF(plot.right(), y0));
+        }
+        painter.save();
+        painter.setClipRect(plot);
         if (average_.size() >= 2) {
             painter.setRenderHint(QPainter::Antialiasing, true);
             QPolygonF line;
@@ -2221,6 +2284,28 @@ protected:
             painter.setPen(QPen(QColor(0x1f, 0x4e, 0xd8), 1.6));
             painter.drawPolyline(line);
         }
+        // Side peak (peak-to-peak distance), mirrored to both sides of lag 0.
+        if (!std::isnan(peakLag_)) {
+            const double ms = std::fabs(peakLag_) * sampleIntervalUs_ / 1000.0;
+            painter.setPen(QPen(QColor(0xe8, 0x90, 0x5a), 1.5, Qt::DashLine));
+            for (double s : {-1.0, 1.0}) {
+                const double y = yForLagMs(s * ms);
+                painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+            }
+        }
+        // Delta-t measurement points.
+        painter.setPen(QPen(QColor(0x19, 0x9e, 0x70), 1.5));
+        for (int i = 0; i < measureCount_; ++i) {
+            const double y = yForLagMs(measure_[i]);
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+        }
+        if (dragging_) {
+            const double ya = yForLagMs(dragA_), yb = yForLagMs(dragB_);
+            painter.setPen(QPen(QColor(0xe8, 0x90, 0x5a), 1.5, Qt::DashLine));
+            painter.setBrush(QColor(0xe8, 0x90, 0x5a, 40));
+            painter.drawRect(QRectF(QPointF(plot.left(), ya), QPointF(plot.right(), yb)).normalized());
+        }
+        painter.restore();
         painter.setPen(QColor(0xe0, 0xe2, 0xe7));
         QFont axisFont = painter.font();
         axisFont.setPixelSize(8);
@@ -2237,45 +2322,80 @@ private:
     int sampleStart_ = 0;
     int sampleEnd_ = 0;
     double sampleIntervalUs_ = 0.0;
+    double peakLag_ = std::nan("");
+    bool boxMode_ = false;
+    bool dragging_ = false;
+    double dragA_ = 0.0, dragB_ = 0.0;
+    double measure_[2] = {0.0, 0.0};
+    int measureCount_ = 0;
 };
 
 } // namespace
 
-AutocorrelationDialog::AutocorrelationDialog(QWidget* parent) : QDialog(parent) {
-    setWindowTitle("Autocorrelation");
+AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelation) : QDialog(parent) {
+    setWindowTitle(crossCorrelation ? "Cross-correlation" : "Autocorrelation");
     setModal(false);
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QHBoxLayout* toolbarRow = new QHBoxLayout();
-    toolbarRow->addWidget(new QLabel("Length:"));
-    lengthSpin_ = new QDoubleSpinBox();
-    lengthSpin_->setRange(4.0, 10000.0);
-    lengthSpin_->setDecimals(0);
-    lengthSpin_->setSingleStep(20.0);
-    lengthSpin_->setSuffix(" ms");
-    lengthSpin_->setValue(200.0);
-    lengthSpin_->setToolTip("Maximum lag L: the display runs from -L to +L, lag 0 in the middle");
-    toolbarRow->addWidget(lengthSpin_);
+    auto lagSpin = [](const QString& tip) {
+        QDoubleSpinBox* spin = new QDoubleSpinBox();
+        spin->setRange(0.0, 10000.0);
+        spin->setDecimals(0);
+        spin->setSingleStep(20.0);
+        spin->setSuffix(" ms");
+        spin->setValue(200.0);
+        spin->setToolTip(tip);
+        return spin;
+    };
+    minLagSpin_ = lagSpin("Lags shown before 0 (the negative side)");
+    maxLagSpin_ = lagSpin("Lags shown after 0 (the positive side)");
+    toolbarRow->addWidget(new QLabel(QString("%1lag").arg(QChar(0x2212))));
+    toolbarRow->addWidget(minLagSpin_);
+    toolbarRow->addWidget(new QLabel("+lag"));
+    toolbarRow->addWidget(maxLagSpin_);
     QPushButton* applyButton = new QPushButton("Apply");
     toolbarRow->addWidget(applyButton);
-    toolbarRow->addSpacing(16);
-    infoLabel_ = new QLabel();
-    infoLabel_->setStyleSheet("color: #9a9ca3;");
-    toolbarRow->addWidget(infoLabel_);
+    toolbarRow->addSpacing(12);
+    QToolBar* zoomBar = new QToolBar(this);
+    zoomBar->setIconSize(QSize(18, 18));
+    zoomAction_ = zoomBar->addAction(iconMagnifier(true), "Zoom");
+    zoomAction_->setToolTip("Zoom the lag axis to the box (without one: drag one on the average curve)");
+    unzoomAction_ = zoomBar->addAction(iconMagnifier(false), "Unzoom");
+    unzoomAction_->setToolTip("Back to the previous lag window");
+    boxAction_ = zoomBar->addAction(iconRectangle(), "Box Select");
+    boxAction_->setCheckable(true);
+    boxAction_->setToolTip("Drag on the average curve to select a lag range");
+    toolbarRow->addWidget(zoomBar);
+    spectrumCheck_ = new QCheckBox("Spectrum");
+    spectrumCheck_->setToolTip("Power spectrum of the average, below the plots");
+    toolbarRow->addWidget(spectrumCheck_);
     toolbarRow->addStretch();
     layout->addLayout(toolbarRow);
-    connect(applyButton, &QPushButton::clicked, this, [this]() {
-        if (onApply_) onApply_(lengthSpin_->value());
-    });
-    // Enter in the length field recomputes too -- but only for a real edit
+
+    QHBoxLayout* infoRow = new QHBoxLayout();
+    peakLabel_ = new QLabel();
+    peakLabel_->setStyleSheet("color: #f0f2f5; font-weight: 600;");
+    infoRow->addWidget(peakLabel_);
+    infoRow->addSpacing(16);
+    infoLabel_ = new QLabel();
+    infoLabel_->setStyleSheet("color: #9a9ca3;");
+    infoRow->addWidget(infoLabel_, 1);
+    layout->addLayout(infoRow);
+
+    connect(applyButton, &QPushButton::clicked, this, [this]() { applyWindow(minLagSpin_->value(), maxLagSpin_->value()); });
+    // Enter in a lag field recomputes too -- but only for a real edit
     // while the window is open. editingFinished also fires when the field
     // loses focus because the window is closing; recomputing then re-opened
     // the window (the compute's completion shows it), so it couldn't be
     // closed.
-    connect(lengthSpin_, &QDoubleSpinBox::editingFinished, this, [this]() {
-        if (!isVisible() || lengthSpin_->value() == lastAppliedLengthMs_) return;
-        if (onApply_) onApply_(lengthSpin_->value());
-    });
+    for (QDoubleSpinBox* spin : {minLagSpin_, maxLagSpin_}) {
+        connect(spin, &QDoubleSpinBox::editingFinished, this, [this]() {
+            if (!isVisible()) return;
+            if (minLagSpin_->value() == lastAppliedMin_ && maxLagSpin_->value() == lastAppliedMax_) return;
+            applyWindow(minLagSpin_->value(), maxLagSpin_->value());
+        });
+    }
 
     QHBoxLayout* plots = new QHBoxLayout();
     plots->setSpacing(0);
@@ -2286,29 +2406,109 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent) : QDialog(parent) 
     averagePlot_ = averagePlot;
     plots->addWidget(panelPlot, 3);
     plots->addWidget(averagePlot, 1);
-    layout->addLayout(plots, 1);
-    resize(820, 680);
+    layout->addLayout(plots, 3);
+    auto* spectrum = new DbCurveChart();
+    spectrum->setTitle("Power spectrum of the average (dB) vs. Frequency (Hz)");
+    spectrum->setEmptyText("Apply to compute");
+    spectrum->setMinimumHeight(200);
+    spectrum->setVisible(false);
+    spectrumChart_ = spectrum;
+    layout->addWidget(spectrum, 2);
+    connect(spectrumCheck_, &QCheckBox::toggled, this, [spectrum](bool on) { spectrum->setVisible(on); });
+
+    averagePlot->onLagBox = [this](double fromMs, double toMs) {
+        hasLagBox_ = true;
+        lagBoxA_ = fromMs;
+        lagBoxB_ = toMs;
+        if (zoomWhenBoxDrawn_) {
+            zoomWhenBoxDrawn_ = false;
+            zoomToLagBox();
+        }
+        refreshZoomActions();
+    };
+    averagePlot->onMeasure = [this](const QString& text) { infoLabel_->setText(text); };
+    connect(boxAction_, &QAction::toggled, this, [averagePlot](bool on) { averagePlot->setBoxMode(on); });
+    connect(zoomAction_, &QAction::triggered, this, [this]() {
+        if (hasLagBox_) {
+            zoomToLagBox();
+            return;
+        }
+        // No box yet: draw one, and the window zooms as soon as it's there.
+        zoomWhenBoxDrawn_ = true;
+        if (!boxAction_->isChecked()) boxAction_->setChecked(true);
+        infoLabel_->setText("Drag on the average curve to choose the lags");
+    });
+    connect(unzoomAction_, &QAction::triggered, this, [this]() {
+        if (zoomHistory_.empty()) return;
+        const auto previous = zoomHistory_.back();
+        zoomHistory_.pop_back();
+        minLagSpin_->setValue(previous.first);
+        maxLagSpin_->setValue(previous.second);
+        if (onApply_) onApply_(previous.first, previous.second);
+        refreshZoomActions();
+    });
+    refreshZoomActions();
+    resize(860, 720);
 }
 
-double AutocorrelationDialog::lengthMs() const { return lengthSpin_->value(); }
+void AutocorrelationDialog::applyWindow(double minLagMs, double maxLagMs) {
+    if (onApply_) onApply_(minLagMs, maxLagMs);
+}
+
+void AutocorrelationDialog::zoomToLagBox() {
+    if (!hasLagBox_) return;
+    zoomHistory_.push_back({minLagSpin_->value(), maxLagSpin_->value()});
+    // The box's lags, signed: the negative side becomes -lag, the positive
+    // side +lag (a box entirely on one side keeps a little of the other).
+    const double from = lagBoxA_, to = lagBoxB_;
+    minLagSpin_->setValue(std::max(0.0, -from));
+    maxLagSpin_->setValue(std::max(0.0, to));
+    hasLagBox_ = false;
+    if (boxAction_->isChecked()) boxAction_->setChecked(false);
+    applyWindow(minLagSpin_->value(), maxLagSpin_->value());
+    refreshZoomActions();
+}
+
+void AutocorrelationDialog::refreshZoomActions() {
+    zoomAction_->setEnabled(true);
+    unzoomAction_->setEnabled(!zoomHistory_.empty());
+}
+
+double AutocorrelationDialog::minLagMs() const { return minLagSpin_->value(); }
+
+double AutocorrelationDialog::maxLagMs() const { return maxLagSpin_->value(); }
 
 void AutocorrelationDialog::setResult(const AutocorrelationResult& result) {
     auto* panelPlot = static_cast<OctaveBandPlotWidget*>(panelPlot_);
     panelPlot->setBandData(result.panel);
-    panelPlot->setClip(1.0f); // normalized: lag 0 is exactly 1
-    panelPlot->setAxisRange(result.traceStart, result.traceEnd, -result.maxLagSamples, result.maxLagSamples,
+    panelPlot->setClip(1.0f); // normalized: an autocorrelation is exactly 1 at lag 0
+    panelPlot->setAxisRange(result.traceStart, result.traceEnd, result.minLagSamples, result.maxLagSamples,
                             result.sampleIntervalUs);
-    static_cast<AutocorrelationAverageWidget*>(averagePlot_)
-        ->setAverage(result.average, -result.maxLagSamples, result.maxLagSamples, result.sampleIntervalUs);
-    const double lagMs = result.maxLagSamples * result.sampleIntervalUs / 1000.0;
-    lastAppliedLengthMs_ = lengthSpin_->value();
-    infoLabel_->setText(QString("%1 traces, lags %2 to +%3 ms, normalized to 1 at lag 0")
+    auto* averagePlot = static_cast<AutocorrelationAverageWidget*>(averagePlot_);
+    averagePlot->setAverage(result.average, result.minLagSamples, result.maxLagSamples, result.sampleIntervalUs);
+    averagePlot->setPeak(result.peakLagSamples);
+    const double dtMs = result.sampleIntervalUs / 1000.0;
+    lastAppliedMin_ = minLagSpin_->value();
+    lastAppliedMax_ = maxLagSpin_->value();
+    peakLabel_->setText(std::isnan(result.peakLagSamples)
+                            ? QString("Peak-to-peak: no side peak %1 0.5").arg(QChar(0x2265))
+                            : QString("Peak-to-peak: %1 ms (r = %2)")
+                                  .arg(std::fabs(result.peakLagSamples) * dtMs, 0, 'f', 1)
+                                  .arg(double(result.peakValue), 0, 'f', 2));
+    infoLabel_->setText(QString("%1%2 traces, lags %3 to +%4 ms%5")
+                            .arg(result.description.isEmpty() ? QString() : result.description + " | ")
                             .arg(result.traceCount)
-                            .arg(-lagMs, 0, 'f', 0)
-                            .arg(lagMs, 0, 'f', 0));
+                            .arg(result.minLagSamples * dtMs, 0, 'f', 0)
+                            .arg(result.maxLagSamples * dtMs, 0, 'f', 0)
+                            .arg(result.description.isEmpty() ? QString(", 1 at lag 0") : QString()));
+    DbCurve curve;
+    curve.name = "Power";
+    curve.color = QColor(0x39, 0x87, 0xe5);
+    curve.db = result.spectrumDb;
+    static_cast<DbCurveChart*>(spectrumChart_)->setCurves(result.spectrumHz, {curve});
 }
 
-void AutocorrelationDialog::setApplyCallback(std::function<void(double)> callback) { onApply_ = std::move(callback); }
+void AutocorrelationDialog::setApplyCallback(std::function<void(double, double)> callback) { onApply_ = std::move(callback); }
 
 void OctaveBandDialog::emitApply() {
     if (!onApply_ || sourceCombo_->count() == 0) return;
@@ -6328,7 +6528,7 @@ MainWindow::MainWindow() : QMainWindow() {
             return;
         }
         openAutocorrelationDialog();
-        computeAndShowAutocorrelation(activePanel_, autocorrelationDialog_->lengthMs());
+        computeAndShowAutocorrelation(activePanel_, autocorrelationDialog_->minLagMs(), autocorrelationDialog_->maxLagMs());
     });
 
     // x-f display: per-trace amplitude spectra of what's on screen, in dB
@@ -7545,29 +7745,26 @@ void MainWindow::computeAndShowSpectrum(Panel* panel) {
     spectrumPlot_->activateWindow();
 }
 
-void MainWindow::runCalculator(AppState& a, AppState& b, bool subtract, const QString& outputName) {
-    if (!a.loaded || !b.loaded) {
+void MainWindow::runCalculator(std::shared_ptr<Dataset> dsA, std::shared_ptr<Dataset> dsB, bool subtract,
+                               const QString& outputName) {
+    if (!dsA || !dsB || dsA->traceCount <= 0 || dsB->traceCount <= 0) {
         flashStatusMessage("No data selected");
         return;
     }
     // Clipped to the overlap when the two datasets differ in size, rather
     // than refusing -- combining a full line with a sub-window of it is a
     // reasonable thing to want.
-    int64_t traceCount = std::min(a.foreground->traceCount, b.foreground->traceCount);
-    int samplesPerTrace = std::min<int>(a.foreground->binHeader.samplesPerTrace, b.foreground->binHeader.samplesPerTrace);
+    int64_t traceCount = std::min(dsA->traceCount, dsB->traceCount);
+    int samplesPerTrace = std::min<int>(dsA->binHeader.samplesPerTrace, dsB->binHeader.samplesPerTrace);
     if (traceCount <= 0 || samplesPerTrace <= 0) {
         flashStatusMessage("No data selected");
         return;
     }
 
-    // Snapshot the two source Datasets by shared_ptr *now*, on the UI
-    // thread -- the background closure below reads through these, never
-    // through `a`/`b` again, so it stays correct (and the underlying
-    // mmap'd files/pyramids stay alive) even if the user switches a
-    // panel's Foreground or deletes one of these from the pool while the
-    // computation is still running.
-    std::shared_ptr<Dataset> dsA = a.foreground;
-    std::shared_ptr<Dataset> dsB = b.foreground;
+    // The background closure below reads through these shared_ptrs, so
+    // it stays correct (and the underlying mmap'd files/pyramids stay
+    // alive) even if a panel switches Foreground or one of these is
+    // deleted from the pool while the computation is still running.
 
     segy::BinaryHeader outHeader = dsA->binHeader;
     outHeader.samplesPerTrace = int16_t(samplesPerTrace);
@@ -7889,14 +8086,37 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
 void MainWindow::openCalculatorDialog() {
     if (!calculatorDialog_) {
         calculatorDialog_ = new CalculatorDialog(this);
-        calculatorDialog_->setApplyCallback([this](int idxA, int idxB, bool subtract, QString outputName) {
-            Panel* a = idxA == 0 ? &panelA_ : &panelB_;
-            Panel* b = idxB == 0 ? &panelA_ : &panelB_;
-            runCalculator(a->app, b->app, subtract, outputName);
+        calculatorDialog_->setApplyCallback([this](int idxA, int idxB, int op, QString outputName) {
+            if (idxA < 0 || idxB < 0 || idxA >= int(datasetPool_.size()) || idxB >= int(datasetPool_.size())) return;
+            std::shared_ptr<Dataset> a = datasetPool_[size_t(idxA)];
+            std::shared_ptr<Dataset> b = datasetPool_[size_t(idxB)];
+            if (op == 2) {
+                double minMs = 200.0, maxMs = 200.0;
+                if (crossCorrelationDialog_) {
+                    minMs = crossCorrelationDialog_->minLagMs();
+                    maxMs = crossCorrelationDialog_->maxLagMs();
+                }
+                computeAndShowCrossCorrelation(a, b, minMs, maxMs);
+            } else {
+                runCalculator(a, b, op == 1, outputName);
+            }
         });
     }
-    calculatorDialog_->refreshPanels(QString::fromStdString(panelA_.app.foreground->filePath.stem().string()), panelA_.app.loaded,
-                                      QString::fromStdString(panelB_.app.foreground->filePath.stem().string()), panelB_.app.loaded);
+    // The whole dataset list (not just what the panels show), defaulting to
+    // the two panels' Foregrounds.
+    QStringList names;
+    int defaultA = -1, defaultB = -1;
+    for (size_t i = 0; i < datasetPool_.size(); ++i) {
+        const Dataset& ds = *datasetPool_[i];
+        QString label = QString::fromStdString(ds.name);
+        if (!ds.attribute.empty()) label += QString("   [%1]").arg(QString::fromStdString(ds.attribute));
+        names << label;
+        if (panelA_.app.loaded && panelA_.app.foreground == datasetPool_[i]) defaultA = int(i);
+        if (panelB_.app.loaded && panelB_.app.foreground == datasetPool_[i]) defaultB = int(i);
+    }
+    if (defaultA < 0 && !names.isEmpty()) defaultA = 0;
+    if (defaultB < 0 && names.size() > 1) defaultB = defaultA == 0 ? 1 : 0;
+    calculatorDialog_->refreshDatasets(names, defaultA, defaultB);
     calculatorDialog_->show();
     calculatorDialog_->raise();
     calculatorDialog_->activateWindow();
@@ -9137,11 +9357,11 @@ void MainWindow::openAutocorrelationDialog() {
         autocorrelationDialog_ = new AutocorrelationDialog(this);
         // Recomputes from whichever panel is active at Apply time (non-modal).
         autocorrelationDialog_->setApplyCallback(
-            [this](double lengthMs) { computeAndShowAutocorrelation(activePanel_, lengthMs); });
+            [this](double minMs, double maxMs) { computeAndShowAutocorrelation(activePanel_, minMs, maxMs); });
     }
 }
 
-void MainWindow::computeAndShowAutocorrelation(Panel* sourcePanel, double lengthMs) {
+void MainWindow::computeAndShowAutocorrelation(Panel* sourcePanel, double minLagMs, double maxLagMs) {
     if (sourcePanel->app.xf.active) {
         flashStatusMessage("Not available on an x-f display");
         return;
@@ -9157,59 +9377,140 @@ void MainWindow::computeAndShowAutocorrelation(Panel* sourcePanel, double length
     int64_t t1 = std::min<int64_t>(app.foreground->traceCount, int64_t(std::ceil(app.view.traceEnd)));
     int s0 = std::max(0, int(std::floor(app.view.sampleStart)));
     int s1 = std::min<int>(app.foreground->binHeader.samplesPerTrace, int(std::ceil(app.view.sampleEnd)));
-    int64_t visibleTraces = t1 - t0;
-    int visibleSamples = s1 - s0;
-    double intervalUs = app.foreground->binHeader.sampleIntervalUs;
-    if (visibleTraces <= 0 || visibleSamples < 2 || intervalUs <= 0) return;
-    int maxLag = int(std::lround(lengthMs * 1000.0 / intervalUs));
-    maxLag = std::clamp(maxLag, 1, visibleSamples - 1);
+    const double intervalUs = app.foreground->binHeader.sampleIntervalUs;
+    if (t1 - t0 <= 0 || s1 - s0 < 2 || intervalUs <= 0) return;
+    const int visible = s1 - s0;
+    const int minLag = -std::clamp(int(std::lround(minLagMs * 1000.0 / intervalUs)), 0, visible - 1);
+    const int maxLag = std::clamp(int(std::lround(maxLagMs * 1000.0 / intervalUs)), 0, visible - 1);
+    if (maxLag - minLag < 2) {
+        flashStatusMessage("Lag window too small");
+        return;
+    }
+    openAutocorrelationDialog();
+    runCorrelation(autocorrelationDialog_, app.foreground, app.foreground, t0, t1, s0, s1, minLag, maxLag,
+                   app.display.colorScale, app.display.colorScaleFlipped,
+                   QString("Autocorrelation") + datasetTitleSuffix(app), QString());
+}
 
-    std::shared_ptr<Dataset> ds = app.foreground;
-    segy::ColorScale colorScale = app.display.colorScale;
-    bool colorScaleFlipped = app.display.colorScaleFlipped;
-    // Evenly spaced traces across the view, like the octave panels.
-    constexpr int kMaxAutocorrelationTraces = 240;
-    int decodeCount = int(std::min<int64_t>(visibleTraces, kMaxAutocorrelationTraces));
+void MainWindow::computeAndShowCrossCorrelation(std::shared_ptr<Dataset> a, std::shared_ptr<Dataset> b,
+                                                double minLagMs, double maxLagMs) {
+    if (!a || !b) return;
+    crossA_ = a;
+    crossB_ = b;
+    if (!crossCorrelationDialog_) {
+        crossCorrelationDialog_ = new AutocorrelationDialog(this, /*crossCorrelation=*/true);
+        crossCorrelationDialog_->setApplyCallback([this](double minMs, double maxMs) {
+            computeAndShowCrossCorrelation(crossA_, crossB_, minMs, maxMs);
+        });
+    }
+    // Trace i of A with trace i of B over the whole common trace length.
+    const int64_t traces = std::min(a->traceCount, b->traceCount);
+    const int samples = std::min<int>(a->binHeader.samplesPerTrace, b->binHeader.samplesPerTrace);
+    const double intervalUs = a->binHeader.sampleIntervalUs;
+    if (traces <= 0 || samples < 2 || intervalUs <= 0) {
+        flashStatusMessage("Not enough data to cross-correlate");
+        return;
+    }
+    if (a->binHeader.sampleIntervalUs != b->binHeader.sampleIntervalUs) {
+        flashStatusMessage("Different sample intervals: cross-correlation needs the same");
+        return;
+    }
+    const int minLag = -std::clamp(int(std::lround(minLagMs * 1000.0 / intervalUs)), 0, samples - 1);
+    const int maxLag = std::clamp(int(std::lround(maxLagMs * 1000.0 / intervalUs)), 0, samples - 1);
+    const QString nameA = QString::fromStdString(a->name), nameB = QString::fromStdString(b->name);
+    runCorrelation(crossCorrelationDialog_, a, b, 0, traces, 0, samples, minLag, maxLag, app_->display.colorScale,
+                   app_->display.colorScaleFlipped, QString("Cross-correlation %1 %2 %3").arg(nameA, QChar(0x00D7), nameB),
+                   QString("%1 %2 %3").arg(nameA, QChar(0x00D7), nameB));
+}
+
+void MainWindow::runCorrelation(AutocorrelationDialog* dialog, std::shared_ptr<Dataset> a, std::shared_ptr<Dataset> b,
+                                int64_t t0, int64_t t1, int s0, int s1, int minLag, int maxLag,
+                                segy::ColorScale colorScale, bool colorScaleFlipped, const QString& title,
+                                const QString& description) {
+    const int visibleSamples = s1 - s0;
+    const double intervalUs = a->binHeader.sampleIntervalUs;
+    // Evenly spaced traces across the range, like the octave panels.
+    constexpr int kMaxCorrelationTraces = 240;
+    const int decodeCount = int(std::min<int64_t>(t1 - t0, kMaxCorrelationTraces));
     auto result = std::make_shared<AutocorrelationResult>();
     result->traceStart = double(t0);
     result->traceEnd = double(t1 - 1);
+    result->minLagSamples = minLag;
     result->maxLagSamples = maxLag;
     result->sampleIntervalUs = intervalUs;
     result->traceCount = decodeCount;
+    result->description = description;
 
     runBackgroundTask(
-        QString("Autocorrelation: %1 ms").arg(lengthMs, 0, 'f', 0),
-        [this, ds, t0, t1, s0, visibleSamples, decodeCount, maxLag, colorScale, colorScaleFlipped, result]() {
+        QString("%1: %2 traces").arg(description.isEmpty() ? QString("Autocorrelation") : QString("Cross-correlation"))
+            .arg(decodeCount),
+        [this, a, b, t0, t1, s0, visibleSamples, decodeCount, minLag, maxLag, colorScale, colorScaleFlipped, result]() {
             backgroundTaskTotal_ = decodeCount;
-            const int width = 2 * maxLag + 1; // -L..+L
+            const int width = maxLag - minLag + 1;
             std::vector<std::vector<float>> panel(size_t(decodeCount), std::vector<float>(size_t(width), 0.0f));
             std::vector<double> sum(size_t(width), 0.0);
             int contributing = 0;
-            double step = double(t1 - t0) / double(decodeCount);
-            int sampleSize = segy::sampleFormatSizeBytes(ds->binHeader.formatCode);
-            std::vector<float> samples(static_cast<size_t>(visibleSamples));
+            const double step = double(t1 - t0) / double(decodeCount);
+            std::vector<float> sa(static_cast<size_t>(visibleSamples)), sb(static_cast<size_t>(visibleSamples));
+            auto decode = [visibleSamples, s0](const Dataset& ds, int64_t traceIdx, float* out) {
+                const int sampleSize = segy::sampleFormatSizeBytes(ds.binHeader.formatCode);
+                const uint8_t* traceBase = ds.file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * ds.traceStrideBytes;
+                segy::decodeSamples(traceBase + segy::kTraceHeaderSize + size_t(s0) * size_t(sampleSize), out,
+                                    size_t(visibleSamples), ds.binHeader.formatCode);
+            };
             for (int i = 0; i < decodeCount; ++i) {
-                int64_t traceIdx = std::min<int64_t>(t0 + int64_t((double(i) + 0.5) * step), t1 - 1);
-                const uint8_t* traceBase =
-                    ds->file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * ds->traceStrideBytes;
-                segy::decodeSamples(traceBase + segy::kTraceHeaderSize + size_t(s0) * size_t(sampleSize),
-                                    samples.data(), size_t(visibleSamples), ds->binHeader.formatCode);
-                std::vector<float> r = segy::normalizedAutocorrelation(samples.data(), visibleSamples, maxLag);
-                std::vector<float>& out = panel[size_t(i)];
-                for (int k = 0; k <= maxLag; ++k) {
-                    out[size_t(maxLag + k)] = r[size_t(k)];
-                    out[size_t(maxLag - k)] = r[size_t(k)];
+                const int64_t traceIdx = std::min<int64_t>(t0 + int64_t((double(i) + 0.5) * step), t1 - 1);
+                decode(*a, traceIdx, sa.data());
+                const float* other = sa.data();
+                if (b != a) {
+                    decode(*b, traceIdx, sb.data());
+                    other = sb.data();
                 }
-                // Dead traces (r[0] == 0 -> all zero) don't drag the average down.
-                if (r[0] > 0.0f) {
+                std::vector<float> corr = segy::normalizedCrossCorrelation(sa.data(), other, visibleSamples, minLag, maxLag);
+                const bool dead = std::all_of(corr.begin(), corr.end(), [](float v) { return v == 0.0f; });
+                panel[size_t(i)] = corr;
+                // Dead traces (all zero) don't drag the average down.
+                if (!dead) {
                     ++contributing;
-                    for (int j = 0; j < width; ++j) sum[size_t(j)] += out[size_t(j)];
+                    for (int j = 0; j < width; ++j) sum[size_t(j)] += corr[size_t(j)];
                 }
                 backgroundTaskDone_ = i + 1;
             }
             result->average.assign(size_t(width), 0.0f);
             if (contributing > 0) {
                 for (int j = 0; j < width; ++j) result->average[size_t(j)] = float(sum[size_t(j)] / contributing);
+            }
+            // Peak-to-peak: nearest side peak of the average >= 0.5.
+            result->peakLagSamples = segy::nearestSidePeakLag(result->average, minLag, 0.5);
+            if (!std::isnan(result->peakLagSamples)) {
+                const int idx = std::clamp(int(std::lround(result->peakLagSamples)) - minLag, 0, width - 1);
+                result->peakValue = result->average[size_t(idx)];
+            }
+            // Power spectrum of the average: lags tapered (cosine squared
+            // to each end) and placed circularly (lag k at index k mod N).
+            const size_t len = segy::nextPowerOfTwo(size_t(std::max(64, 2 * width)));
+            std::vector<std::complex<float>> buf(len, std::complex<float>(0.0f, 0.0f));
+            const double pi = std::acos(-1.0);
+            for (int j = 0; j < width; ++j) {
+                const int lag = minLag + j;
+                const double side = lag >= 0 ? double(std::max(1, maxLag)) : double(std::max(1, -minLag));
+                const double w = std::cos(0.5 * pi * std::min(1.0, std::fabs(double(lag)) / (side + 1.0)));
+                buf[size_t((lag % int(len) + int(len)) % int(len))] = float(result->average[size_t(j)] * w * w);
+            }
+            segy::fft(buf);
+            const size_t half = len / 2;
+            double peak = 0.0;
+            std::vector<double> power(half + 1);
+            for (size_t m = 0; m <= half; ++m) {
+                power[m] = std::abs(buf[m]);
+                peak = std::max(peak, power[m]);
+            }
+            const double dtSeconds = result->sampleIntervalUs * 1e-6;
+            for (size_t m = 0; m <= half; ++m) {
+                result->spectrumHz.push_back(float(double(m) / (double(len) * dtSeconds)));
+                result->spectrumDb.push_back(peak > 0.0 && power[m] > 0.0
+                                                 ? std::max(-120.0f, float(10.0 * std::log10(power[m] / peak)))
+                                                 : std::numeric_limits<float>::quiet_NaN());
             }
             auto data = std::make_shared<OctaveBandData>();
             data->traces = std::move(panel);
@@ -9218,13 +9519,12 @@ void MainWindow::computeAndShowAutocorrelation(Panel* sourcePanel, double length
             data->colorScaleFlipped = colorScaleFlipped;
             result->panel = std::move(data);
         },
-        [this, sourcePanel, result]() {
-            openAutocorrelationDialog();
-            autocorrelationDialog_->setResult(*result);
-            autocorrelationDialog_->setWindowTitle(QString("Autocorrelation") + datasetTitleSuffix(sourcePanel->app));
-            autocorrelationDialog_->show();
-            autocorrelationDialog_->raise();
-            autocorrelationDialog_->activateWindow();
+        [dialog, result, title]() {
+            dialog->setResult(*result);
+            dialog->setWindowTitle(title);
+            dialog->show();
+            dialog->raise();
+            dialog->activateWindow();
         });
 }
 

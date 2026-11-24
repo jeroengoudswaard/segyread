@@ -413,6 +413,49 @@ void traceDerivative(std::vector<float>& trace, double sampleIntervalUs, double 
     for (size_t i = 0; i < n; ++i) trace[i] = float(out[i] - (a < 0.0 ? outMean : 0.0));
 }
 
+std::vector<float> normalizedCrossCorrelation(const float* a, const float* b, int count, int minLag, int maxLag) {
+    if (count <= 0 || maxLag < minLag) return {};
+    double ea = 0.0, eb = 0.0;
+    for (int i = 0; i < count; ++i) {
+        ea += double(a[i]) * a[i];
+        eb += double(b[i]) * b[i];
+    }
+    std::vector<float> out(size_t(maxLag - minLag + 1), 0.0f);
+    if (ea <= 0.0 || eb <= 0.0) return out;
+    const double norm = 1.0 / std::sqrt(ea * eb);
+    for (int k = minLag; k <= maxLag; ++k) {
+        double sum = 0.0;
+        const int lo = std::max(0, -k), hi = std::min(count, count - k);
+        for (int i = lo; i < hi; ++i) sum += double(a[i]) * b[i + k];
+        out[size_t(k - minLag)] = float(sum * norm);
+    }
+    return out;
+}
+
+double nearestSidePeakLag(const std::vector<float>& correlation, int minLag, double threshold) {
+    const int n = int(correlation.size());
+    const int zero = -minLag; // index of lag 0
+    if (n < 3 || zero < 0 || zero >= n) return std::nan("");
+    auto at = [&](int i) { return double(correlation[size_t(i)]); };
+    // Walk outwards from lag 0 in one direction: past the central lobe (to
+    // the first local minimum), then to the next local maximum.
+    auto search = [&](int step) -> double {
+        int i = zero;
+        while (i + step > 0 && i + step < n - 1 && at(i + step) <= at(i)) i += step; // down the central lobe
+        while (i + step > 0 && i + step < n - 1 && at(i + step) > at(i)) i += step;  // up to the side peak
+        if (i == zero || i <= 0 || i >= n - 1) return std::nan("");
+        if (at(i) < threshold || at(i) < at(i - 1) || at(i) < at(i + 1)) return std::nan("");
+        const double ym = at(i - 1), y0 = at(i), yp = at(i + 1);
+        const double curvature = ym - 2.0 * y0 + yp;
+        const double delta = curvature < 0.0 ? std::clamp(0.5 * (ym - yp) / curvature, -0.5, 0.5) : 0.0;
+        return double(i - zero) + delta;
+    };
+    const double right = search(+1), left = search(-1);
+    if (std::isnan(right)) return left;
+    if (std::isnan(left)) return right;
+    return std::fabs(left) < std::fabs(right) ? left : right;
+}
+
 std::vector<float> fractionalShift(const std::vector<float>& x, double shift) {
     const size_t n = x.size();
     if (n == 0 || shift == 0.0) return x;

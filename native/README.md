@@ -3057,6 +3057,44 @@ These are the user's decisions on COPILOT.md items 21, 23, 24, 25 and 32.
   a script can't set up here (loading goes through modal dialogs). They
   build and run, but please check them by hand.
 
+### Autocorrelation window rework; Calculator: whole dataset list, Cross-correlate
+
+These are the user's decisions on COPILOT.md items 22 and 26-30.
+
+- **Lag window (27):** separate **−lag** and **+lag** fields (ms), so the
+  window can be asymmetric. `segy::normalizedCrossCorrelation(a, b, n,
+  minLag, maxLag)` computes any window, and with a == b it is the
+  autocorrelation. Tested against the one-sided autocorrelation, for
+  symmetry, and for a known 7-sample shift.
+- **Zoom (26):** Zoom / Unzoom / Box on the lag axis. Box drags a lag range
+  on the average curve. Zoom sets the lag fields to it and recomputes;
+  without a box it waits for one and zooms when it's drawn, like the
+  seismic display. Unzoom steps back through the previous windows.
+- **Peak-to-peak (28):** the nearest side peak of the average with
+  r ≥ 0.5, on either side of lag 0 (`segy::nearestSidePeakLag`: past the
+  central lobe, to the next local maximum, with parabolic refinement). It
+  is shown as "Peak-to-peak: 32.0 ms (r = 0.62)", or "no side peak ≥ 0.5",
+  and marked with orange dashes at ±lag. **Delta-t tool:** click the
+  average curve twice to read Δt between the two lags; a third click
+  starts over.
+- **Spectrum (29):** the "Spectrum" toggle (off by default) shows the
+  average's power spectrum (dB) below the plots, in the same chart as
+  Spectrum. The lags get a cosine-squared taper, separately for each side.
+- **Calculator (22):** the dataset choices are now **the whole dataset
+  list**, including filtered results and attribute volumes, instead of
+  only what panels A and B show. That was why it "did not always show all
+  data sets". The defaults are the two panels' Foregrounds.
+- **Cross-correlate (30):** a third operation. Trace i of A with trace i
+  of B (normalized, up to 240 evenly spaced traces, the whole common
+  length) opens in its own window, the same one as the autocorrelation:
+  correlogram, average, peak-to-peak, Δt, spectrum and zoom. Apply
+  recomputes the same pair with new lags. It needs equal sample
+  intervals. It produces no new dataset, as decided.
+- **Checked by screenshot:** the autocorrelation window on the PARAGON
+  stack, which correctly reports no side peak ≥ 0.5 (its first side lobe
+  is about −0.1). The calculator's Cross-correlate opens through two
+  datasets in a modal flow, so it was not checked with a screenshot.
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`

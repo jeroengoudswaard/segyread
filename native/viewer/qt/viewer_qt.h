@@ -1000,23 +1000,21 @@ class CalculatorDialog : public QDialog {
 public:
     explicit CalculatorDialog(QWidget* parent = nullptr);
 
-    // `panelIndex` in the callback below is 0 for the panel named by
-    // `nameA`/`loadedA` here, 1 for `nameB`/`loadedB` -- i.e. MainWindow's
-    // panelA_/panelB_, not to be confused with the dialog's own "Dataset A"/
-    // "Dataset B" combo boxes, which each independently pick one of the two.
-    void refreshPanels(const QString& nameA, bool loadedA, const QString& nameB, bool loadedB);
-    void setApplyCallback(std::function<void(int operandAPanelIndex, int operandBPanelIndex, bool subtract,
-                                              QString outputName)>
-                              callback);
+    // Every dataset in the dataset list; `defaultA`/`defaultB` index into it
+    // (the two panels' Foregrounds, normally).
+    void refreshDatasets(const QStringList& names, int defaultA, int defaultB);
+    // op: 0 = add, 1 = subtract, 2 = cross-correlate (a popup, no dataset).
+    void setApplyCallback(std::function<void(int datasetA, int datasetB, int op, QString outputName)> callback);
 
 private:
     QComboBox* datasetACombo_ = nullptr;
     QComboBox* datasetBCombo_ = nullptr;
     QRadioButton* addRadio_ = nullptr;
     QRadioButton* subtractRadio_ = nullptr;
+    QRadioButton* crossRadio_ = nullptr;
     QLineEdit* outputNameEdit_ = nullptr;
     bool outputNameEdited_ = false; // true once the user types into it directly -- stop auto-updating it
-    std::function<void(int, int, bool, QString)> onApply_;
+    std::function<void(int, int, int, QString)> onApply_;
 
     void updateDefaultOutputName();
     void emitApply();
@@ -1165,37 +1163,62 @@ private:
     void emitApply();
 };
 
-// Analysis > Autocorrelation: per-trace normalized autocorrelation of the
-// visible traces/samples, lags -L..+L with lag 0 in the middle, shown as an
-// autocorrelogram (one column per trace, same smooth raster plot as the
-// Octave Band Display) plus the average over all traces as a curve on the
-// same lag axis. L (ms) is the user's one parameter. MainWindow computes it
-// (computeAndShowAutocorrelation) and feeds it back via setResult().
+// Analysis > Autocorrelation, and Processing > Calculator's Cross-correlate:
+// per-trace normalized correlation over lags -lag..+lag (each side set on
+// its own, so the window can be asymmetric), shown as a correlogram (one
+// column per trace, the Octave Band Display's raster) beside the average
+// over all traces. Above the plots: the peak-to-peak distance (nearest side
+// peak of the average >= 0.5, marked on the curve), and Zoom / Unzoom / Box
+// on the lag axis. Clicking the average curve twice measures a delta-t. A
+// Spectrum toggle (off by default) shows the average's power spectrum
+// below. MainWindow computes it and feeds it back via setResult().
 struct AutocorrelationResult {
-    std::shared_ptr<const OctaveBandData> panel; // traces = per-trace -L..+L autocorrelations, clip 1
-    std::vector<float> average;                  // -L..+L, same length as each panel trace
+    std::shared_ptr<const OctaveBandData> panel; // traces = per-trace correlations, minLag..maxLag, clip 1
+    std::vector<float> average;                  // minLag..maxLag, same length as each panel trace
     double traceStart = 0.0;
     double traceEnd = 0.0;
+    int minLagSamples = 0;
     int maxLagSamples = 0;
     double sampleIntervalUs = 0.0;
     int traceCount = 0;
+    double peakLagSamples = 0.0; // NaN: no side peak >= 0.5
+    float peakValue = 0.0f;
+    std::vector<float> spectrumHz; // power spectrum of the average (dB re its peak)
+    std::vector<float> spectrumDb;
+    QString description; // e.g. "A x B" for a cross-correlation
 };
 
 class AutocorrelationDialog : public QDialog {
 public:
-    explicit AutocorrelationDialog(QWidget* parent = nullptr);
+    explicit AutocorrelationDialog(QWidget* parent = nullptr, bool crossCorrelation = false);
 
-    double lengthMs() const;
+    double minLagMs() const; // negative side, as a positive number of ms
+    double maxLagMs() const;
     void setResult(const AutocorrelationResult& result);
-    void setApplyCallback(std::function<void(double lengthMs)> callback);
+    void setApplyCallback(std::function<void(double minLagMs, double maxLagMs)> callback);
 
 private:
-    QDoubleSpinBox* lengthSpin_ = nullptr;
+    QDoubleSpinBox* minLagSpin_ = nullptr;
+    QDoubleSpinBox* maxLagSpin_ = nullptr;
     QLabel* infoLabel_ = nullptr;
+    QLabel* peakLabel_ = nullptr;
+    QCheckBox* spectrumCheck_ = nullptr;
+    QAction* zoomAction_ = nullptr;
+    QAction* unzoomAction_ = nullptr;
+    QAction* boxAction_ = nullptr;
     QWidget* panelPlot_ = nullptr;   // OctaveBandPlotWidget (defined in viewer_qt.cpp)
     QWidget* averagePlot_ = nullptr; // AutocorrelationAverageWidget (likewise)
-    double lastAppliedLengthMs_ = -1.0; // length of the result on screen; see the editingFinished guard
-    std::function<void(double)> onApply_;
+    QWidget* spectrumChart_ = nullptr; // DbCurveChart
+    std::vector<std::pair<double, double>> zoomHistory_; // previous (minLagMs, maxLagMs)
+    bool hasLagBox_ = false;
+    double lagBoxA_ = 0.0, lagBoxB_ = 0.0; // ms, signed
+    bool zoomWhenBoxDrawn_ = false;
+    double lastAppliedMin_ = -1.0, lastAppliedMax_ = -1.0; // the result on screen; see the editingFinished guard
+    std::function<void(double, double)> onApply_;
+
+    void applyWindow(double minLagMs, double maxLagMs);
+    void zoomToLagBox();
+    void refreshZoomActions();
 };
 
 // Analysis > Signal/Noise: SIGCOR estimate (segy::computeSigcor) of the
@@ -1731,6 +1754,8 @@ private:
     double fkLastOffsetScalar_ = 1.0;
     double fkLastCdpDistance_ = 1.0;
     AutocorrelationDialog* autocorrelationDialog_ = nullptr;
+    AutocorrelationDialog* crossCorrelationDialog_ = nullptr;
+    std::shared_ptr<Dataset> crossA_, crossB_; // the Calculator's last Cross-correlate inputs
     SignalNoiseWindow* signalNoiseWindow_ = nullptr;
     bool signalNoiseComputed_ = false; // false until the first compute: Recompute is then always useful
     SignalNoiseSource signalNoiseLastSource_;
@@ -1927,7 +1952,8 @@ private:
     // to a temp SEG-Y file, and loads it into panelA_ (see
     // native/README.md). `outputName` becomes both the output file's stem
     // and the display name shown everywhere via datasetTitleSuffix().
-    void runCalculator(AppState& a, AppState& b, bool subtract, const QString& outputName);
+    void runCalculator(std::shared_ptr<Dataset> dsA, std::shared_ptr<Dataset> dsB, bool subtract,
+                       const QString& outputName);
     // Bandpass-filters every trace of `source`'s full sample range, writes
     // the result to a temp SEG-Y file, and loads it into panelA_.
     void runBandpass(AppState& source, const segy::ButterworthBandParams& params, const QString& outputName);
@@ -1940,7 +1966,16 @@ private:
     void computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, int maxFreqHz);
     // Autocorrelation of `sourcePanel`'s visible traces/samples, lags up to
     // `lengthMs`, shown in autocorrelationDialog_ (background task).
-    void computeAndShowAutocorrelation(Panel* sourcePanel, double lengthMs);
+    void computeAndShowAutocorrelation(Panel* sourcePanel, double minLagMs, double maxLagMs);
+    void computeAndShowCrossCorrelation(std::shared_ptr<Dataset> a, std::shared_ptr<Dataset> b, double minLagMs,
+                                        double maxLagMs);
+    // Shared by both: per-trace correlations of `a` with `b` (the same
+    // dataset for an autocorrelation) over traces [t0, t1) and samples
+    // [s0, s1), up to 240 evenly spaced traces, plus the average, its side
+    // peak and power spectrum; shown in `dialog`.
+    void runCorrelation(AutocorrelationDialog* dialog, std::shared_ptr<Dataset> a, std::shared_ptr<Dataset> b,
+                        int64_t t0, int64_t t1, int s0, int s1, int minLag, int maxLag, segy::ColorScale colorScale,
+                        bool colorScaleFlipped, const QString& title, const QString& description);
     void openAutocorrelationDialog();
     // Signal/Noise (SIGCOR, prefs_.signalNoise) of `sourcePanel`'s active
     // selection box, or its visible data without one; background task,
