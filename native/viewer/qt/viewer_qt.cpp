@@ -9034,25 +9034,55 @@ namespace {
 // filled, scaled to its own peak -- a quick look beside the sample table.
 class TraceWiggleWidget : public QWidget {
 public:
-    explicit TraceWiggleWidget(QWidget* parent = nullptr) : QWidget(parent) { setMinimumWidth(150); }
+    explicit TraceWiggleWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setMinimumWidth(150);
+        setCursor(Qt::CrossCursor);
+    }
     void setSamples(std::vector<float> samples, double sampleIntervalMs) {
         samples_ = std::move(samples);
         sampleIntervalMs_ = sampleIntervalMs;
+        if (marker_ >= int(samples_.size())) marker_ = -1;
         update();
+    }
+    // The sample picked in the table: a red line and dot (-1 = none).
+    void setMarker(int sample) {
+        marker_ = sample;
+        update();
+    }
+    std::function<void(int sample)> onSampleClicked; // a click on the wiggle, nearest sample
+
+protected:
+    QRect plotRect() const { return rect().adjusted(8, 10, -8, -10); }
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton || samples_.size() < 2) return;
+        const QRect plot = plotRect();
+        const double frac = (event->position().y() - plot.top()) / std::max(1, plot.height());
+        const int sample = std::clamp(int(std::lround(frac * double(samples_.size() - 1))), 0, int(samples_.size()) - 1);
+        marker_ = sample;
+        update();
+        if (onSampleClicked) onSampleClicked(sample);
     }
 
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this);
         painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
-        const QRect plot = rect().adjusted(8, 10, -8, -10);
+        const QRect plot = plotRect();
         painter.fillRect(plot, Qt::white);
         if (samples_.size() < 2 || plot.height() <= 0) return;
+        // Non-finite values (e.g. IBM floats read in the wrong byte order)
+        // don't set the scale, and everything is clamped to the plot.
         float peak = 0.0f;
-        for (float v : samples_) peak = std::max(peak, std::fabs(v));
+        for (float v : samples_) {
+            if (std::isfinite(v)) peak = std::max(peak, std::fabs(v));
+        }
         const double centre = plot.center().x();
         const double half = plot.width() / 2.0 - 2.0;
-        auto xFor = [&](float v) { return centre + (peak > 0.0f ? double(v) / peak : 0.0) * half; };
+        auto xFor = [&](float v) {
+            const double t = peak > 0.0f && std::isfinite(v) ? std::clamp(double(v) / peak, -1.0, 1.0) : 0.0;
+            return centre + t * half;
+        };
+        painter.setClipRect(plot);
         auto yFor = [&](size_t i) { return plot.top() + double(i) / double(samples_.size() - 1) * plot.height(); };
         painter.setRenderHint(QPainter::Antialiasing, true);
         QPainterPath fill;
@@ -9066,11 +9096,22 @@ protected:
         painter.drawPolyline(line);
         painter.setPen(QPen(QColor(0x9a, 0x9c, 0xa3), 1, Qt::DashLine));
         painter.drawLine(QPointF(centre, plot.top()), QPointF(centre, plot.bottom()));
+        if (marker_ >= 0 && marker_ < int(samples_.size())) {
+            const double y = yFor(size_t(marker_));
+            painter.setPen(QPen(QColor(0xe0, 0x2b, 0x2b), 1.5));
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+            painter.setBrush(QColor(0xe0, 0x2b, 0x2b));
+            painter.drawEllipse(QPointF(xFor(samples_[size_t(marker_)]), y), 4.0, 4.0);
+            painter.setPen(QColor(0xe0, 0x2b, 0x2b));
+            painter.drawText(QRectF(plot.left() + 4, y - 18, plot.width() - 8, 16), Qt::AlignRight | Qt::AlignVCenter,
+                             QString("%1 ms").arg(marker_ * sampleIntervalMs_, 0, 'f', 1));
+        }
     }
 
 private:
     std::vector<float> samples_;
     double sampleIntervalMs_ = 0.0;
+    int marker_ = -1;
 };
 } // namespace
 
@@ -9100,10 +9141,11 @@ TraceInspectorWindow::TraceInspectorWindow(QWidget* parent) : QWidget(parent, Qt
     standardCombo_->setToolTip("Trace header definition: Shell V2.1 (default), SEG-Y rev 1.0 or rev 2.0");
     top->addWidget(standardCombo_);
     top->addSpacing(16);
-    top->addWidget(new QLabel("Header byte order"));
+    top->addWidget(new QLabel("Byte order"));
     bigEndianRadio_ = new QRadioButton("Big endian");
     QRadioButton* littleEndian = new QRadioButton("Little endian");
     bigEndianRadio_->setChecked(true);
+    bigEndianRadio_->setToolTip("Byte order for the header values and the samples");
     QButtonGroup* endianGroup = new QButtonGroup(this);
     endianGroup->addButton(bigEndianRadio_);
     endianGroup->addButton(littleEndian);
@@ -9146,6 +9188,17 @@ TraceInspectorWindow::TraceInspectorWindow(QWidget* parent) : QWidget(parent, Qt
         refresh();
     });
     connect(standardCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { refresh(); });
+    // Click on the wiggle: the sample table jumps there. Pick a sample in
+    // the table: a red line and dot on the wiggle.
+    auto* wiggle = static_cast<TraceWiggleWidget*>(wiggle_);
+    wiggle->onSampleClicked = [this](int sample) {
+        if (sample >= samplesTable_->rowCount()) return;
+        QSignalBlocker block(samplesTable_);
+        samplesTable_->selectRow(sample);
+        samplesTable_->scrollToItem(samplesTable_->item(sample, 0), QAbstractItemView::PositionAtCenter);
+    };
+    connect(samplesTable_, &QTableWidget::currentCellChanged, this,
+            [wiggle](int row, int, int, int) { wiggle->setMarker(row); });
     connect(bigEndianRadio_, &QRadioButton::toggled, this, [this](bool) { refresh(); });
 }
 
@@ -9205,8 +9258,20 @@ void TraceInspectorWindow::refresh() {
     const double intervalMs = dataset_->binHeader.sampleIntervalUs / 1000.0;
     std::vector<float> values(static_cast<size_t>(std::max(0, samples)));
     if (samples > 0) {
-        segy::decodeSamples(traceBase + segy::kTraceHeaderSize, values.data(), size_t(samples),
-                            dataset_->binHeader.formatCode);
+        const uint8_t* sampleBytes = traceBase + segy::kTraceHeaderSize;
+        // Little endian: reverse every sample word before decoding (the
+        // decoder reads SEG-Y's big-endian order) -- on a big-endian file
+        // this gives the nonsense values that show the wrong byte order.
+        std::vector<uint8_t> swapped;
+        const int wordSize = segy::sampleFormatSizeBytes(dataset_->binHeader.formatCode);
+        if (!bigEndian && wordSize > 1) {
+            swapped.assign(sampleBytes, sampleBytes + size_t(samples) * size_t(wordSize));
+            for (size_t i = 0; i + size_t(wordSize) <= swapped.size(); i += size_t(wordSize)) {
+                std::reverse(swapped.begin() + std::ptrdiff_t(i), swapped.begin() + std::ptrdiff_t(i + size_t(wordSize)));
+            }
+            sampleBytes = swapped.data();
+        }
+        segy::decodeSamples(sampleBytes, values.data(), size_t(samples), dataset_->binHeader.formatCode);
     }
     samplesTable_->setRowCount(samples);
     for (int i = 0; i < samples; ++i) {
@@ -9218,7 +9283,8 @@ void TraceInspectorWindow::refresh() {
             samplesTable_->setItem(i, col, item);
         }
     }
-    samplesTable_->resizeColumnToContents(0);
+    // Wide enough for the largest sample number, not just the rows in view.
+    samplesTable_->setColumnWidth(0, samplesTable_->fontMetrics().horizontalAdvance(QString::number(std::max(1, samples))) + 24);
     samplesTable_->resizeColumnToContents(1);
     static_cast<TraceWiggleWidget*>(wiggle_)->setSamples(values, intervalMs);
     summaryLabel_->setText(QString("Trace %1 of %2  |  %3 samples, %4 us, data format %5  |  %6")

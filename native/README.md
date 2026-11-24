@@ -3014,11 +3014,24 @@ One trace at a time.
 - **Tested:** each definition tiles bytes 1-240 with no gaps or overlaps.
   Reading works in both byte orders.
 
+**Wiggle and samples are linked:**
+- clicking the wiggle jumps the sample table to that sample and selects
+  it;
+- picking a sample in the table marks it on the wiggle with a red line,
+  a red dot and its time.
+
+The # column is sized for the largest sample number.
+
 **Controls:**
 - **Trace:** a 1-based number. **Follow cursor** (on by default) shows
   the trace under the mouse on either panel, but not on an x-f display.
-- **Header byte order:** big endian (the default) or little endian.
-- **Samples:** decoded in the file's own sample format.
+- **Byte order:** big endian (the default) or little endian. It applies
+  to the header values *and* the samples: in little endian every sample
+  word is byte-reversed before decoding, so a big-endian file shows the
+  nonsense values that give the wrong order away.
+- **Samples:** decoded in the file's own sample format. The wiggle scales
+  to the largest finite value and stays inside its plot even when the
+  wrong byte order produces Inf or NaN.
 
 **Verified** against the user's RadExPro screenshot of the same PARAGON
 trace: depths 800/1800, seabed TWT 405097, water depths
