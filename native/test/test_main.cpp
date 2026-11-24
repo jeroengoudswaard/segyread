@@ -30,6 +30,7 @@
 #include "amplitude.h"
 #include "iirfilter.h"
 #include "trace_header_defs.h"
+#include "horizons.h"
 #include <complex>
 
 namespace {
@@ -1767,6 +1768,76 @@ void testCrossCorrelationAndSidePeak() {
     CHECK(std::isnan(segy::nearestSidePeakLag(noise, -40, 0.5)));
 }
 
+void testHorizons() {
+    section("Horizons: snap to event, seabed auto-pick with outlier repair, point-to-point picks, flatten");
+    const double pi = 3.14159265358979323846;
+    auto ricker = [pi](double t, double f) {
+        const double a = pi * f * t;
+        return (1.0 - 2.0 * a * a) * std::exp(-a * a);
+    };
+    // A parabola peaking at 10.3: snapToEvent finds it to within 0.05.
+    std::vector<float> p(21);
+    for (int i = 0; i < 21; ++i) p[size_t(i)] = float(1.0 - 0.01 * (i - 10.3) * (i - 10.3));
+    CHECK_NEAR(segy::snapToEvent(p.data(), 21, 8.0, 4, segy::PickMode::Peak), 10.3, 0.05);
+    std::vector<float> z = {-2, -1, 1, 2, 3};
+    CHECK_NEAR(segy::snapToEvent(z.data(), 5, 1.0, 2, segy::PickMode::ZeroCrossing), 1.5, 1e-9);
+
+    // Seabed: 60 traces x 400 samples (4 ms), strong 25 Hz event at
+    // 100 + 0.5 t samples, weaker events below, a little noise; trace 30
+    // has a big noise burst above the seabed that must be repaired.
+    const int traces = 60, samples = 400;
+    const double dt = 0.004;
+    std::mt19937 rng(7);
+    std::normal_distribution<double> g(0.0, 0.01);
+    std::vector<std::vector<float>> data(traces, std::vector<float>(samples));
+    auto seabed = [](int t) { return 100.0 + 0.5 * t; };
+    for (int t = 0; t < traces; ++t) {
+        for (int i = 0; i < samples; ++i) {
+            double v = ricker((i - seabed(t)) * dt, 25.0) + 0.2 * ricker((i - seabed(t) - 60) * dt, 25.0) + g(rng);
+            data[size_t(t)][size_t(i)] = float(v);
+        }
+    }
+    for (int i = 40; i < 44; ++i) data[30][size_t(i)] = 1.5f;
+    auto fetch = [&data, samples](int64_t idx, float* out) { std::copy_n(data[size_t(idx)].begin(), samples, out); };
+    std::vector<double> picks = segy::autoPickSeabed(fetch, 0, traces, samples, 0.3, segy::PickMode::Peak);
+    double worst = 0.0;
+    for (int t = 0; t < traces; ++t) worst = std::max(worst, std::fabs(picks[size_t(t)] - seabed(t)));
+    CHECK(worst < 1.0);
+
+    // Point to point on a curved event: anchors at traces 0 and 40.
+    auto curve = [](int t) { return 150.0 + 8.0 * std::sin(t / 8.0); };
+    for (int t = 0; t < traces; ++t) {
+        for (int i = 0; i < samples; ++i) data[size_t(t)][size_t(i)] = float(ricker((i - curve(t)) * dt, 25.0) + g(rng));
+    }
+    std::vector<double> tracked = segy::pickBetween(fetch, samples, 0, curve(0), 40, curve(40), 10, 20, 0.7,
+                                                    segy::PickMode::Peak);
+    CHECK(tracked.size() == 41);
+    worst = 0.0;
+    for (int t = 0; t <= 40; ++t) worst = std::max(worst, std::fabs(tracked[size_t(t)] - curve(t)));
+    CHECK(worst < 1.0);
+    // Trust above any correlation: every in-between pick stays on the line.
+    std::vector<double> line = segy::pickBetween(fetch, samples, 0, curve(0), 40, curve(40), 10, 20, 1.01,
+                                                 segy::PickMode::Peak);
+    bool onLine = true;
+    for (int t = 1; t < 40; ++t) {
+        const double expected = curve(0) + (curve(40) - curve(0)) * t / 40.0;
+        onLine = onLine && std::fabs(line[size_t(t)] - expected) < 1e-9;
+    }
+    CHECK(onLine);
+    // Backwards (B before A) works the same.
+    std::vector<double> backwards = segy::pickBetween(fetch, samples, 40, curve(40), 0, curve(0), 10, 20, 0.7,
+                                                      segy::PickMode::Peak);
+    CHECK(backwards.size() == 41);
+    CHECK_NEAR(backwards[40], curve(0), 1.0);
+
+    // Flatten: a spike at 50 moved to 30.
+    std::vector<float> spike(100, 0.0f);
+    spike[50] = 1.0f;
+    segy::flattenTrace(spike, 50.0, 30.0);
+    CHECK_NEAR(spike[30], 1.0, 1e-6);
+    CHECK_NEAR(spike[50], 0.0, 1e-6);
+}
+
 void testNormalizedAutocorrelation() {
     section("Analysis: normalized autocorrelation -- hand-computed values, spike, dead trace, lag clamp, periodicity");
     // x = 1,2,3,4: r0 = 30, r1 = 1*2+2*3+3*4 = 20, r2 = 1*3+2*4 = 11, r3 = 1*4 = 4.
@@ -1901,6 +1972,7 @@ int main() {
     testTraceDerivative();
     testTraceHeaderDefinitions();
     testCrossCorrelationAndSidePeak();
+    testHorizons();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

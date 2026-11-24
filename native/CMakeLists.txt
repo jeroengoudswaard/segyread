@@ -86,6 +86,7 @@ add_library(segyviewercore STATIC
     viewer/amplitude.cpp
     viewer/iirfilter.cpp
     viewer/trace_header_defs.cpp
+    viewer/horizons.cpp
 )
 target_include_directories(segyviewercore PUBLIC viewer)
 target_link_libraries(segyviewercore PUBLIC segycore)
