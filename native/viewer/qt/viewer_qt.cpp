@@ -599,7 +599,7 @@ private:
 // with the same 8 px axis font and plot height, so their lines coincide.
 QFont plotAxisFont(const QWidget* widget) {
     QFont f = widget->font();
-    f.setPixelSize(8);
+    f.setPixelSize(10); // 8 px was too small to read
     return f;
 }
 
@@ -709,7 +709,7 @@ protected:
             painter.save();
             painter.translate(plot.left() - 12, y);
             painter.rotate(-90);
-            painter.drawText(QRect(-24, -8, 48, 16), Qt::AlignCenter, QString::fromStdString(tick.label));
+            painter.drawText(QRect(-30, -8, 60, 16), Qt::AlignCenter, QString::fromStdString(tick.label));
             painter.restore();
         }
         // Trace axis: first, middle, last (labels at the two ends).
@@ -718,12 +718,15 @@ protected:
             int x = plot.left() + int(std::round(fraction * (plot.width() - 1)));
             double trace = traceStart_ + fraction * (traceEnd_ - traceStart_);
             painter.drawLine(x, plot.bottom(), x, plot.bottom() + 4);
+            // Whole trace numbers (not 1.508e+04), as wide as they need.
+            const QString text = QString::number(qlonglong(std::llround(trace)));
+            const int tw = QFontMetrics(axisFont).horizontalAdvance(text) + 2;
             if (i == 0) {
-                painter.drawText(QRect(plot.left(), plot.bottom() + 3, 48, 15), Qt::AlignLeft | Qt::AlignVCenter,
-                                 QString::number(std::round(trace), 'g', 4));
-            } else if (i == 2) {
-                painter.drawText(QRect(plot.right() - 47, plot.bottom() + 3, 48, 15),
-                                 Qt::AlignRight | Qt::AlignVCenter, QString::number(std::round(trace), 'g', 4));
+                painter.drawText(QRect(plot.left(), plot.bottom() + 3, tw, 15), Qt::AlignLeft | Qt::AlignVCenter, text);
+            } else if (i == 2 && plot.width() > 2 * tw + 8) {
+                // Kept inside the widget: the plot can reach its right edge.
+                const int left = std::min(plot.right() - tw + 1, width() - tw - 6);
+                painter.drawText(QRect(left, plot.bottom() + 3, tw, 15), Qt::AlignRight | Qt::AlignVCenter, text);
             }
         }
         painter.setFont(font());
@@ -2308,7 +2311,7 @@ protected:
         painter.restore();
         painter.setPen(QColor(0xe0, 0xe2, 0xe7));
         QFont axisFont = painter.font();
-        axisFont.setPixelSize(8);
+        axisFont.setPixelSize(10);
         painter.setFont(axisFont);
         painter.drawText(QRect(plot.left() - 10, plot.bottom() + 3, 20, 14), Qt::AlignCenter, "-1");
         painter.drawText(QRect(int(xFor(0.0)) - 10, plot.bottom() + 3, 20, 14), Qt::AlignCenter, "0");
@@ -3748,6 +3751,7 @@ void FkChart::paintEvent(QPaintEvent*) {
         small.setPixelSize(11);
         painter.setFont(small);
         std::vector<QRectF> placedLabels;
+        std::vector<std::pair<QRectF, QString>> labels; // drawn after every line, so no line crosses a label
         for (double velocity : {300.0, 500.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0}) {
             for (double sign : {-1.0, 1.0}) {
                 const double kTop = sign * view_.y1 * 1000.0 / velocity; // k (cycles/km) at f = top
@@ -3762,7 +3766,7 @@ void FkChart::paintEvent(QPaintEvent*) {
                 painter.setPen(QPen(QColor(255, 255, 255, 200), 1, Qt::DashLine));
                 painter.drawLine(from, to);
                 const QString label = QString::number(int(velocity));
-                const int lw = fm.horizontalAdvance(label) + 6;
+                const int lw = fm.horizontalAdvance(label) + 8;
                 QPointF anchor = to + QPointF(sign > 0 ? -lw - 2 : 4, 4);
                 if (fEnd < view_.y1) anchor = to + QPointF(sign > 0 ? -lw - 2 : 4, -16);
                 QRectF box(anchor, QSizeF(lw, 14));
@@ -3770,10 +3774,13 @@ void FkChart::paintEvent(QPaintEvent*) {
                 for (const QRectF& placed : placedLabels) overlaps = overlaps || placed.adjusted(-2, -2, 2, 2).intersects(box);
                 if (overlaps) continue; // the line stays, its label would collide
                 placedLabels.push_back(box);
-                painter.fillRect(box, QColor(0x14, 0x14, 0x16, 170));
-                painter.setPen(QColor(0xf0, 0xf2, 0xf5));
-                painter.drawText(box, Qt::AlignCenter, label);
+                labels.push_back({box, label});
             }
+        }
+        for (const auto& [box, label] : labels) {
+            painter.fillRect(box, QColor(0x14, 0x14, 0x16)); // opaque: readable over the raster
+            painter.setPen(QColor(0xf0, 0xf2, 0xf5));
+            painter.drawText(box, Qt::AlignCenter, label);
         }
         painter.setFont(font);
     }
@@ -5330,17 +5337,27 @@ void SegyCanvas::paintIdentText(QPainter& painter, const segy::ChromeLayout& chr
     painter.setFont(font);
     painter.setPen(Qt::white);
 
+    // A label that would touch the previous one in its row is skipped, so a
+    // narrow window or long values (e.g. 163004113) never pile up.
     auto drawRow = [&](int y, IdentField field, const std::vector<int64_t>& ticks) {
+        int lastRight = std::numeric_limits<int>::min();
+        const int plotLeft = kCanvasMargin + chrome.plotX, plotRight = plotLeft + chrome.plotWidth;
         for (int64_t idx : ticks) {
             double px, py;
             pixelForData(double(idx), 0.0, px, py);
             QString text = QString::number(identFieldValue(headerAt(idx), field));
             int tw = fm.horizontalAdvance(text);
-            painter.drawText(QPoint(int(std::lround(px)) - tw / 2, y + fm.ascent()), text);
+            int left = int(std::lround(px)) - tw / 2;
+            left = std::clamp(left, plotLeft - tw / 2, std::max(plotLeft - tw / 2, plotRight - tw / 2));
+            if (left < lastRight + 10) continue;
+            painter.drawText(QPoint(left, y + fm.ascent()), text);
+            lastRight = left + tw;
         }
     };
 
-    std::vector<int64_t> textTicks = identTracePositions(app_.view, traceCount, 12);
+    // As many label positions as fit (about one per 90 px, at most 12).
+    const int labelSlots = std::clamp(chrome.plotWidth / 90, 1, 12);
+    std::vector<int64_t> textTicks = identTracePositions(app_.view, traceCount, labelSlots);
     int y = kCanvasMargin;
 
     if (idents.plotField >= 0) {
@@ -5555,6 +5572,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
                 kCanvasMargin + chrome.rightScaleX + chrome.columnGap + chrome.numbersColumnWidth + chrome.columnGap;
 
             painter.setPen(Qt::white);
+            int lastLabelEnd = std::numeric_limits<int>::min();
             for (const segy::TimeTick& tick : chrome.ticks) {
                 // Labels are centered on their tick's Y position, so one
                 // sitting right at the top/bottom edge (e.g. sample 0, or
@@ -5564,6 +5582,8 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
                 // reference example this feature was built from.
                 int halfSpan = fm.horizontalAdvance(QString::fromStdString(tick.label)) / 2;
                 int y = topInset + std::clamp(tick.pixelY, halfSpan, insetHeight - halfSpan);
+                if (y - halfSpan < lastLabelEnd + 6) continue; // would overlap the previous label
+                lastLabelEnd = y + halfSpan;
                 drawRotatedLabel(painter, font, leftNumbersX, y, tick.label);
                 drawRotatedLabel(painter, font, rightNumbersX, y, tick.label);
             }
@@ -9997,6 +10017,24 @@ QString darkStyleSheet() {
         QTableWidget { background: #17181a; color: #d4d4d8; border: 1px solid #3c3f41; gridline-color: #3c3f41; }
         QTableWidget::item { padding: 4px 6px; }
         QHeaderView::section { background: #2b2d30; color: #9a9ca3; border: none; border-bottom: 1px solid #3c3f41; border-right: 1px solid #3c3f41; padding: 4px 6px; }
+        QTableWidget::item:selected, QListWidget::item:selected, QTableView::item:selected { background: #4a3626; color: #f0f2f5; }
+        QTableCornerButton::section { background: #2b2d30; border: none; }
+        QLineEdit { background: #17181a; color: #d4d4d8; border: 1px solid #3c3f41; border-radius: 4px; padding: 2px 6px; selection-background-color: #4a3626; selection-color: #f0f2f5; }
+        QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #e8905a; }
+        QLineEdit:disabled { color: #68696e; }
+        QListWidget, QListView, QTreeView { background: #17181a; color: #d4d4d8; border: 1px solid #3c3f41; }
+        QPlainTextEdit, QTextEdit { background: #17181a; color: #d4d4d8; border: 1px solid #3c3f41; selection-background-color: #4a3626; }
+        QToolTip { background: #2b2d30; color: #f0f2f5; border: 1px solid #4a4c50; padding: 4px 6px; }
+        QTabBar::tab { background: #2b2d30; color: #9a9ca3; padding: 6px 12px; border: 1px solid #3c3f41; }
+        QTabBar::tab:selected { background: #3c3f41; color: #f0f2f5; }
+        QScrollBar:horizontal { background: #17181a; height: 12px; margin: 0; }
+        QScrollBar:vertical { background: #17181a; width: 12px; margin: 0; }
+        QScrollBar::handle:horizontal { background: #4a4c50; min-width: 24px; border-radius: 5px; margin: 2px; }
+        QScrollBar::handle:vertical { background: #4a4c50; min-height: 24px; border-radius: 5px; margin: 2px; }
+        QScrollBar::handle:hover { background: #6b6d72; }
+        QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+        QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+        QAbstractScrollArea::corner { background: #17181a; }
     )");
 }
 
@@ -10050,6 +10088,16 @@ int main(int argc, char** argv) {
     // (Explorer, taskbar before the window paints) is separate, embedded by
     // app.rc.
     app.setWindowIcon(QIcon(QStringLiteral(":/app_icon.png")));
+    {
+        // Disabled text is drawn embossed with the palette's Light colour on
+        // Windows (a white shadow: "Selection" looked doubled and blurry on
+        // the dark background). Make that shadow the background colour.
+        QPalette palette = app.palette();
+        palette.setColor(QPalette::Disabled, QPalette::Light, QColor(0x1e, 0x1f, 0x22));
+        palette.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x68, 0x69, 0x6e));
+        palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x68, 0x69, 0x6e));
+        app.setPalette(palette);
+    }
     app.setStyleSheet(darkStyleSheet());
     segyqt::installDarkTitleBars(app); // Windows: black title bars on every window, matching the theme
     segyqt::MainWindow window;

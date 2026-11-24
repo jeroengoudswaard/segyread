@@ -3125,6 +3125,32 @@ These are the user's decisions on COPILOT.md items 22 and 26-30.
   is about −0.1). The calculator's Cross-correlate opens through two
   datasets in a modal flow, so it was not checked with a screenshot.
 
+### Readability pass (all windows)
+
+I went through every window by screenshot (main window wide and narrow,
+Spectrum/Histogram parameters, Octave Bands, Autocorrelation,
+Signal/Noise, f-k, Trace Inspector, Trace Header Ranges) and fixed:
+
+- **Ident rows (main window):** each row drew 12 labels whatever the
+  width, so a narrow window or long values (163004113) piled up. Now it
+  uses about one label slot per 90 px and skips a label that would touch
+  the previous one.
+- **Time axis (main window):** the last tick is nudged inward at the
+  edge, which made it collide with its neighbour ("10009000"). A label
+  that would overlap the previous one is now skipped.
+- **f-k velocity labels:** the fan's dashed lines ran through the labels
+  ("2000" looked struck through). Labels are now drawn after all lines,
+  on an opaque background.
+- **Octave Bands / Autocorrelation axes:** the axis font went from 8 to
+  10 px. Trace numbers are whole numbers (not "1.508e+04") and stay
+  inside the panel.
+- **Disabled text** (e.g. "Selection" without a box): Windows embossed it
+  with a white shadow, so it looked doubled and blurry. The palette's
+  disabled Light/Text colours now suit the dark theme.
+- **Stylesheet gaps:** QLineEdit, focus borders, lists, text views,
+  tooltips, tabs, selected table rows, and dark scroll bars (they were
+  light and hatched).
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`
