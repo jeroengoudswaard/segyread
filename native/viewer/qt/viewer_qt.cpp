@@ -9310,6 +9310,45 @@ void MainWindow::openTraceInspector() {
     traceInspector_->activateWindow();
 }
 
+namespace {
+// One row of File > Trace Header Ranges. `select` is the segy::IdentField a
+// row can subset and sort on (-1: display only).
+struct HeaderRangeRow {
+    QString name, bytes;
+    std::function<int64_t(const segy::TraceHeader&)> value;
+    int select = -1;
+    int64_t min = std::numeric_limits<int64_t>::max(), max = std::numeric_limits<int64_t>::min();
+    int64_t changes = 0;
+    std::map<int64_t, int64_t> stepCounts;
+};
+
+std::vector<HeaderRangeRow> makeHeaderRangeRows() {
+    std::vector<HeaderRangeRow> rows;
+    auto add = [&rows](const char* name, const char* bytes, int select,
+                       std::function<int64_t(const segy::TraceHeader&)> value) {
+        HeaderRangeRow row;
+        row.name = name;
+        row.bytes = bytes;
+        row.select = select;
+        row.value = std::move(value);
+        rows.push_back(std::move(row));
+    };
+    using F = segy::IdentField;
+    add("Seq (Line)", "1-4", int(F::TraceSequenceLine), [](const segy::TraceHeader& t) { return int64_t(t.traceSequenceLine); });
+    add("Seq (File)", "5-8", int(F::TraceSequenceFile), [](const segy::TraceHeader& t) { return int64_t(t.traceSequenceFile); });
+    add("Field Record (FFID)", "9-12", int(F::FieldRecord), [](const segy::TraceHeader& t) { return int64_t(t.fieldRecord); });
+    add("Trace Number", "13-16", int(F::TraceNumber), [](const segy::TraceHeader& t) { return int64_t(t.traceNumber); });
+    add("CDP", "21-24", int(F::Cdp), [](const segy::TraceHeader& t) { return int64_t(t.cdp); });
+    add("Offset", "37-40", int(F::Offset), [](const segy::TraceHeader& t) { return int64_t(t.offset); });
+    add("Coordinate scalar", "71-72", -1, [](const segy::TraceHeader& t) { return int64_t(t.coordinateScalar); });
+    add("Source X", "73-76", int(F::X), [](const segy::TraceHeader& t) { return int64_t(t.x); });
+    add("Source Y", "77-80", int(F::Y), [](const segy::TraceHeader& t) { return int64_t(t.y); });
+    add("CDP X", "181-184", -1, [](const segy::TraceHeader& t) { return int64_t(t.cdpX); });
+    add("CDP Y", "185-188", -1, [](const segy::TraceHeader& t) { return int64_t(t.cdpY); });
+    return rows;
+}
+} // namespace
+
 void MainWindow::openTraceHeaderRanges() {
     if (!app_->loaded) {
         flashStatusMessage("No data selected");
@@ -9318,32 +9357,7 @@ void MainWindow::openTraceHeaderRanges() {
     // Every trace's header, scanned in the background: per field the byte
     // range, min, max, how often the value changes from trace to trace, and
     // the most common nonzero step.
-    struct Row {
-        QString name, bytes;
-        std::function<int64_t(const segy::TraceHeader&)> value;
-        int64_t min = std::numeric_limits<int64_t>::max(), max = std::numeric_limits<int64_t>::min();
-        int64_t changes = 0;
-        std::map<int64_t, int64_t> stepCounts;
-    };
-    auto rows = std::make_shared<std::vector<Row>>();
-    auto add = [&rows](const char* name, const char* bytes, std::function<int64_t(const segy::TraceHeader&)> value) {
-        Row row;
-        row.name = name;
-        row.bytes = bytes;
-        row.value = std::move(value);
-        rows->push_back(std::move(row));
-    };
-    add("Seq (Line)", "1-4", [](const segy::TraceHeader& t) { return int64_t(t.traceSequenceLine); });
-    add("Seq (File)", "5-8", [](const segy::TraceHeader& t) { return int64_t(t.traceSequenceFile); });
-    add("Field Record (FFID)", "9-12", [](const segy::TraceHeader& t) { return int64_t(t.fieldRecord); });
-    add("Trace Number", "13-16", [](const segy::TraceHeader& t) { return int64_t(t.traceNumber); });
-    add("CDP", "21-24", [](const segy::TraceHeader& t) { return int64_t(t.cdp); });
-    add("Offset", "37-40", [](const segy::TraceHeader& t) { return int64_t(t.offset); });
-    add("Coordinate scalar", "71-72", [](const segy::TraceHeader& t) { return int64_t(t.coordinateScalar); });
-    add("Source X", "73-76", [](const segy::TraceHeader& t) { return int64_t(t.x); });
-    add("Source Y", "77-80", [](const segy::TraceHeader& t) { return int64_t(t.y); });
-    add("CDP X", "181-184", [](const segy::TraceHeader& t) { return int64_t(t.cdpX); });
-    add("CDP Y", "185-188", [](const segy::TraceHeader& t) { return int64_t(t.cdpY); });
+    auto rows = std::make_shared<std::vector<HeaderRangeRow>>(makeHeaderRangeRows());
     std::shared_ptr<Dataset> ds = app_->foreground;
     const QString title = QString("Trace Header Ranges") + datasetTitleSuffix(*app_);
     runBackgroundTask(
@@ -9355,7 +9369,7 @@ void MainWindow::openTraceHeaderRanges() {
                 const segy::TraceHeader th =
                     segy::parseTraceHeader(ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes);
                 for (size_t r = 0; r < rows->size(); ++r) {
-                    Row& row = (*rows)[r];
+                    HeaderRangeRow& row = (*rows)[r];
                     const int64_t v = row.value(th);
                     row.min = std::min(row.min, v);
                     row.max = std::max(row.max, v);
@@ -9370,6 +9384,7 @@ void MainWindow::openTraceHeaderRanges() {
             backgroundTaskDone_ = ds->traceCount;
         },
         [this, rows, title, ds]() {
+            headerRangesDataset_ = ds;
             if (!headerRangesWidget_) {
                 headerRangesWidget_ = new QWidget(this, Qt::Window);
                 headerRangesWidget_->setStyleSheet("background-color: #1e1f22;");
@@ -9379,16 +9394,101 @@ void MainWindow::openTraceHeaderRanges() {
                 table->setColumnCount(6);
                 table->setHorizontalHeaderLabels({"Ident", "Bytes", "Min", "Max", "Changes", "Typical step"});
                 table->verticalHeader()->hide();
-                table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-                table->setSelectionBehavior(QAbstractItemView::SelectRows);
+                table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed |
+                                       QAbstractItemView::AnyKeyPressed);
                 table->horizontalHeader()->setStretchLastSection(true);
                 layout->addWidget(table);
-                headerRangesWidget_->resize(720, 420);
+                QLabel* hint = new QLabel("Edit Min/Max of an ident (double-click) to select a subset; changed cells "
+                                          "turn orange.");
+                hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+                layout->addWidget(hint);
+                // Up to three sort keys, each ascending or descending.
+                QGridLayout* sortGrid = new QGridLayout();
+                sortGrid->setHorizontalSpacing(10);
+                for (int k = 0; k < 3; ++k) {
+                    sortGrid->addWidget(new QLabel(k == 0 ? "Sort by" : "then by"), k, 0);
+                    QComboBox* key = new QComboBox();
+                    key->setObjectName(QString("sortKey%1").arg(k));
+                    key->addItem("(none)", -1);
+                    for (const HeaderRangeRow& row : makeHeaderRangeRows()) {
+                        if (row.select >= 0) key->addItem(row.name, row.select);
+                    }
+                    QCheckBox* descending = new QCheckBox("Descending");
+                    descending->setObjectName(QString("sortDesc%1").arg(k));
+                    sortGrid->addWidget(key, k, 1);
+                    sortGrid->addWidget(descending, k, 2);
+                }
+                sortGrid->setColumnStretch(3, 1);
+                layout->addLayout(sortGrid);
+                QHBoxLayout* applyRow = new QHBoxLayout();
+                applyRow->addWidget(new QLabel("Output name"));
+                QLineEdit* name = new QLineEdit();
+                name->setObjectName("subsetName");
+                applyRow->addWidget(name, 1);
+                QPushButton* apply = new QPushButton("Apply subset / sort");
+                apply->setToolTip("The selected traces, in the chosen order, as a new dataset in the active panel");
+                applyRow->addWidget(apply);
+                layout->addLayout(applyRow);
+                connect(apply, &QPushButton::clicked, this, [this, table]() {
+                    if (!headerRangesDataset_) return;
+                    std::vector<segy::IdentCriterion> criteria;
+                    QStringList selectText, sortText;
+                    const std::vector<HeaderRangeRow> defs = makeHeaderRangeRows();
+                    for (int r = 0; r < table->rowCount() && r < int(defs.size()); ++r) {
+                        if (defs[size_t(r)].select < 0) continue;
+                        QTableWidgetItem* minItem = table->item(r, 2);
+                        QTableWidgetItem* maxItem = table->item(r, 3);
+                        if (!minItem || !maxItem) continue;
+                        bool okMin = false, okMax = false;
+                        const qlonglong lo = minItem->text().trimmed().toLongLong(&okMin);
+                        const qlonglong hi = maxItem->text().trimmed().toLongLong(&okMax);
+                        if (!okMin || !okMax) {
+                            flashStatusMessage(QString("%1: Min/Max must be whole numbers").arg(defs[size_t(r)].name));
+                            return;
+                        }
+                        const qlonglong fullLo = minItem->data(Qt::UserRole).toLongLong();
+                        const qlonglong fullHi = maxItem->data(Qt::UserRole).toLongLong();
+                        if (lo == fullLo && hi == fullHi) continue; // untouched: no criterion
+                        segy::IdentCriterion criterion;
+                        criterion.field = segy::IdentField(defs[size_t(r)].select);
+                        criterion.min = int32_t(std::clamp<qlonglong>(std::min(lo, hi), INT32_MIN, INT32_MAX));
+                        criterion.max = int32_t(std::clamp<qlonglong>(std::max(lo, hi), INT32_MIN, INT32_MAX));
+                        criteria.push_back(criterion);
+                        selectText << QString("%1 %2-%3").arg(defs[size_t(r)].name.toUpper()).arg(criterion.min).arg(criterion.max);
+                    }
+                    std::vector<segy::SortKey> sortKeys;
+                    for (int k = 0; k < 3; ++k) {
+                        auto* key = headerRangesWidget_->findChild<QComboBox*>(QString("sortKey%1").arg(k));
+                        auto* desc = headerRangesWidget_->findChild<QCheckBox*>(QString("sortDesc%1").arg(k));
+                        if (!key || key->currentData().toInt() < 0) continue;
+                        sortKeys.push_back({segy::IdentField(key->currentData().toInt()), desc && desc->isChecked()});
+                        sortText << QString("%1%2").arg(key->currentText().toUpper(), desc && desc->isChecked() ? "-" : "+");
+                    }
+                    if (criteria.empty() && sortKeys.empty()) {
+                        flashStatusMessage("Change a Min/Max or choose a sort key first");
+                        return;
+                    }
+                    auto* nameEdit = headerRangesWidget_->findChild<QLineEdit*>("subsetName");
+                    QString outputName = nameEdit ? nameEdit->text().trimmed() : QString();
+                    if (outputName.isEmpty()) outputName = QString::fromStdString(headerRangesDataset_->name) + "_sel";
+                    QString history;
+                    if (!selectText.isEmpty()) history += "SELECT " + selectText.join(", ");
+                    if (!sortText.isEmpty()) history += QString(history.isEmpty() ? "" : "; ") + "SORT " + sortText.join(", ");
+                    runSubsetSort(activePanel_, headerRangesDataset_, criteria, sortKeys, outputName, history);
+                });
+                connect(table, &QTableWidget::itemChanged, this, [](QTableWidgetItem* item) {
+                    if (item->column() != 2 && item->column() != 3) return;
+                    const bool changed = item->text().trimmed() != QString::number(item->data(Qt::UserRole).toLongLong());
+                    item->setBackground(changed ? QColor(0x4a, 0x36, 0x26) : QColor(Qt::transparent));
+                    item->setForeground(changed ? QColor(0xe8, 0x90, 0x5a) : QColor(0xd4, 0xd4, 0xd8));
+                });
+                headerRangesWidget_->resize(760, 560);
             }
             QTableWidget* table = headerRangesWidget_->findChild<QTableWidget*>("rangesTable");
+            QSignalBlocker block(table);
             table->setRowCount(int(rows->size()));
             for (int r = 0; r < int(rows->size()); ++r) {
-                const Row& row = (*rows)[size_t(r)];
+                const HeaderRangeRow& row = (*rows)[size_t(r)];
                 int64_t step = 0, best = 0;
                 for (const auto& [s, count] : row.stepCounts) {
                     if (count > best) {
@@ -9406,15 +9506,87 @@ void MainWindow::openTraceHeaderRanges() {
                 for (int col = 0; col < cells.size(); ++col) {
                     QTableWidgetItem* item = new QTableWidgetItem(cells[col]);
                     if (col >= 2) item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+                    // Only Min/Max of selectable idents can be edited.
+                    const bool editable = (col == 2 || col == 3) && row.select >= 0;
+                    if (!editable) item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+                    if (col == 2) item->setData(Qt::UserRole, qlonglong(row.min));
+                    if (col == 3) item->setData(Qt::UserRole, qlonglong(row.max));
                     if (constant) item->setForeground(QColor(0x7a, 0x7c, 0x82));
                     table->setItem(r, col, item);
                 }
             }
             table->resizeColumnsToContents();
+            if (auto* nameEdit = headerRangesWidget_->findChild<QLineEdit*>("subsetName")) {
+                nameEdit->setText(QString::fromStdString(ds->name) + "_sel");
+            }
             headerRangesWidget_->setWindowTitle(title + QString("  (%1 traces)").arg(ds->traceCount));
             headerRangesWidget_->show();
             headerRangesWidget_->raise();
             headerRangesWidget_->activateWindow();
+        });
+}
+
+void MainWindow::runSubsetSort(Panel* panel, std::shared_ptr<Dataset> dataset, std::vector<segy::IdentCriterion> criteria,
+                               std::vector<segy::SortKey> sortKeys, const QString& outputName,
+                               const QString& historyLine) {
+    if (!dataset || dataset->traceCount <= 0) return;
+    const int samplesPerTrace = dataset->binHeader.samplesPerTrace;
+    const QString sourceName = QString::fromStdString(dataset->name);
+    std::vector<std::string> history = dataset->processingHistory;
+    history.push_back(historyLine.toStdString());
+    const std::filesystem::path outPath = scratchSegyPath(outputName);
+    struct SubsetOutcome {
+        bool ok = false;
+        std::string error;
+        int64_t traces = 0;
+    };
+    auto outcome = std::make_shared<SubsetOutcome>();
+    runBackgroundTask(
+        QString("Subset/sort: %1").arg(sourceName),
+        [this, dataset, criteria, sortKeys, samplesPerTrace, outputName, history, outPath, sourceName, outcome]() {
+            segy::ThreadPool pool;
+            const segy::TraceHeaderColumns columns =
+                segy::scanTraceHeaders(dataset->file.data(), dataset->traceCount, dataset->traceStrideBytes, pool);
+            std::vector<int64_t> order = segy::selectTraces(columns, criteria);
+            segy::sortTraceIndices(order, columns, sortKeys);
+            outcome->traces = int64_t(order.size());
+            if (order.empty()) {
+                outcome->error = "No traces match the selection.";
+                return;
+            }
+            backgroundTaskTotal_ = int64_t(order.size());
+            std::vector<segy::WriteTrace> traces(order.size());
+            std::atomic<int64_t> done{0};
+            pool.parallelFor(order.size(), 64, [&](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    const uint8_t* traceBase =
+                        dataset->file.data() + segy::kHeaderTotalSize + size_t(order[i]) * dataset->traceStrideBytes;
+                    segy::WriteTrace& out = traces[i];
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        dataset->binHeader.formatCode);
+                    backgroundTaskDone_ = done.fetch_add(1) + 1;
+                }
+            });
+            QStringList inputBlocks;
+            inputBlocks << QString("FILE: %1  TRACES: %2 OF %3  SAMPLES/TRACE: %4  SAMPLE INTERVAL: %5 US")
+                               .arg(sourceName)
+                               .arg(order.size())
+                               .arg(dataset->traceCount)
+                               .arg(samplesPerTrace)
+                               .arg(dataset->binHeader.sampleIntervalUs);
+            const QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, int64_t(order.size()),
+                                                           samplesPerTrace, dataset->binHeader.sampleIntervalUs);
+            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), dataset->binHeader, traces, &outcome->error);
+        },
+        [this, panel, outcome, outPath, history]() {
+            if (!outcome->ok) {
+                QMessageBox::warning(this, "Subset / sort", QString::fromStdString(outcome->error));
+                return;
+            }
+            flashStatusMessage(QString("%1 traces selected").arg(outcome->traces));
+            panel->canvas->startLoading(outPath, history);
         });
 }
 

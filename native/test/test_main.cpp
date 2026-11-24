@@ -431,7 +431,20 @@ void testSortTraceIndicesMultiKeyStable() {
 
     // Empty sort key list is a documented no-op.
     std::vector<int64_t> untouched = {5, 3, 1, 4, 2, 0};
-    segy::sortTraceIndices(untouched, columns, {});
+    segy::sortTraceIndices(untouched, columns, std::vector<segy::IdentField>{});
+
+    // Per-key direction: CDP descending, then trace number ascending.
+    std::vector<int64_t> mixed = {0, 1, 2, 3, 4, 5};
+    segy::sortTraceIndices(mixed, columns,
+                           std::vector<segy::SortKey>{{segy::IdentField::Cdp, true}, {segy::IdentField::TraceNumber, false}});
+    bool mixedOrdered = true;
+    for (size_t i = 1; i < mixed.size(); ++i) {
+        const int32_t c0 = columns.cdp[size_t(mixed[i - 1])], c1 = columns.cdp[size_t(mixed[i])];
+        const int32_t n0 = columns.traceNumber[size_t(mixed[i - 1])], n1 = columns.traceNumber[size_t(mixed[i])];
+        mixedOrdered = mixedOrdered && (c0 > c1 || (c0 == c1 && n0 <= n1));
+    }
+    CHECK(mixedOrdered);
+    CHECK(columns.offset.size() == columns.cdp.size());
     CHECK(untouched == std::vector<int64_t>({5, 3, 1, 4, 2, 0}));
 }
 

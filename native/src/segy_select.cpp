@@ -13,6 +13,7 @@ const std::vector<int32_t>& TraceHeaderColumns::column(IdentField field) const {
         case IdentField::Cdp: return cdp;
         case IdentField::X: return x;
         case IdentField::Y: return y;
+        case IdentField::Offset: return offset;
     }
     return traceSequenceLine; // unreachable; silences -Wreturn-type
 }
@@ -29,6 +30,7 @@ TraceHeaderColumns scanTraceHeaders(const uint8_t* fileBase, int64_t traceCount,
     columns.cdp.resize(size_t(traceCount));
     columns.x.resize(size_t(traceCount));
     columns.y.resize(size_t(traceCount));
+    columns.offset.resize(size_t(traceCount));
 
     // Each worker owns a disjoint, contiguous range of trace indices -- same
     // no-synchronization shape as buildFinestLevel in segy_pyramid.cpp.
@@ -43,6 +45,7 @@ TraceHeaderColumns scanTraceHeaders(const uint8_t* fileBase, int64_t traceCount,
             columns.cdp[t] = h.cdp;
             columns.x[t] = h.x;
             columns.y[t] = h.y;
+            columns.offset[t] = h.offset;
         }
     });
 
@@ -94,6 +97,22 @@ void sortTraceIndices(std::vector<int64_t>& indices, const TraceHeaderColumns& c
             int32_t va = (*col)[size_t(a)];
             int32_t vb = (*col)[size_t(b)];
             if (va != vb) return va < vb;
+        }
+        return false;
+    });
+}
+
+void sortTraceIndices(std::vector<int64_t>& indices, const TraceHeaderColumns& columns,
+                       const std::vector<SortKey>& sortKeys) {
+    if (sortKeys.empty()) return;
+    std::vector<std::pair<const std::vector<int32_t>*, bool>> keyColumns;
+    keyColumns.reserve(sortKeys.size());
+    for (const SortKey& key : sortKeys) keyColumns.push_back({&columns.column(key.field), key.descending});
+    std::stable_sort(indices.begin(), indices.end(), [&](int64_t a, int64_t b) {
+        for (const auto& [col, descending] : keyColumns) {
+            const int32_t va = (*col)[size_t(a)];
+            const int32_t vb = (*col)[size_t(b)];
+            if (va != vb) return descending ? va > vb : va < vb;
         }
         return false;
     });

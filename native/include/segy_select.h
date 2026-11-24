@@ -32,6 +32,7 @@ enum class IdentField {
     Cdp,
     X,
     Y,
+    Offset, // bytes 37-40
 };
 
 // Every trace's header, parsed once and stored column-major (one vector per
@@ -48,6 +49,7 @@ struct TraceHeaderColumns {
     std::vector<int32_t> cdp;
     std::vector<int32_t> x;
     std::vector<int32_t> y;
+    std::vector<int32_t> offset;
 
     int64_t traceCount() const { return int64_t(traceSequenceLine.size()); }
     const std::vector<int32_t>& column(IdentField field) const;
@@ -87,5 +89,13 @@ std::vector<int64_t> selectTraces(const TraceHeaderColumns& columns, const std::
 // an empty `sortKeys`.
 void sortTraceIndices(std::vector<int64_t>& indices, const TraceHeaderColumns& columns,
                        const std::vector<IdentField>& sortKeys);
+
+// Same, with a direction per key (stable, priority order).
+struct SortKey {
+    IdentField field = IdentField::TraceSequenceLine;
+    bool descending = false;
+};
+void sortTraceIndices(std::vector<int64_t>& indices, const TraceHeaderColumns& columns,
+                       const std::vector<SortKey>& sortKeys);
 
 } // namespace segy

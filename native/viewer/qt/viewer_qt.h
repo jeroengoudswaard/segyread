@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "analysis.h"
+#include "segy_select.h"
 #include "trace_header_defs.h"
 #include "iirfilter.h"
 #include "chrome.h"
@@ -1794,6 +1795,12 @@ private:
     TraceInspectorWindow* traceInspector_ = nullptr; // File > Trace Inspector
     void openTraceInspector();
     void openTraceHeaderRanges();
+    // Trace Header Ranges' Apply: the traces of `dataset` matching
+    // `criteria`, in `sortKeys` order, as a new dataset loaded into `panel`
+    // (a new item in the dataset list, so it cascades).
+    void runSubsetSort(Panel* panel, std::shared_ptr<Dataset> dataset, std::vector<segy::IdentCriterion> criteria,
+                       std::vector<segy::SortKey> sortKeys, const QString& outputName, const QString& historyLine);
+    std::shared_ptr<Dataset> headerRangesDataset_; // what the Trace Header Ranges window shows
 
     // Shows/hides the right dock entirely -- the dock itself can't be
     // closed any other way (NoDockWidgetFeatures), so this button is the
