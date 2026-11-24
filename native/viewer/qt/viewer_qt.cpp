@@ -9391,15 +9391,20 @@ void MainWindow::openTraceHeaderRanges() {
                 QVBoxLayout* layout = new QVBoxLayout(headerRangesWidget_);
                 QTableWidget* table = new QTableWidget(headerRangesWidget_);
                 table->setObjectName("rangesTable");
-                table->setColumnCount(6);
-                table->setHorizontalHeaderLabels({"Ident", "Bytes", "Min", "Max", "Changes", "Typical step"});
+                table->setColumnCount(7);
+                table->setHorizontalHeaderLabels({"Ident", "Bytes", "Min", "Max", "Inc", "Changes", "Typical step"});
+                table->horizontalHeaderItem(4)->setToolTip(
+                    "Increment: keep every value min, min + inc, min + 2 inc, ... (1 = all)");
+                // The in-cell editor in the dark style (it was white on light grey).
+                table->setStyleSheet("QTableWidget QLineEdit { background: #2b2d30; color: #f0f2f5; "
+                                     "border: 1px solid #e8905a; selection-background-color: #4a3626; }");
                 table->verticalHeader()->hide();
                 table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed |
                                        QAbstractItemView::AnyKeyPressed);
                 table->horizontalHeader()->setStretchLastSection(true);
                 layout->addWidget(table);
-                QLabel* hint = new QLabel("Edit Min/Max of an ident (double-click) to select a subset; changed cells "
-                                          "turn orange.");
+                QLabel* hint = new QLabel("Edit Min/Max/Inc of an ident (double-click) to select a subset; changed "
+                                          "cells turn orange. Inc 2 keeps every second value from Min.");
                 hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
                 layout->addWidget(hint);
                 // Up to three sort keys, each ascending or descending.
@@ -9438,23 +9443,31 @@ void MainWindow::openTraceHeaderRanges() {
                         if (defs[size_t(r)].select < 0) continue;
                         QTableWidgetItem* minItem = table->item(r, 2);
                         QTableWidgetItem* maxItem = table->item(r, 3);
-                        if (!minItem || !maxItem) continue;
-                        bool okMin = false, okMax = false;
+                        QTableWidgetItem* incItem = table->item(r, 4);
+                        if (!minItem || !maxItem || !incItem) continue;
+                        bool okMin = false, okMax = false, okInc = false;
                         const qlonglong lo = minItem->text().trimmed().toLongLong(&okMin);
                         const qlonglong hi = maxItem->text().trimmed().toLongLong(&okMax);
-                        if (!okMin || !okMax) {
-                            flashStatusMessage(QString("%1: Min/Max must be whole numbers").arg(defs[size_t(r)].name));
+                        const qlonglong inc = incItem->text().trimmed().toLongLong(&okInc);
+                        if (!okMin || !okMax || !okInc || inc < 1) {
+                            flashStatusMessage(
+                                QString("%1: Min/Max must be whole numbers, Inc 1 or more").arg(defs[size_t(r)].name));
                             return;
                         }
                         const qlonglong fullLo = minItem->data(Qt::UserRole).toLongLong();
                         const qlonglong fullHi = maxItem->data(Qt::UserRole).toLongLong();
-                        if (lo == fullLo && hi == fullHi) continue; // untouched: no criterion
+                        if (lo == fullLo && hi == fullHi && inc == 1) continue; // untouched: no criterion
                         segy::IdentCriterion criterion;
                         criterion.field = segy::IdentField(defs[size_t(r)].select);
                         criterion.min = int32_t(std::clamp<qlonglong>(std::min(lo, hi), INT32_MIN, INT32_MAX));
                         criterion.max = int32_t(std::clamp<qlonglong>(std::max(lo, hi), INT32_MIN, INT32_MAX));
+                        criterion.inc = int32_t(std::min<qlonglong>(inc, INT32_MAX));
                         criteria.push_back(criterion);
-                        selectText << QString("%1 %2-%3").arg(defs[size_t(r)].name.toUpper()).arg(criterion.min).arg(criterion.max);
+                        selectText << QString("%1 %2-%3%4")
+                                          .arg(defs[size_t(r)].name.toUpper())
+                                          .arg(criterion.min)
+                                          .arg(criterion.max)
+                                          .arg(criterion.inc > 1 ? QString(" INC %1").arg(criterion.inc) : QString());
                     }
                     std::vector<segy::SortKey> sortKeys;
                     for (int k = 0; k < 3; ++k) {
@@ -9477,12 +9490,12 @@ void MainWindow::openTraceHeaderRanges() {
                     runSubsetSort(activePanel_, headerRangesDataset_, criteria, sortKeys, outputName, history);
                 });
                 connect(table, &QTableWidget::itemChanged, this, [](QTableWidgetItem* item) {
-                    if (item->column() != 2 && item->column() != 3) return;
+                    if (item->column() < 2 || item->column() > 4) return;
                     const bool changed = item->text().trimmed() != QString::number(item->data(Qt::UserRole).toLongLong());
                     item->setBackground(changed ? QColor(0x4a, 0x36, 0x26) : QColor(Qt::transparent));
                     item->setForeground(changed ? QColor(0xe8, 0x90, 0x5a) : QColor(0xd4, 0xd4, 0xd8));
                 });
-                headerRangesWidget_->resize(760, 560);
+                headerRangesWidget_->resize(820, 560);
             }
             QTableWidget* table = headerRangesWidget_->findChild<QTableWidget*>("rangesTable");
             QSignalBlocker block(table);
@@ -9501,16 +9514,18 @@ void MainWindow::openTraceHeaderRanges() {
                                            row.bytes,
                                            QString::number(row.min),
                                            QString::number(row.max),
+                                           row.select >= 0 ? QString("1") : QString(),
                                            constant ? QString("constant") : QString::number(row.changes),
                                            constant ? QString(QChar(0x2013)) : QString::number(step)};
                 for (int col = 0; col < cells.size(); ++col) {
                     QTableWidgetItem* item = new QTableWidgetItem(cells[col]);
                     if (col >= 2) item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
-                    // Only Min/Max of selectable idents can be edited.
-                    const bool editable = (col == 2 || col == 3) && row.select >= 0;
+                    // Only Min/Max/Inc of selectable idents can be edited.
+                    const bool editable = col >= 2 && col <= 4 && row.select >= 0;
                     if (!editable) item->setFlags(item->flags() & ~Qt::ItemIsEditable);
                     if (col == 2) item->setData(Qt::UserRole, qlonglong(row.min));
                     if (col == 3) item->setData(Qt::UserRole, qlonglong(row.max));
+                    if (col == 4) item->setData(Qt::UserRole, qlonglong(1));
                     if (constant) item->setForeground(QColor(0x7a, 0x7c, 0x82));
                     table->setItem(r, col, item);
                 }

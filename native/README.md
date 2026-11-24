@@ -2922,15 +2922,18 @@ Writing and loading the temporary x-f SEG-Y were already fast (0.2 s and
   changes from trace to trace, and the most common step. Constant fields
   are dimmed.
 - **Subset and sort, from that same window:**
-  - **Select:** double-click the Min or Max of an ident (Seq Line/File,
-    FFID, trace number, CDP, offset, source X/Y) to narrow the range.
-    Changed cells turn orange.
+  - **Select:** double-click the Min, Max or **Inc** of an ident (Seq
+    Line/File, FFID, trace number, CDP, offset, source X/Y). Inc keeps
+    the values min, min + inc, min + 2·inc, …, so Inc 2 keeps every
+    second value from Min. Changed cells turn orange. The in-cell editor
+    uses the dark style; it used to be white with light text and was
+    unreadable.
   - **Sort:** up to three sort keys, each ascending or descending
     (`segy::SortKey`, a stable multi-key sort, tested).
   - **Apply subset / sort:** writes the matching traces, in that order,
     as a new dataset in the active panel. It is a new item in the dataset
     list, so it cascades like the filters. The history line records the
-    step, e.g. "SELECT CDP 700-720; SORT OFFSET-".
+    step, e.g. "SELECT CDP 700-720 INC 2; SORT OFFSET-".
   - **Core:** `segy::selectTraces` / `sortTraceIndices`
     (`segy_select.h`), now with offset as a column.
   - **Checked** on the F3 prestack: CDP 700–720 sorted by offset
