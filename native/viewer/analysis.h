@@ -196,9 +196,10 @@ FkResult computeFk(const SigcorTraceFetch& fetch, int samplesPerTrace, const std
 // or fractional: the spectrum is multiplied by (i 2 pi f)^a with
 // a = slope / 6.0206, so 6 dB/octave is exactly d/dt (or the integral dt),
 // including its +90 (-90) degree phase, 3 dB/octave a half derivative
-// (amplitude ~ sqrt(f), 45 degrees), 0 leaves the trace alone. The mean is
-// removed first (and after integration: the integration constant); DC
-// gets zero gain. Zero-padded to twice the length (no wrap-around). Time
+// (amplitude ~ sqrt(f), 45 degrees), 0 leaves the trace alone. The mean
+// (DC) is handled outside the FFT: differentiation drops it, integration
+// adds its exact integral (m t^alpha / Gamma(alpha + 1)) and then removes
+// the arbitrary integration constant (the result's mean). Zero-padded to twice the length (no wrap-around). Time
 // in seconds: full differentiation scales by 2 pi f.
 void traceDerivative(std::vector<float>& trace, double sampleIntervalUs, double slopeDbPerOctave);
 

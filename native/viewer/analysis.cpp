@@ -394,11 +394,23 @@ void traceDerivative(std::vector<float>& trace, double sampleIntervalUs, double 
         buf[m] = std::complex<float>(std::complex<double>(buf[m]) * h);
     }
     ifft(buf);
+    // Integration: the mean (DC) was taken out before the FFT, where it has
+    // no finite gain -- but its integral is well defined: m t for a full
+    // integral, m t^alpha / Gamma(alpha + 1) for a fractional one. Add it
+    // back in the time domain; without it, integrating a derivative (whose
+    // mean is generally not zero) lost a ramp.
+    std::vector<double> out(n);
+    const double dtSeconds = sampleIntervalUs * 1e-6;
+    const double alpha = -a;
+    const double dcScale = a < 0.0 ? mean / std::tgamma(alpha + 1.0) : 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = buf[i].real() + (a < 0.0 ? dcScale * std::pow(double(i) * dtSeconds, alpha) : 0.0);
+    }
     double outMean = 0.0;
-    for (size_t i = 0; i < n; ++i) outMean += buf[i].real();
+    for (double v : out) outMean += v;
     outMean /= double(n);
     // An integral is defined up to a constant: keep it centred on zero.
-    for (size_t i = 0; i < n; ++i) trace[i] = float(buf[i].real() - (a < 0.0 ? outMean : 0.0));
+    for (size_t i = 0; i < n; ++i) trace[i] = float(out[i] - (a < 0.0 ? outMean : 0.0));
 }
 
 std::vector<float> fractionalShift(const std::vector<float>& x, double shift) {

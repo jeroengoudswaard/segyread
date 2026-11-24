@@ -1662,6 +1662,33 @@ void testTraceDerivative() {
     x = sine(0.0);
     segy::traceDerivative(x, dt * 1e6, 3.0103);
     CHECK(maxErr(x, std::sqrt(w), pi / 4) < 0.02);
+    // Differentiate, then integrate: the original comes back. Input: a
+    // band-limited Ricker series with its mean (f = 0) removed first, since
+    // DC is lost by differentiation and can't be restored.
+    {
+        SigcorSynthetic syn = makeSigcorSynthetic(1, 1000, dt, 25.0, 0.0, 1.0, 0.0, 31);
+        std::vector<float> original = syn.data[0];
+        double mean = 0.0;
+        for (float v : original) mean += v;
+        mean /= double(original.size());
+        for (float& v : original) v -= float(mean);
+        std::vector<float> roundTrip = original;
+        segy::traceDerivative(roundTrip, dt * 1e6, 6.0206);
+        segy::traceDerivative(roundTrip, dt * 1e6, -6.0206);
+        double peak = 0.0, err = 0.0;
+        for (int i = 100; i < 900; ++i) {
+            peak = std::max(peak, double(std::fabs(original[size_t(i)])));
+            err = std::max(err, double(std::fabs(roundTrip[size_t(i)] - original[size_t(i)])));
+        }
+        CHECK(err < 0.01 * peak);
+        // Same the other way round (integrate, then differentiate).
+        roundTrip = original;
+        segy::traceDerivative(roundTrip, dt * 1e6, -6.0206);
+        segy::traceDerivative(roundTrip, dt * 1e6, 6.0206);
+        err = 0.0;
+        for (int i = 100; i < 900; ++i) err = std::max(err, double(std::fabs(roundTrip[size_t(i)] - original[size_t(i)])));
+        CHECK(err < 0.01 * peak);
+    }
     // 0 dB/octave: untouched.
     x = sine(0.0);
     std::vector<float> same = x;

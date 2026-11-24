@@ -34,7 +34,7 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 16. **x-f display** — Toggle on the seismic display: amplitude spectrum (dB, 0 to Nyquist) of every trace in view, variable density, green -40 dB to red 0 dB by default; toggling back restores the seismic and the selection boxes. *Status: done — toolbar/View > x-f Display.*
 
-17. **Lock View (open)** — The user wants a way to fix an axis range set via Axis Ranges so zoom/unzoom can no longer change it. Conflicts with the existing Lock button, which links the two panels. *Status: parked — decide whether this is a separate Lock View button or a new meaning for Lock.*
+17. **Lock View (decided, see 32)** — The user wants a way to fix an axis range set via Axis Ranges so zoom/unzoom can no longer change it. Conflicts with the existing Lock button, which links the two panels. *Status: parked — decide whether this is a separate Lock View button or a new meaning for Lock.*
 
 18. **f-k display** — Separate window: one f-k plot per gather in view (or averaged), selectable panel and distance idents with scalar, velocity fan. *Status: done — Analysis > f-k display.*
 
@@ -44,21 +44,21 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 ## Ideas to implement (registered 2026-11-24, to clarify with the user before building)
 
-21. **Send Zoom** — send one panel's zoom to the other.
-22. **Calculator does not always show all data sets** — bug: its dataset choice is incomplete.
-23. **Send Display** — send scaling, colour scale and display method to the other panel.
-24. **Crosshairs between two windows** — linked crosshair across the panels, on/off, default on.
-25. **Zoom without a box** — clicking Zoom with no box selected turns on "Draw a box to zoom".
-26. **Autocorrelation: zoom** — zoom option in the autocorrelation window.
-27. **Autocorrelation: lag window** — let the user set the +/- lag window, possibly asymmetric.
-28. **Peak-to-peak distance** — automatic estimate of the lag (nearest peak with a cross-correlation of 50%, if it exists), or a delta-T measuring tool.
-29. **Spectrum of the autocorrelation** — shown below it, default off.
-30. **XCOR in the calculator** — cross-correlation of two datasets, same display as the autocorrelation.
-31. **Verify diff/integrate** — check the trace differentiation/integration functionality.
-32. **Lock functionality** — work on Lock (see 17).
-33. **Always some headers at top** — ident rows always present at the top.
-34. **Auto-pick seabed.**
-35. **Flatten** — on an ident or a picked horizon.
-36. **Horizon picking, point to point** — straight lines between picks; use the trace-to-trace autocovariance to fill in between, with a single trust value between 0.3 and 1.
-37. **Picks in memory** — several user horizons; output of an event as IDENT/TIME.
-38. **Time-depth conversion** — with a velocity function loaded, T-D or D-T conversion; default output sampling 4 ms (time) or 8 m (depth).
+21. **Send Zoom** — send one panel's zoom to the other. *Decided: a one-off action, matched on trace index and time.*
+22. **Calculator does not always show all data sets** — bug: its dataset choice is incomplete. *Decided: pick inputs from the whole dataset list, not just what panels A and B show.*
+23. **Send Display** — send scaling, colour scale and display method to the other panel. *Decided: everything, including gain, AGC and the manual clip.*
+24. **Crosshairs between two windows** — linked crosshair across the panels, on/off, default on. *Decided: linked on time and trace index, default on.*
+25. **Zoom without a box** — clicking Zoom with no box selected turns on "Draw a box to zoom". *Decided: Box Select turns on and the view zooms automatically once the box is drawn.*
+26. **Autocorrelation: zoom** — zoom option in the autocorrelation window. *Decided: the same three buttons as the spectra (Zoom, Unzoom, Box Select).*
+27. **Autocorrelation: lag window** — let the user set the +/- lag window, possibly asymmetric. *Decided: two fields, -lag and +lag (ms).*
+28. **Peak-to-peak distance** — automatic estimate of the lag (nearest peak with a cross-correlation of 50%, if it exists), or a delta-T measuring tool. *Decided: automatic on the average autocorrelation (first side peak >= 0.5), plus a two-click delta-T measuring tool.*
+29. **Spectrum of the autocorrelation** — shown below it, default off. *Decided: in dB, same chart as Spectrum, below the autocorrelation, default off.*
+30. **XCOR in the calculator** — cross-correlation of two datasets, same display as the autocorrelation. *Decided: panel A x panel B trace by trace, shown as a popup like the autocorrelation (no new dataset).*
+31. **Verify diff/integrate** — check the trace differentiation/integration functionality. *Decided: test differentiate-then-integrate gives back the original; remove f = 0 (DC) from the test input first.*
+32. **Lock functionality** — work on Lock (see 17). *Decided: two separate buttons — Lock Panels (today's linking) and Lock View (fixes the axis range so zoom/unzoom cannot change it).*
+33. **Always some headers at top** — ident rows always present at the top. *Decided: fall back to the sequence number when no sort ident is found; the user can always switch them off.*
+34. **Auto-pick seabed.** *Open: questions asked 2026-11-24, awaiting answers.*
+35. **Flatten** — on an ident or a picked horizon. *Open: questions asked 2026-11-24, awaiting answers.*
+36. **Horizon picking, point to point** — straight lines between picks; use the trace-to-trace autocovariance to fill in between, with a single trust value between 0.3 and 1. *Open: questions asked 2026-11-24, awaiting answers.*
+37. **Picks in memory** — several user horizons; output of an event as IDENT/TIME. *Open: questions asked 2026-11-24, awaiting answers.*
+38. **Time-depth conversion** — with a velocity function loaded, T-D or D-T conversion; default output sampling 4 ms (time) or 8 m (depth). *Open: questions asked 2026-11-24, awaiting answers.*
