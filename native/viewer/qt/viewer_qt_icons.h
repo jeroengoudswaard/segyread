@@ -28,6 +28,7 @@ QIcon iconWiggleGlyph();
 QIcon iconVariableDensityGlyph();
 QIcon iconArrowsHorizontal();
 QIcon iconXf();
+QIcon iconLockView();
 QIcon iconColumns3();
 QIcon iconList();
 QIcon iconIdents();

@@ -4932,6 +4932,8 @@ HoverInfo SegyCanvas::currentHoverInfo() const {
     info.amplitude = value;
     info.frequencyAxis = app_.display.frequencyAxis;
     info.dataset = app_.foreground.get();
+    info.sourceCanvas = this;
+    info.traceCoord = traceCoord;
     return info;
 }
 
@@ -5068,6 +5070,7 @@ void SegyCanvas::handleBoxSelectPress(QMouseEvent* event) {
         app_.activeBoxIndex = int(app_.selectionBoxes.size()) - 1;
         notifyStateChanged();
         update();
+        if (onBoxCompleted_) onBoxCompleted_();
         return;
     }
 
@@ -5517,6 +5520,26 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             painter.restore();
         }
         painter.restore();
+
+        // Linked crosshair: where the cursor is on the other panel (same
+        // trace index and time), black underlay + white dashes like the
+        // chart crosshairs. Not on an x-f display (frequency, not time).
+        if (linkedCrosshairValid_ && !app_.display.frequencyAxis) {
+            const double sampleMs = app_.foreground->binHeader.sampleIntervalUs / 1000.0;
+            if (sampleMs > 0.0) {
+                double x = 0.0, y = 0.0;
+                pixelForData(linkedTraceCoord_, linkedTimeMs_ / sampleMs, x, y);
+                const QRect plot(kCanvasMargin + chrome.plotX, topInset, chrome.plotWidth, insetHeight);
+                painter.save();
+                painter.setClipRect(plot);
+                for (const QPen& pen : {QPen(QColor(0, 0, 0, 170), 3), QPen(Qt::white, 1, Qt::DashLine)}) {
+                    painter.setPen(pen);
+                    painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()));
+                    painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+                }
+                painter.restore();
+            }
+        }
     }
     // No file loaded: the dark surround fill above already covers the
     // whole widget, so there's nothing more to draw here.
@@ -5529,6 +5552,22 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
     // trigger a repaint at all.
     updateStatusBar();
 }
+
+bool SegyCanvas::refuseIfViewLocked() {
+    if (!app_.viewLocked) return false;
+    if (statusBar_) statusBar_->showMessage("View is locked (Lock View)", 2000);
+    return true;
+}
+
+void SegyCanvas::setLinkedCrosshair(bool valid, double traceCoord, double timeMs) {
+    if (!valid && !linkedCrosshairValid_) return;
+    linkedCrosshairValid_ = valid;
+    linkedTraceCoord_ = traceCoord;
+    linkedTimeMs_ = timeMs;
+    update();
+}
+
+void SegyCanvas::setBoxCompletedCallback(std::function<void()> callback) { onBoxCompleted_ = std::move(callback); }
 
 void SegyCanvas::mousePressEvent(QMouseEvent* event) {
     if (notifyActivated_) notifyActivated_();
@@ -5548,6 +5587,7 @@ void SegyCanvas::mousePressEvent(QMouseEvent* event) {
     if (app_.tool == ToolMode::BoxSelect) {
         handleBoxSelectPress(event);
     } else if (app_.tool == ToolMode::Pan && event->button() == Qt::LeftButton) {
+        if (refuseIfViewLocked()) return;
         app_.dragging = true;
         app_.dragAnchorX = event->pos().x();
         app_.dragAnchorY = event->pos().y();
@@ -5558,6 +5598,7 @@ void SegyCanvas::mousePressEvent(QMouseEvent* event) {
 
 void SegyCanvas::showAxisRangeMenu(const QPoint& globalPos) {
     if (!app_.loaded) return;
+    if (refuseIfViewLocked()) return;
     QMenu menu(this);
     QAction* ranges = menu.addAction("Axis Ranges...");
     QAction* reset = menu.addAction("Reset View");
@@ -5644,6 +5685,7 @@ void SegyCanvas::mouseReleaseEvent(QMouseEvent*) { app_.dragging = false; }
 
 void SegyCanvas::wheelEvent(QWheelEvent* event) {
     if (!app_.loaded) return;
+    if (refuseIfViewLocked()) return;
     int insetWidth = std::max(1, plotAreaWidth());
     IdentInsets insets = identInsets();
     int topInset = kCanvasMargin + insets.top;
@@ -5666,6 +5708,7 @@ void SegyCanvas::wheelEvent(QWheelEvent* event) {
 
 void SegyCanvas::keyPressEvent(QKeyEvent* event) {
     if (event->key() == Qt::Key_R && app_.loaded) {
+        if (refuseIfViewLocked()) return;
         segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
         if (notifyViewChanged_) notifyViewChanged_();
         updateStatusBar();
@@ -5911,6 +5954,14 @@ MainWindow::MainWindow() : QMainWindow() {
     panelB_.canvas->hide();
     setCentralWidget(splitter_);
     panelA_.canvas->setActivatedCallback([this]() { setActivePanel(&panelA_); });
+    for (Panel* p : {&panelA_, &panelB_}) {
+        p->canvas->setBoxCompletedCallback([this, p]() {
+            if (!pendingBoxZoom_ || p != activePanel_) return;
+            pendingBoxZoom_ = false;
+            zoomToBox();
+            if (boxSelectAction_->isChecked()) boxSelectAction_->trigger(); // back to the pointer
+        });
+    }
     panelB_.canvas->setActivatedCallback([this]() { setActivePanel(&panelB_); });
 
     // Same dummy-vs-real split as the removed shells: only File > Open and
@@ -6051,7 +6102,7 @@ MainWindow::MainWindow() : QMainWindow() {
     QToolBar* toolbar = toolbar_; // short alias for the many toolbar->... calls below
 
     zoomAction_ = toolbar->addAction(iconMagnifier(true), "Zoom");
-    zoomAction_->setToolTip("Zoom to the selection box");
+    zoomAction_->setToolTip("Zoom to the selection box (without one: draw a box, then it zooms)");
     zoomAction_->setEnabled(false);
     connect(zoomAction_, &QAction::triggered, this, &MainWindow::zoomToBox);
 
@@ -6357,11 +6408,22 @@ MainWindow::MainWindow() : QMainWindow() {
         });
     }
 
-    lockAction_ = toolbar->addAction(iconLock(false), "Lock");
+    lockAction_ = toolbar->addAction(iconLock(false), "Lock Panels");
     lockAction_->setCheckable(true);
     lockAction_->setToolTip("Lock: apply toolbar/menu actions to both panels at once");
     connect(lockAction_, &QAction::triggered, this, [this](bool checked) {
         lockAction_->setIcon(iconLock(checked));
+    });
+
+    // Lock View (per panel): the view can't be zoomed, panned, reset or
+    // given new axis ranges until unlocked -- see SegyCanvas's guards.
+    lockViewAction_ = toolbar->addAction(iconLockView(), "Lock View");
+    lockViewAction_->setCheckable(true);
+    lockViewAction_->setToolTip("Lock View: fix this panel's view so zoom/unzoom/pan can't change it");
+    connect(lockViewAction_, &QAction::triggered, this, [this](bool checked) {
+        app_->viewLocked = checked;
+        flashStatusMessage(checked ? "View locked" : "View unlocked");
+        refreshToolChrome();
     });
 
     // Pushes everything after it to the toolbar's far end (right when
@@ -6391,7 +6453,7 @@ MainWindow::MainWindow() : QMainWindow() {
         seismicModeToolbarAction_, flipHorizontalAction_, identsAction_,  gainDetailAction_, gainUpAction_,
         gainDownAction_,      agcAction_,          spectrumAction_,     histogramAction_,   octaveBandAction_,
         autocorrelationAction_, xfAction_,
-        ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_,
+        ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_, lockViewAction_,
         sidebarToggleAction_,
     };
     // A QToolButton parented to toolbar_ but deliberately NOT added via
@@ -6454,6 +6516,7 @@ MainWindow::MainWindow() : QMainWindow() {
         {"binaryHeader", "Binary Header", 4, {binaryHeaderAction_}},
         {"splitView", "Split View", 4, {splitViewAction_}},
         {"lock", "Lock Panels", 4, {lockAction_}},
+        {"lockView", "Lock View", 4, {lockViewAction_}},
         {"sidebar", "Sidebar Toggle", 5, {sidebarToggleAction_}},
     };
 
@@ -6540,6 +6603,21 @@ MainWindow::MainWindow() : QMainWindow() {
         stackedAction->setChecked(splitter_->orientation() == Qt::Vertical);
     });
     addMenuMirror(viewMenu, lockAction_, "Lock Pa&nels");
+    addMenuMirror(viewMenu, lockViewAction_, "Lock &View");
+    viewMenu->addSeparator();
+    QAction* sendZoomAction = viewMenu->addAction("Send &Zoom to Other Panel");
+    connect(sendZoomAction, &QAction::triggered, this, &MainWindow::sendZoomToOtherPanel);
+    QAction* sendDisplayAction = viewMenu->addAction("Send &Display to Other Panel");
+    connect(sendDisplayAction, &QAction::triggered, this, &MainWindow::sendDisplayToOtherPanel);
+    linkedCrosshairAction_ = viewMenu->addAction("Linked &Crosshair");
+    linkedCrosshairAction_->setCheckable(true);
+    linkedCrosshairAction_->setChecked(true);
+    linkedCrosshairAction_->setToolTip("Show the cursor position of one panel as a crosshair on the other");
+    connect(linkedCrosshairAction_, &QAction::toggled, this, [this](bool on) {
+        if (!on) {
+            for (Panel* p : {&panelA_, &panelB_}) p->canvas->setLinkedCrosshair(false, 0.0, 0.0);
+        }
+    });
 
     viewMenu->addSeparator();
     addMenuMirror(viewMenu, sidebarToggleAction_, "Side&bar");
@@ -7080,7 +7158,7 @@ std::vector<Panel*> MainWindow::targetPanels() {
 void MainWindow::syncLockedView(Panel* source) {
     if (!lockAction_->isChecked()) return;
     Panel* other = source == &panelA_ ? &panelB_ : &panelA_;
-    if (!other->app.loaded) return; // nothing sensible to sync into
+    if (!other->app.loaded || other->app.viewLocked) return; // nothing sensible (or allowed) to sync into
     other->app.view = source->app.view;
     // The two panels' datasets can have different trace/sample extents --
     // a view valid for `source` isn't necessarily valid for `other`.
@@ -7110,6 +7188,7 @@ void MainWindow::setActivePanel(Panel* panel) {
     refreshSeismicModeToolbarIcon();
     refreshAmplitudeProcessingControls();
     xfAction_->setChecked(app_->xf.active);
+    lockViewAction_->setChecked(app_->viewLocked);
     // Analyses that assume a time series mean nothing on an x-f display
     // (its samples are frequency bins in dB). Histogram stays: a
     // distribution of dB values is still meaningful.
@@ -7156,10 +7235,23 @@ void MainWindow::openAmplitudeProcessingDialog() {
 }
 
 void MainWindow::zoomToBox() {
-    // Locked: zoom each target panel to its *own* active, completed box (if
-    // it has one) -- not a shared box, since the two panels can hold
+    if (app_->loaded && app_->viewLocked) {
+        flashStatusMessage("View is locked (Lock View)");
+        return;
+    }
+    // No box yet: switch to Box Select and zoom as soon as one is drawn.
+    const SelectionBox* activeNow = activeBox(*app_);
+    if (app_->loaded && (!activeNow || !activeNow->complete)) {
+        pendingBoxZoom_ = true;
+        if (!boxSelectAction_->isChecked()) boxSelectAction_->trigger();
+        flashStatusMessage("Draw a box to zoom");
+        return;
+    }
+    // Locked panels: zoom each target panel to its *own* active, completed
+    // box (if it has one) -- not a shared box, since the two panels can hold
     // different datasets with entirely different trace/sample ranges.
     for (Panel* p : targetPanels()) {
+        if (p->app.viewLocked) continue;
         const SelectionBox* box = activeBox(p->app);
         if (!box || !box->complete) continue;
         p->app.zoomHistory.push_back(p->app.view);
@@ -7172,9 +7264,60 @@ void MainWindow::zoomToBox() {
     refreshToolChrome();
 }
 
+void MainWindow::sendZoomToOtherPanel() {
+    Panel* other = activePanel_ == &panelA_ ? &panelB_ : &panelA_;
+    if (!app_->loaded || !other->app.loaded) {
+        flashStatusMessage("Both panels need data");
+        return;
+    }
+    if (other->app.viewLocked) {
+        flashStatusMessage("The other panel's view is locked (Lock View)");
+        return;
+    }
+    if (app_->xf.active != other->app.xf.active) {
+        flashStatusMessage("Not between an x-f display and a seismic display");
+        return;
+    }
+    // Same trace index range and the same times (ms), so panels with
+    // different sample intervals still line up.
+    other->app.zoomHistory.push_back(other->app.view);
+    const double fromMs = app_->foreground->binHeader.sampleIntervalUs / 1000.0;
+    const double toMs = other->app.foreground->binHeader.sampleIntervalUs / 1000.0;
+    segy::ViewRange next = app_->view;
+    if (fromMs > 0.0 && toMs > 0.0) {
+        next.sampleStart = app_->view.sampleStart * fromMs / toMs;
+        next.sampleEnd = app_->view.sampleEnd * fromMs / toMs;
+    }
+    segy::clampView(next, other->app.foreground->traceCount, other->app.foreground->binHeader.samplesPerTrace);
+    other->app.view = next;
+    flashStatusMessage("Zoom sent to the other panel");
+    refreshToolChrome();
+}
+
+void MainWindow::sendDisplayToOtherPanel() {
+    Panel* other = activePanel_ == &panelA_ ? &panelB_ : &panelA_;
+    if (!app_->loaded || !other->app.loaded) {
+        flashStatusMessage("Both panels need data");
+        return;
+    }
+    if (app_->xf.active || other->app.xf.active) {
+        flashStatusMessage("Not available with an x-f display");
+        return;
+    }
+    // Everything: mode, colour scale (and flip), gain, AGC/computed gain,
+    // manual clip, polarity, grid/scale toggles, flip horizontal.
+    other->app.display = app_->display;
+    flashStatusMessage("Display settings sent to the other panel");
+    refreshAfterDisplaySwap();
+}
+
 void MainWindow::moozBack() {
+    if (app_->viewLocked) {
+        flashStatusMessage("View is locked (Lock View)");
+        return;
+    }
     for (Panel* p : targetPanels()) {
-        if (p->app.zoomHistory.empty()) continue;
+        if (p->app.viewLocked || p->app.zoomHistory.empty()) continue;
         p->app.view = p->app.zoomHistory.back();
         p->app.zoomHistory.pop_back();
     }
@@ -7182,9 +7325,9 @@ void MainWindow::moozBack() {
 }
 
 void MainWindow::refreshToolChrome() {
-    const SelectionBox* box = activeBox(*app_);
-    zoomAction_->setEnabled(box && box->complete);
-    moozAction_->setEnabled(!app_->zoomHistory.empty());
+    // Zoom is always available with data: without a box it starts one.
+    zoomAction_->setEnabled(app_->loaded && !app_->viewLocked);
+    moozAction_->setEnabled(!app_->zoomHistory.empty() && !app_->viewLocked);
     for (Panel* p : {&panelA_, &panelB_}) p->canvas->update();
     canvas_->refreshStatusBar();
     refreshAmplitudeScale();
@@ -7267,6 +7410,18 @@ void MainWindow::refreshAmplitudeScale() {
 }
 
 void MainWindow::updateHoverInfo(const HoverInfo& info) {
+    // Linked crosshair: show this cursor position on the other panel.
+    if (linkedCrosshairAction_ && linkedCrosshairAction_->isChecked()) {
+        for (Panel* p : {&panelA_, &panelB_}) {
+            const bool isSource = p->canvas == info.sourceCanvas;
+            if (isSource) {
+                p->canvas->setLinkedCrosshair(false, 0.0, 0.0);
+            } else {
+                p->canvas->setLinkedCrosshair(info.valid && !info.frequencyAxis && p->canvas->isVisible(),
+                                              info.traceCoord, info.timeMs);
+            }
+        }
+    }
     // Trace Inspector, Follow cursor: the trace under the mouse (not on an
     // x-f display, whose traces are spectra).
     if (info.valid && !info.frequencyAxis && traceInspector_ && traceInspector_->isVisible() &&

@@ -328,6 +328,10 @@ struct AppState {
     std::vector<uint32_t> pixels;
 
     XfState xf;
+
+    // Lock View: the view (zoom/pan/axis ranges) can't change -- see
+    // MainWindow's Lock View action and SegyCanvas's guards.
+    bool viewLocked = false;
 };
 
 class SegyCanvas;
@@ -352,6 +356,8 @@ struct HoverInfo {
     float amplitude = 0.0f;
     bool frequencyAxis = false; // x-f: timeMs is Hz, amplitude is dB
     const Dataset* dataset = nullptr; // the hovered panel's Foreground (Trace Inspector's Follow cursor)
+    const void* sourceCanvas = nullptr; // the hovered SegyCanvas (linked crosshair)
+    double traceCoord = 0.0;            // continuous trace position under the cursor
 };
 
 // A tall, narrow amplitude-to-color legend (gradient plus +clip/0/-clip
@@ -1436,8 +1442,20 @@ public:
     // so Mooz steps back.
     void showAxisRangeMenu(const QPoint& globalPos);
 
+    // Linked crosshair: the other panel's cursor position (trace index and
+    // time in ms), drawn as a dashed crosshair; valid = false hides it.
+    void setLinkedCrosshair(bool valid, double traceCoord, double timeMs);
+    // Fires when a selection box has just been completed (Zoom without a
+    // box: zoom as soon as the box is drawn).
+    void setBoxCompletedCallback(std::function<void()> callback);
+
 private:
     std::function<void(const QPoint& globalPos)> colorScaleMenu_; // the color bar's right-click menu
+    bool linkedCrosshairValid_ = false;
+    double linkedTraceCoord_ = 0.0;
+    double linkedTimeMs_ = 0.0;
+    std::function<void()> onBoxCompleted_;
+    bool refuseIfViewLocked(); // flashes a status message when locked
 public:
 
     // MainWindow owns the status bar (and, via the callback, the Del
@@ -1697,6 +1715,11 @@ private:
     Panel* octaveSourcePanel_ = nullptr; // whose display clip the octave panels follow
     QAction* autocorrelationAction_ = nullptr;
     QAction* xfAction_ = nullptr;
+    QAction* lockViewAction_ = nullptr;
+    QAction* linkedCrosshairAction_ = nullptr;
+    bool pendingBoxZoom_ = false; // Zoom clicked without a box: zoom once one is drawn
+    void sendZoomToOtherPanel();
+    void sendDisplayToOtherPanel();
     QAction* signalNoiseAction_ = nullptr;
     QAction* fkAction_ = nullptr;
     FkWindow* fkWindow_ = nullptr;

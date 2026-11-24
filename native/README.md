@@ -3026,6 +3026,37 @@ trace: depths 800/1800, seabed TWT 405097, water depths
 was not checked by script: the inspector window covers the seismic, so
 the scripted mouse never reached it.
 
+### Two panels: Send Zoom/Display, linked crosshair, Lock View; Zoom without a box
+
+These are the user's decisions on COPILOT.md items 21, 23, 24, 25 and 32.
+
+- **View > Send Zoom to Other Panel** (one-off): the other panel gets the
+  same trace-index range and the same times in ms. Times are converted
+  through both sample intervals, then clamped to the other dataset. It
+  goes on the other panel's zoom history, so Mooz undoes it. It is
+  refused when that panel's view is locked, or between an x-f display and
+  a seismic display.
+- **View > Send Display to Other Panel**: copies everything, including
+  mode, colour scale and flip, gain, AGC and computed gain, the manual
+  clip, polarity and the scale/grid toggles. Not with x-f displays.
+- **View > Linked Crosshair** (on by default): hovering one panel draws a
+  crosshair on the other at the same trace index and time (black
+  underlay, white dashes, like the chart crosshairs). It goes away when
+  the cursor leaves, and is not drawn on x-f displays. Like the Trace Info
+  readout, it follows the pointer tool.
+- **Zoom without a box**: Zoom is always enabled when there's data.
+  Without a completed box it switches to Box Select and says "Draw a box
+  to zoom". As soon as the box is finished the view zooms and the tool
+  returns to the pointer (`SegyCanvas::setBoxCompletedCallback`).
+- **Lock View** (toolbar, View menu; per panel): wheel zoom, pan, R,
+  Zoom, Mooz, Axis Ranges and Reset View are refused, with a status
+  message, and Lock Panels' view sync doesn't move a locked panel. The
+  existing **Lock Panels** (linking both panels) is unchanged; its toolbar
+  text now says so.
+- **Not checked with a screenshot:** these need two loaded panels, which
+  a script can't set up here (loading goes through modal dialogs). They
+  build and run, but please check them by hand.
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`
