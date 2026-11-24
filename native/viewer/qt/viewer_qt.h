@@ -1902,6 +1902,19 @@ private:
 
     void openCalculatorDialog();
     void openBandpassDialog();
+    // Per-trace processing into a new dataset (Processing > Filter > Trace
+    // Integration/Differentiation, Processing > Trace Math > Scale): runs
+    // `transform` on every trace of `panel`'s Foreground in parallel, writes
+    // the result with `historyLine` appended to the processing history, and
+    // loads it into the same panel -- a new item in the dataset list, so
+    // operations cascade (integrate, then bandpass, ...).
+    void runTraceTransform(Panel* panel, const QString& title, const QString& outputName, const QString& historyLine,
+                           std::function<void(std::vector<float>& trace, double sampleIntervalUs)> transform);
+    void openTraceDerivative(bool integrate);
+    void openTraceScale();
+    double lastIntegrationDb_ = 6.0;
+    double lastDifferentiationDb_ = 6.0;
+    double lastScaleFactor_ = 1.0;
     void openSaveSegyDialog();
     void openOctaveBandDialog();
 

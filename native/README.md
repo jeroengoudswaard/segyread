@@ -2934,6 +2934,45 @@ Writing and loading the temporary x-f SEG-Y were already fast (0.2 s and
   axes had swallowed it, because the legend overlay passes mouse presses
   through to the canvas.
 
+### Processing: Filter > Trace Integration/Differentiation, Trace Math > Scale
+
+All three run per trace, in parallel, on the active panel's Foreground
+(`MainWindow::runTraceTransform`). The result is written as a new float32
+SEG-Y with a processing-history line and loaded into the **same panel**.
+It becomes a new item in the dataset list, so operations cascade:
+integrate, then bandpass, and so on, each step recorded in the text
+header. Bandpass now also loads into the panel it came from (it always
+used the left one). None of them run on an x-f display.
+
+- **Trace Integration / Differentiation** (Processing > Filter): a slope
+  of 0–12 dB/octave, 6 by default (`segy::traceDerivative`). The spectrum
+  is multiplied by (i·2πf)^±a with a = slope/6.02:
+  - 6 dB/octave is the full integral or derivative, including the ∓90°
+    phase;
+  - 3 dB/octave is a half integral or derivative (45°);
+  - 0 leaves the data as is.
+
+  The trace mean is removed first and DC gets zero gain. After
+  integration the result's mean is removed too: the integration constant
+  is arbitrary. In quiet water above the seafloor this shows as a small
+  offset, because the whole trace is zero-mean. The trace is zero-padded
+  to twice its length, so nothing wraps around.
+
+  A first version kept the integration gain flat below 1 Hz. That
+  distorted the integral of a finite segment by 11%, because the
+  integration constant's step lives at those frequencies, so it was
+  dropped. Tested: d/dt and the integral of a 20 Hz sine, and the half
+  derivative (amplitude √ω, +45°), to 2%.
+- **Trace Math > Scale**: multiply every sample by a factor (negative
+  flips the polarity).
+- **Dialog:** a small modal dialog with the value and an output name. The
+  name follows the value (`<name>_int6`, `<name>_diff3`, `<name>_x2`)
+  until you type one. Each operation remembers its last value for the
+  session.
+- **Legend labels:** the amplitude legend shows three significant digits
+  below 10, so small amplitudes (e.g. after integration) no longer all
+  read "0".
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`

@@ -63,6 +63,7 @@
 #include <QTableWidget>
 #include <QSignalBlocker>
 #include <map>
+#include <atomic>
 #include <QRegularExpression>
 #include <QToolButton>
 #include <QWidgetAction>
@@ -872,11 +873,15 @@ void AmplitudeScaleWidget::paintEvent(QPaintEvent*) {
     int textX = barX + barW + kPad;
     int textW = w - textX - kPad;
     // Signed labels with a real minus sign (U+2212); "+" only around a zero centre.
-    auto signedLabel = [this](float value, bool plusSign) {
-        int rounded = int(std::lround(value));
-        QString text = rounded < 0 ? QString(QChar(0x2212)) + QString::number(-rounded)
-                                   : (plusSign && rounded > 0 ? "+" : "") + QString::number(rounded);
-        return text;
+    // Whole numbers from 10 up, three significant digits below (small
+    // amplitudes, e.g. after integration, would otherwise all read "0").
+    auto signedLabel = [](float value, bool plusSign) {
+        const double magnitude = std::fabs(double(value));
+        QString digits = magnitude >= 10.0 || magnitude == 0.0 ? QString::number(std::lround(magnitude))
+                                                               : QString::number(magnitude, 'g', 3);
+        if (digits == "0") return QString("0");
+        if (value < 0.0f) return QString(QChar(0x2212)) + digits;
+        return (plusSign ? QString("+") : QString()) + digits;
     };
     const bool zeroCentre = center_ == 0.0f;
     QString topLabel = signedLabel(center_ + posClip_, zeroCentre);
@@ -6015,6 +6020,14 @@ MainWindow::MainWindow() : QMainWindow() {
     QMenu* filterMenu = processingMenu->addMenu("&Filter");
     QAction* bandpassAction = filterMenu->addAction("&Bandpass...");
     connect(bandpassAction, &QAction::triggered, this, &MainWindow::openBandpassDialog);
+    filterMenu->addSeparator();
+    QAction* integrationAction = filterMenu->addAction("Trace &Integration...");
+    connect(integrationAction, &QAction::triggered, this, [this]() { openTraceDerivative(true); });
+    QAction* differentiationAction = filterMenu->addAction("Trace &Differentiation...");
+    connect(differentiationAction, &QAction::triggered, this, [this]() { openTraceDerivative(false); });
+    QMenu* traceMathMenu = processingMenu->addMenu("Trace &Math");
+    QAction* scaleAction = traceMathMenu->addAction("&Scale...");
+    connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
 
     QMenu* helpMenu = menuBar()->addMenu("&Help");
     helpMenu->addAction("&About");
@@ -7448,6 +7461,12 @@ void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams
         flashStatusMessage("No data selected");
         return;
     }
+    if (source.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    // The result goes into the panel it came from, so filters cascade there.
+    Panel* targetPanel = &source == &panelB_.app ? &panelB_ : &panelA_;
     // Snapshot by shared_ptr now -- see runCalculator's comment for why.
     std::shared_ptr<Dataset> ds = source.foreground;
     int64_t traceCount = ds->traceCount;
@@ -7513,12 +7532,12 @@ void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams
             }
             *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
         },
-        [this, writeOk, writeError, outPath, history]() {
+        [this, writeOk, writeError, outPath, history, targetPanel]() {
             if (!*writeOk) {
                 QMessageBox::warning(this, "Bandpass Filter", QString::fromStdString(*writeError));
                 return;
             }
-            panelA_.canvas->startLoading(outPath, history);
+            targetPanel->canvas->startLoading(outPath, history);
         });
 }
 
@@ -7704,6 +7723,190 @@ void MainWindow::openCalculatorDialog() {
     calculatorDialog_->show();
     calculatorDialog_->raise();
     calculatorDialog_->activateWindow();
+}
+
+namespace {
+// Small modal "one number + output name" dialog for the per-trace
+// processing steps. Returns false on Cancel.
+bool askProcessingValue(QWidget* parent, const QString& title, const QString& label, const QString& explanation,
+                        double minimum, double maximum, double step, int decimals, const QString& suffix,
+                        double& value, QString& outputName, const std::function<QString(double)>& defaultName) {
+    QDialog dialog(parent);
+    dialog.setWindowTitle(title);
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    QGridLayout* grid = new QGridLayout();
+    grid->setHorizontalSpacing(10);
+    grid->setVerticalSpacing(8);
+    QDoubleSpinBox* spin = new QDoubleSpinBox();
+    spin->setRange(minimum, maximum);
+    spin->setSingleStep(step);
+    spin->setDecimals(decimals);
+    spin->setSuffix(suffix);
+    spin->setValue(value);
+    QLineEdit* name = new QLineEdit(defaultName(value));
+    bool nameEdited = false;
+    QObject::connect(name, &QLineEdit::textEdited, &dialog, [&nameEdited]() { nameEdited = true; });
+    // The default name follows the value until the user types one.
+    QObject::connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), &dialog, [&](double v) {
+        if (!nameEdited) name->setText(defaultName(v));
+    });
+    grid->addWidget(new QLabel(label), 0, 0);
+    grid->addWidget(spin, 0, 1);
+    grid->addWidget(new QLabel("Output name"), 1, 0);
+    grid->addWidget(name, 1, 1);
+    layout->addLayout(grid);
+    QLabel* hint = new QLabel(explanation);
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    layout->addWidget(hint);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    buttons->addStretch();
+    QPushButton* ok = new QPushButton("OK");
+    QPushButton* cancel = new QPushButton("Cancel");
+    ok->setDefault(true);
+    buttons->addWidget(ok);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+    QObject::connect(ok, &QPushButton::clicked, &dialog, [&]() {
+        if (!name->text().trimmed().isEmpty()) dialog.accept();
+    });
+    QObject::connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    dialog.resize(420, dialog.sizeHint().height());
+    if (dialog.exec() != QDialog::Accepted) return false;
+    value = spin->value();
+    outputName = name->text().trimmed();
+    return true;
+}
+
+QString compactNumber(double value) {
+    QString text = QString::number(value, 'f', 3);
+    while (text.contains('.') && (text.endsWith('0') || text.endsWith('.'))) text.chop(1);
+    return text;
+}
+} // namespace
+
+void MainWindow::openTraceDerivative(bool integrate) {
+    Panel* panel = activePanel_;
+    if (!panel->app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    if (panel->app.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    const QString source = QString::fromStdString(panel->app.foreground->filePath.stem().string());
+    double db = integrate ? lastIntegrationDb_ : lastDifferentiationDb_;
+    QString outputName;
+    const QString what = integrate ? "Integration" : "Differentiation";
+    if (!askProcessingValue(this, "Trace " + what, "Slope",
+                            integrate ? "Spectrum multiplied by (i 2 pi f)^-a, a = slope / 6.02: 6 dB/octave is full "
+                                        "integration (-90 degrees), 3 dB/octave a half integral, 0 leaves the data as is."
+                                      : "Spectrum multiplied by (i 2 pi f)^a, a = slope / 6.02: 6 dB/octave is full "
+                                        "differentiation (+90 degrees), 3 dB/octave a half derivative, 0 leaves the data "
+                                        "as is.",
+                            0.0, 12.0, 0.5, 1, " dB/octave", db, outputName, [source, integrate](double v) {
+                                return QString("%1_%2%3").arg(source, integrate ? "int" : "diff", compactNumber(v));
+                            })) {
+        return;
+    }
+    (integrate ? lastIntegrationDb_ : lastDifferentiationDb_) = db;
+    const double slope = integrate ? -db : db;
+    const QString history = QString("TRACE %1 %2 DB/OCTAVE%3")
+                                .arg(what.toUpper())
+                                .arg(compactNumber(db))
+                                .arg(std::fabs(db - 20.0 * std::log10(2.0)) < 0.05 ? " (FULL)" : "");
+    runTraceTransform(panel, "Trace " + what, outputName, history,
+                      [slope](std::vector<float>& trace, double sampleIntervalUs) {
+                          segy::traceDerivative(trace, sampleIntervalUs, slope);
+                      });
+}
+
+void MainWindow::openTraceScale() {
+    Panel* panel = activePanel_;
+    if (!panel->app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    if (panel->app.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    const QString source = QString::fromStdString(panel->app.foreground->filePath.stem().string());
+    double factor = lastScaleFactor_;
+    QString outputName;
+    if (!askProcessingValue(this, "Trace Math: Scale", "Factor",
+                            "Every sample is multiplied by this factor (negative flips the polarity).", -1e9, 1e9, 0.1,
+                            4, QString(), factor, outputName,
+                            [source](double v) { return QString("%1_x%2").arg(source, compactNumber(v)); })) {
+        return;
+    }
+    lastScaleFactor_ = factor;
+    runTraceTransform(panel, "Trace Math: Scale", outputName, QString("TRACE MATH: SCALE BY %1").arg(compactNumber(factor)),
+                      [factor](std::vector<float>& trace, double) {
+                          const float f = float(factor);
+                          for (float& v : trace) v *= f;
+                      });
+}
+
+void MainWindow::runTraceTransform(Panel* panel, const QString& title, const QString& outputName,
+                                   const QString& historyLine,
+                                   std::function<void(std::vector<float>&, double)> transform) {
+    AppState& source = panel->app;
+    if (!source.loaded || source.foreground->traceCount <= 0 || source.foreground->binHeader.samplesPerTrace <= 0) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = source.foreground;
+    const int64_t traceCount = ds->traceCount;
+    const int samplesPerTrace = ds->binHeader.samplesPerTrace;
+    const double intervalUs = ds->binHeader.sampleIntervalUs;
+    const QString sourceName = QString::fromStdString(ds->filePath.stem().string());
+    QStringList inputBlocks;
+    inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
+                       .arg(sourceName)
+                       .arg(traceCount)
+                       .arg(samplesPerTrace)
+                       .arg(ds->binHeader.sampleIntervalUs);
+    std::vector<std::string> history = ds->processingHistory;
+    history.push_back(historyLine.toStdString());
+    const QString textHeader =
+        buildSegyTextHeader(inputBlocks, history, outputName, traceCount, samplesPerTrace, ds->binHeader.sampleIntervalUs);
+    const std::filesystem::path outPath = scratchSegyPath(outputName);
+    const segy::BinaryHeader outHeader = ds->binHeader;
+    auto writeOk = std::make_shared<bool>(false);
+    auto writeError = std::make_shared<std::string>();
+    runBackgroundTask(
+        QString("%1: %2").arg(title, sourceName),
+        [this, ds, traceCount, samplesPerTrace, intervalUs, transform, outHeader, textHeader, outPath, writeOk,
+         writeError]() {
+            backgroundTaskTotal_ = traceCount;
+            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
+            std::atomic<int64_t> done{0};
+            // Traces are independent: in parallel (decoding from the mmap is thread-safe).
+            segy::ThreadPool pool;
+            pool.parallelFor(size_t(traceCount), 64, [&](size_t begin, size_t end) {
+                std::vector<float> samples(static_cast<size_t>(samplesPerTrace));
+                for (size_t t = begin; t < end; ++t) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                    transform(samples, intervalUs);
+                    segy::WriteTrace& out = traces[t];
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    out.samples = samples;
+                    backgroundTaskDone_ = done.fetch_add(1) + 1;
+                }
+            });
+            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+        },
+        [this, panel, title, writeOk, writeError, outPath, history]() {
+            if (!*writeOk) {
+                QMessageBox::warning(this, title, QString::fromStdString(*writeError));
+                return;
+            }
+            panel->canvas->startLoading(outPath, history);
+        });
 }
 
 void MainWindow::openBandpassDialog() {
