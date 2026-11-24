@@ -79,16 +79,34 @@ std::vector<double> autoPickSeabed(const HorizonTraceFetch& fetch, int64_t trace
         }
         return kNaN;
     };
+    // (Nearly) empty traces get no pick: their peak is noise, not a seabed.
+    std::vector<float> peaks(static_cast<size_t>(n), 0.0f);
     for (int64_t t = 0; t < n; ++t) {
         fetch(traceStart + t, trace.data());
+        for (int i = std::max(0, firstSample); i < samplesPerTrace; ++i) {
+            peaks[size_t(t)] = std::max(peaks[size_t(t)], std::fabs(trace[size_t(i)]));
+        }
         picks[size_t(t)] = firstBreak(trace, 0, samplesPerTrace);
     }
-    // Neighbour consistency: re-pick outliers near the local median.
-    std::vector<double> cleaned = picks;
+    std::vector<float> sortedPeaks = peaks;
+    std::nth_element(sortedPeaks.begin(), sortedPeaks.begin() + std::ptrdiff_t(sortedPeaks.size() / 2), sortedPeaks.end());
+    const float deadBelow = 0.05f * sortedPeaks[sortedPeaks.size() / 2];
+    std::vector<bool> dead(static_cast<size_t>(n), false);
     for (int64_t t = 0; t < n; ++t) {
+        if (peaks[size_t(t)] <= deadBelow) {
+            dead[size_t(t)] = true;
+            picks[size_t(t)] = kNaN;
+        }
+    }
+    // Neighbour consistency: re-pick outliers near the local median. The
+    // median reads the already cleaned picks (in place, left to right), so a
+    // run of bad picks at an edge is repaired from the good side inwards.
+    std::vector<double>& cleaned = picks;
+    for (int64_t t = 0; t < n; ++t) {
+        if (dead[size_t(t)]) continue;
         std::vector<double> near;
         for (int64_t k = std::max<int64_t>(0, t - 10); k <= std::min<int64_t>(n - 1, t + 10); ++k) {
-            if (k != t && std::isfinite(picks[size_t(k)])) near.push_back(picks[size_t(k)]);
+            if (k != t && std::isfinite(cleaned[size_t(k)])) near.push_back(cleaned[size_t(k)]);
         }
         if (near.size() < 3) continue;
         std::nth_element(near.begin(), near.begin() + std::ptrdiff_t(near.size() / 2), near.end());
@@ -98,6 +116,63 @@ std::vector<double> autoPickSeabed(const HorizonTraceFetch& fetch, int64_t trace
         const int from = std::max(0, int(median) - outlierSamples);
         const double repick = firstBreak(trace, from, int(median) + outlierSamples + 1);
         cleaned[size_t(t)] = std::isfinite(repick) ? repick : snapToEvent(trace.data(), samplesPerTrace, median, 4, mode);
+    }
+    // Runs of bad picks too long for the median (a fading seabed at the edge
+    // of the data picks a deeper reflector for dozens of traces): split the
+    // picks into continuous segments (a jump of more than outlierSamples or
+    // a dead trace ends one) and re-track every short segment from an
+    // adjacent long one, trace by trace.
+    const int64_t kShortSegment = 50;
+    struct Segment { int64_t begin, end; };
+    std::vector<Segment> segments;
+    for (int64_t t = 0; t < n;) {
+        if (!std::isfinite(cleaned[size_t(t)])) { ++t; continue; }
+        int64_t e = t + 1;
+        while (e < n && std::isfinite(cleaned[size_t(e)]) &&
+               std::fabs(cleaned[size_t(e)] - cleaned[size_t(e - 1)]) <= outlierSamples) ++e;
+        segments.push_back({t, e});
+        t = e;
+    }
+    auto isLong = [&](const Segment& sg) { return sg.end - sg.begin >= kShortSegment; };
+    // Tracking ends (NaN) where the seabed itself is gone -- muted or
+    // tapered away while deeper data remain: nothing within the window
+    // reaches 10% of the median trace peak.
+    const float goneBelow = 2.0f * deadBelow;
+    auto track = [&](int64_t t, double previous) {
+        if (!std::isfinite(previous)) {
+            cleaned[size_t(t)] = kNaN;
+            return;
+        }
+        fetch(traceStart + t, trace.data());
+        const int from = std::max(0, int(previous) - outlierSamples);
+        float local = 0.0f;
+        for (int i = from; i <= std::min(samplesPerTrace - 1, int(previous) + outlierSamples); ++i) {
+            local = std::max(local, std::fabs(trace[size_t(i)]));
+        }
+        if (local < goneBelow) {
+            cleaned[size_t(t)] = kNaN;
+            return;
+        }
+        const double repick = firstBreak(trace, from, int(previous) + outlierSamples + 1);
+        cleaned[size_t(t)] = std::isfinite(repick) && std::fabs(repick - previous) <= outlierSamples
+                                 ? repick
+                                 : snapToEvent(trace.data(), samplesPerTrace, previous, 4, mode);
+    };
+    if (std::any_of(segments.begin(), segments.end(), isLong)) {
+        for (size_t i = 0; i < segments.size(); ++i) { // left to right: from a long left neighbour
+            if (isLong(segments[i]) || i == 0 || segments[i - 1].end != segments[i].begin) continue;
+            if (!isLong(segments[i - 1])) continue;
+            for (int64_t t = segments[i].begin; t < segments[i].end; ++t) track(t, cleaned[size_t(t - 1)]);
+            segments[i - 1].end = segments[i].end; // merged: now part of the long segment
+            segments[i] = segments[i - 1];
+        }
+        for (size_t i = segments.size(); i-- > 0;) { // right to left: what is left over
+            if (isLong(segments[i]) || i + 1 >= segments.size() || segments[i].end != segments[i + 1].begin) continue;
+            if (!isLong(segments[i + 1])) continue;
+            for (int64_t t = segments[i].end - 1; t >= segments[i].begin; --t) track(t, cleaned[size_t(t + 1)]);
+            segments[i + 1].begin = segments[i].begin;
+            segments[i] = segments[i + 1];
+        }
     }
     return cleaned;
 }
@@ -137,6 +212,27 @@ std::vector<double> pickBetween(const HorizonTraceFetch& fetch, int samplesPerTr
     }
     fetch(traceB, current.data());
     picks[size_t(steps)] = snapToEvent(current.data(), samplesPerTrace, sampleB, 2, mode);
+    return picks;
+}
+
+std::vector<double> fillHorizonGaps(std::vector<double> picks) {
+    const int64_t n = int64_t(picks.size());
+    int64_t previous = -1;
+    for (int64_t t = 0; t < n; ++t) {
+        if (!std::isfinite(picks[size_t(t)])) continue;
+        if (previous < 0) {
+            for (int64_t k = 0; k < t; ++k) picks[size_t(k)] = picks[size_t(t)];
+        } else {
+            for (int64_t k = previous + 1; k < t; ++k) {
+                const double f = double(k - previous) / double(t - previous);
+                picks[size_t(k)] = picks[size_t(previous)] * (1.0 - f) + picks[size_t(t)] * f;
+            }
+        }
+        previous = t;
+    }
+    if (previous >= 0) {
+        for (int64_t k = previous + 1; k < n; ++k) picks[size_t(k)] = picks[size_t(previous)];
+    }
     return picks;
 }
 

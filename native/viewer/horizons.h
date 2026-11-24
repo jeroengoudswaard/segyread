@@ -25,7 +25,12 @@ double snapToEvent(const float* trace, int count, double sample, int radius, Pic
 // `firstSample` on whose |amplitude| reaches thresholdFraction x the
 // trace's maximum, snapped forward to the event (`mode`). Picks that sit
 // more than `outlierSamples` from the median of their +/-10 neighbours are
-// re-picked near that median (neighbour consistency). Dead traces: NaN.
+// re-picked near that median (neighbour consistency); runs of bad picks
+// shorter than 50 traces next to a long continuous stretch are re-tracked
+// from that stretch, trace by trace; tracking stops (NaN) where the seabed
+// is muted away (nothing near the previous pick above 10% of the median
+// trace peak). Dead or nearly empty
+// traces (peak below 5% of the median trace peak) get NaN.
 std::vector<double> autoPickSeabed(const HorizonTraceFetch& fetch, int64_t traceStart, int64_t traceEnd,
                                    int samplesPerTrace, double thresholdFraction, PickMode mode, int firstSample = 0,
                                    int outlierSamples = 10);
@@ -40,6 +45,11 @@ std::vector<double> autoPickSeabed(const HorizonTraceFetch& fetch, int64_t trace
 std::vector<double> pickBetween(const HorizonTraceFetch& fetch, int samplesPerTrace, int64_t traceA, double sampleA,
                                 int64_t traceB, double sampleB, int searchSamples, int windowSamples, double trust,
                                 PickMode mode);
+
+// A value for every trace: NaN gaps between picks are filled by linear
+// interpolation, before the first / after the last pick with that pick.
+// All NaN stays all NaN.
+std::vector<double> fillHorizonGaps(std::vector<double> picks);
 
 // Shifts a trace so the horizon at `horizonSample` lands on
 // `referenceSample` (linear interpolation; zero where it runs out).

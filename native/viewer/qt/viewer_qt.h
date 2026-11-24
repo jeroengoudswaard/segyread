@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "analysis.h"
+#include "horizons.h"
 #include "segy_select.h"
 #include "trace_header_defs.h"
 #include "iirfilter.h"
@@ -76,7 +77,7 @@ namespace segyqt {
 // active: Arrow only hovers/reads (no drag), Pan drag-pans, BoxSelect
 // places/drags the selection box's corners. Wheel-zoom and 'R' reset are
 // independent of this -- they work the same in every mode.
-enum class ToolMode { Arrow, Pan, BoxSelect };
+enum class ToolMode { Arrow, Pan, BoxSelect, Pick };
 
 // Stored in data (trace/sample) coordinates, not pixels, so it stays
 // correctly positioned across pan/zoom -- converted to plot-local pixel
@@ -224,6 +225,16 @@ struct ToolbarItemInfo {
 // always build a new one and reassign the shared_ptr (see
 // SegyCanvas::startLoading) -- a dataset may be shared with the pool or
 // another panel's slot, and in-place mutation would corrupt it for them.
+// A picked horizon (see native/README.md, "Horizons"): one time in ms per
+// trace of its dataset (NaN = no pick), plus the traces the user clicked
+// (anchors; picks between consecutive anchors are filled automatically).
+struct Horizon {
+    QString name;
+    QColor color;
+    std::vector<float> timeMs;
+    std::vector<int64_t> anchors; // in click order
+};
+
 struct Dataset {
     std::string name; // display name -- filePath.stem(), shown in the Foreground/Background boxes and pool dialog
     std::filesystem::path filePath;
@@ -244,6 +255,11 @@ struct Dataset {
     // dataset list only (not shown on load); the idea is to use them as a
     // Background. Shown next to the name in the dataset picker.
     std::string attribute;
+    // User horizons on this dataset (in memory; File > export/import as
+    // CSV). Annotations, not data: edited on the UI thread only, the one
+    // exception to "never mutate a Dataset in place".
+    std::vector<Horizon> horizons;
+    int activeHorizon = -1;
 };
 
 // Same fields as the removed shells' AppState -- one shared struct instead
@@ -265,6 +281,14 @@ struct XfState {
     // (default green -40 dB .. red 0 dB; the user may change it in x-f).
     segy::ColorScale colorScale = segy::ColorScale::RedYellowGreen;
     bool colorScaleFlipped = true;
+};
+
+// Horizons > Flatten as a display (see native/README.md, "Horizons"): the
+// panel shows a flattened copy that is not in the dataset list; switching
+// it off goes back to `original` with the same view.
+struct FlattenState {
+    bool active = false;
+    std::shared_ptr<Dataset> original;
 };
 
 struct AppState {
@@ -329,6 +353,7 @@ struct AppState {
     std::vector<uint32_t> pixels;
 
     XfState xf;
+    FlattenState flatten;
 
     // Lock View: the view (zoom/pan/axis ranges) can't change -- see
     // MainWindow's Lock View action and SegyCanvas's guards.
@@ -1435,7 +1460,11 @@ public:
     // completes -- empty for a normal File > Open, populated when
     // Calculator/Bandpass load a dataset they just synthesized (see
     // Dataset::processingHistory).
-    void startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory = {});
+    // `onLoaded`, when given, receives the loaded dataset instead of it
+    // becoming the Foreground and joining the dataset list (Flatten as a
+    // display uses this).
+    void startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory = {},
+                      std::function<void(std::shared_ptr<Dataset>)> onLoaded = {});
 
     // Fires once per successful load, right after the new Dataset becomes
     // this panel's Foreground -- MainWindow uses it to register the
@@ -1472,6 +1501,9 @@ public:
     // Fires when a selection box has just been completed (Zoom without a
     // box: zoom as soon as the box is drawn).
     void setBoxCompletedCallback(std::function<void()> callback);
+    // Pick tool: a left click at (trace, sample) on the plot; MainWindow adds
+    // the anchor and fills the picks. Right click: remove the nearest anchor.
+    void setPickCallback(std::function<void(double traceCoord, double sampleCoord, bool remove)> callback);
 
 private:
     std::function<void(const QPoint& globalPos)> colorScaleMenu_; // the color bar's right-click menu
@@ -1479,6 +1511,7 @@ private:
     double linkedTraceCoord_ = 0.0;
     double linkedTimeMs_ = 0.0;
     std::function<void()> onBoxCompleted_;
+    std::function<void(double, double, bool)> onPick_;
     bool refuseIfViewLocked(); // flashes a status message when locked
 public:
 
@@ -1740,6 +1773,32 @@ private:
     QAction* autocorrelationAction_ = nullptr;
     QAction* xfAction_ = nullptr;
     QAction* lockViewAction_ = nullptr;
+    QAction* pickAction_ = nullptr;
+    QWidget* horizonManager_ = nullptr; // Horizons > Horizon Manager
+    // Pick settings (Horizon Manager), decided with the user: search +/-20 ms,
+    // trust 0.7, peak; seabed threshold 30% of the trace maximum.
+    segy::PickMode pickMode_ = segy::PickMode::Peak;
+    double pickSearchMs_ = 20.0;
+    double pickWindowMs_ = 40.0;
+    double pickTrust_ = 0.7;
+    double seabedThresholdPercent_ = 30.0;
+    void openHorizonManager();
+    void refreshHorizonManager();
+    Horizon* activeHorizonFor(Panel* panel, bool create);
+    void handlePick(Panel* panel, double traceCoord, double sampleCoord, bool remove);
+    void autoPickSeabed(Panel* panel);
+    void exportHorizon(Panel* panel);
+    void importHorizon(Panel* panel);
+    // Flatten (Horizons > Flatten...): on a horizon or a trace-header time
+    // (default bytes 57-60, Shell SEABED_TWT, 0.01 ms units).
+    QAction* flattenAction_ = nullptr;
+    int headerTimeByte_ = 57;
+    int headerTimeSize_ = 4;
+    double headerTimeMsPerUnit_ = 0.01;
+    void toggleFlatten(Panel* panel, bool on);
+    void runFlatten(Panel* panel, std::vector<double> sourceMs, double referenceMs, bool newDataset,
+                    const QString& outputName, const QString& historyLine);
+    void writeHorizonToHeader(Panel* panel);
     QAction* linkedCrosshairAction_ = nullptr;
     bool pendingBoxZoom_ = false; // Zoom clicked without a box: zoom once one is drawn
     void sendZoomToOtherPanel();

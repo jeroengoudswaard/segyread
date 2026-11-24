@@ -1798,11 +1798,69 @@ void testHorizons() {
         }
     }
     for (int i = 40; i < 44; ++i) data[30][size_t(i)] = 1.5f;
+    // The last 5 traces are nearly empty (tiny noise only): no pick there.
+    for (int tr = 55; tr < traces; ++tr) {
+        for (int i = 0; i < samples; ++i) data[size_t(tr)][size_t(i)] = float(g(rng) * 0.1);
+    }
     auto fetch = [&data, samples](int64_t idx, float* out) { std::copy_n(data[size_t(idx)].begin(), samples, out); };
     std::vector<double> picks = segy::autoPickSeabed(fetch, 0, traces, samples, 0.3, segy::PickMode::Peak);
     double worst = 0.0;
-    for (int t = 0; t < traces; ++t) worst = std::max(worst, std::fabs(picks[size_t(t)] - seabed(t)));
+    for (int t = 0; t < 55; ++t) worst = std::max(worst, std::fabs(picks[size_t(t)] - seabed(t)));
     CHECK(worst < 1.0);
+    bool emptyUnpicked = true;
+    for (int t = 55; t < traces; ++t) emptyUnpicked = emptyUnpicked && std::isnan(picks[size_t(t)]);
+    CHECK(emptyUnpicked);
+
+    // A fading seabed at the edge: 150 traces, traces 120-139 have a seabed
+    // too weak for the threshold (a deeper reflector is picked first), the
+    // last 10 are empty. The weak run is re-tracked from the good stretch.
+    {
+        const int edgeTraces = 150;
+        std::normal_distribution<double> quiet(0.0, 0.002);
+        std::vector<std::vector<float>> edge(edgeTraces, std::vector<float>(samples));
+        auto bed = [](int t) { return 80.0 + 0.5 * t; };
+        for (int t = 0; t < edgeTraces; ++t) {
+            const double strength = t >= 120 ? 0.15 : 1.0, deeper = t >= 120 ? 0.8 : 0.2;
+            for (int i = 0; i < samples; ++i) {
+                const double v = t >= 140 ? quiet(rng) * 0.1
+                                          : strength * ricker((i - bed(t)) * dt, 25.0) +
+                                                deeper * ricker((i - bed(t) - 60) * dt, 25.0) + quiet(rng);
+                edge[size_t(t)][size_t(i)] = float(v);
+            }
+        }
+        auto edgeFetch = [&edge, samples](int64_t idx, float* out) {
+            std::copy_n(edge[size_t(idx)].begin(), samples, out);
+        };
+        std::vector<double> edgePicks =
+            segy::autoPickSeabed(edgeFetch, 0, edgeTraces, samples, 0.3, segy::PickMode::Peak);
+        double edgeWorst = 0.0;
+        for (int t = 0; t < 140; ++t) edgeWorst = std::max(edgeWorst, std::fabs(edgePicks[size_t(t)] - bed(t)));
+        CHECK(edgeWorst < 1.0);
+        CHECK(std::isnan(edgePicks[145]));
+        // A seabed muted away (deeper data remain) ends the horizon.
+        for (int t = 120; t < 140; ++t) {
+            for (int i = 0; i < samples; ++i) {
+                edge[size_t(t)][size_t(i)] = float(0.3 * ricker((i - bed(t) - 60) * dt, 25.0) +
+                                                   (i < bed(t) + 30 ? 0.0 : quiet(rng)));
+            }
+        }
+        edgePicks = segy::autoPickSeabed(edgeFetch, 0, edgeTraces, samples, 0.3, segy::PickMode::Peak);
+        bool mutedUnpicked = true;
+        for (int t = 121; t < 140; ++t) mutedUnpicked = mutedUnpicked && std::isnan(edgePicks[size_t(t)]);
+        CHECK(mutedUnpicked);
+        CHECK(std::fabs(edgePicks[100] - bed(100)) < 1.0);
+    }
+
+    // Gap filling: linear inside, constant at the ends, all-NaN stays NaN.
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        std::vector<double> filled = segy::fillHorizonGaps({nan, 10.0, nan, nan, 16.0, nan});
+        CHECK_NEAR(filled[0], 10.0, 1e-12);
+        CHECK_NEAR(filled[2], 12.0, 1e-12);
+        CHECK_NEAR(filled[3], 14.0, 1e-12);
+        CHECK_NEAR(filled[5], 16.0, 1e-12);
+        CHECK(std::isnan(segy::fillHorizonGaps({nan, nan})[1]));
+    }
 
     // Point to point on a curved event: anchors at traces 0 and 40.
     auto curve = [](int t) { return 150.0 + 8.0 * std::sin(t / 8.0); };

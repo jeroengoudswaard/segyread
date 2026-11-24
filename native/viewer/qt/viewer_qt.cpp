@@ -62,6 +62,9 @@
 #include <QStringList>
 #include <QTableWidget>
 #include <QSignalBlocker>
+#include <QFile>
+#include <QTextStream>
+#include <QColorDialog>
 #include <map>
 #include <complex>
 #include "fft.h"
@@ -304,6 +307,10 @@ QIcon renderOverflowIcon(int hiddenCount) {
 // is showing is always visible and titled the same way everywhere.
 QString datasetTitleSuffix(const AppState& app) {
     if (!app.loaded || app.foreground->filePath.empty()) return QString();
+    if (app.flatten.active && app.flatten.original) {
+        return QString::fromUtf8(" \xe2\x80\x94 ") +
+               QString::fromStdString(app.flatten.original->filePath.filename().string()) + " (flattened)";
+    }
     return QString::fromUtf8(" \xe2\x80\x94 ") + QString::fromStdString(app.foreground->filePath.filename().string());
 }
 
@@ -5741,6 +5748,55 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         }
         painter.restore();
 
+        // Horizons of this dataset: a line through the picks (gaps where
+        // there are none), anchors as squares, the active one thicker.
+        if (!app_.foreground->horizons.empty() && !app_.display.frequencyAxis) {
+            const double sampleMs = app_.foreground->binHeader.sampleIntervalUs / 1000.0;
+            const QRect plot(kCanvasMargin + chrome.plotX, topInset, chrome.plotWidth, insetHeight);
+            const int64_t first = std::max<int64_t>(0, int64_t(std::floor(app_.view.traceStart)));
+            const int64_t last = std::min<int64_t>(app_.foreground->traceCount - 1, int64_t(std::ceil(app_.view.traceEnd)));
+            // At most ~2 points per pixel column.
+            const int64_t step = std::max<int64_t>(1, (last - first + 1) / std::max(1, 2 * chrome.plotWidth));
+            painter.save();
+            painter.setClipRect(plot);
+            painter.setRenderHint(QPainter::Antialiasing, true);
+            for (int hi = 0; hi < int(app_.foreground->horizons.size()); ++hi) {
+                const Horizon& hz = app_.foreground->horizons[size_t(hi)];
+                const bool active = hi == app_.foreground->activeHorizon;
+                QPolygonF run;
+                auto flush = [&]() {
+                    if (run.size() > 1) {
+                        painter.setPen(QPen(QColor(0, 0, 0, 140), active ? 4.5 : 3.0));
+                        painter.drawPolyline(run);
+                        painter.setPen(QPen(hz.color, active ? 2.5 : 1.5));
+                        painter.drawPolyline(run);
+                    }
+                    run.clear();
+                };
+                for (int64_t t = first; t <= last && sampleMs > 0.0; t += step) {
+                    const float ms = t < int64_t(hz.timeMs.size()) ? hz.timeMs[size_t(t)] : NAN;
+                    if (!std::isfinite(ms)) {
+                        flush();
+                        continue;
+                    }
+                    double x = 0.0, y = 0.0;
+                    pixelForData(double(t) + 0.5, ms / sampleMs, x, y);
+                    run << QPointF(x, y);
+                }
+                flush();
+                painter.setPen(QPen(Qt::black, 1));
+                painter.setBrush(hz.color);
+                for (int64_t a : hz.anchors) {
+                    if (a < first || a > last || a >= int64_t(hz.timeMs.size()) || !std::isfinite(hz.timeMs[size_t(a)])) continue;
+                    double x = 0.0, y = 0.0;
+                    pixelForData(double(a) + 0.5, hz.timeMs[size_t(a)] / sampleMs, x, y);
+                    painter.drawRect(QRectF(x - 3.5, y - 3.5, 7.0, 7.0));
+                }
+                painter.setBrush(Qt::NoBrush);
+            }
+            painter.restore();
+        }
+
         // Linked crosshair: where the cursor is on the other panel (same
         // trace index and time), black underlay + white dashes like the
         // chart crosshairs. Not on an x-f display (frequency, not time).
@@ -5789,6 +5845,8 @@ void SegyCanvas::setLinkedCrosshair(bool valid, double traceCoord, double timeMs
 
 void SegyCanvas::setBoxCompletedCallback(std::function<void()> callback) { onBoxCompleted_ = std::move(callback); }
 
+void SegyCanvas::setPickCallback(std::function<void(double, double, bool)> callback) { onPick_ = std::move(callback); }
+
 void SegyCanvas::mousePressEvent(QMouseEvent* event) {
     if (notifyActivated_) notifyActivated_();
     if (!app_.loaded) return;
@@ -5803,6 +5861,14 @@ void SegyCanvas::mousePressEvent(QMouseEvent* event) {
             showAxisRangeMenu(event->globalPosition().toPoint());
             return;
         }
+    }
+    if (app_.tool == ToolMode::Pick) {
+        double traceCoord = 0.0, sampleCoord = 0.0;
+        if ((event->button() == Qt::LeftButton || event->button() == Qt::RightButton) && onPick_ &&
+            dataCoordAt(event->pos().x(), event->pos().y(), traceCoord, sampleCoord)) {
+            onPick_(traceCoord, sampleCoord, event->button() == Qt::RightButton);
+        }
+        return;
     }
     if (app_.tool == ToolMode::BoxSelect) {
         handleBoxSelectPress(event);
@@ -6048,6 +6114,7 @@ void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
     // new from startLoading or already sitting in the pool).
     app_.foreground = std::move(dataset);
     app_.loaded = true;
+    app_.flatten = FlattenState{}; // a flattened display ends with any new Foreground
     applyDefaultSortIdents(app_);
     segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
     // A newly-active dataset invalidates any boxes drawn against the
@@ -6071,14 +6138,15 @@ void SegyCanvas::setBackgroundDataset(std::shared_ptr<Dataset> dataset) {
     notifyStateChanged();
 }
 
-void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory) {
+void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory,
+                              std::function<void(std::shared_ptr<Dataset>)> onLoaded) {
     if (app_.loading) return;
     app_.loaded = false;
     app_.loading = true;
     app_.progressDone = 0;
     app_.progressTotal = 1;
 
-    std::thread([this, path, processingHistory = std::move(processingHistory)]() mutable {
+    std::thread([this, path, processingHistory = std::move(processingHistory), onLoaded = std::move(onLoaded)]() mutable {
         // Must be a genuinely atomic timestamp -- buildPyramid's progress
         // callback runs concurrently from multiple pool worker threads. A
         // plain std::chrono::time_point mutated across threads without
@@ -6106,7 +6174,8 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
 
         QMetaObject::invokeMethod(
             this,
-            [this, path, result = std::move(result), processingHistory = std::move(processingHistory)]() mutable {
+            [this, path, result = std::move(result), processingHistory = std::move(processingHistory),
+             onLoaded = std::move(onLoaded)]() mutable {
                 app_.loading = false;
                 if (result.ok) {
                     auto dataset = std::make_shared<Dataset>();
@@ -6118,6 +6187,13 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
                     dataset->traceStrideBytes = result.traceStrideBytes;
                     dataset->pyramid = std::move(result.pyramid);
                     dataset->processingHistory = std::move(processingHistory);
+                    if (onLoaded) {
+                        app_.loaded = true; // the current Foreground is still there
+                        onLoaded(dataset);
+                        updateStatusBar();
+                        update();
+                        return;
+                    }
                     // Foreground first: onDatasetLoaded_ (MainWindow::
                     // registerDataset) ends by refreshing both panels'
                     // Foreground/Background box text, which reads through
@@ -6129,7 +6205,7 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
                     setForegroundDataset(dataset);
                     if (onDatasetLoaded_) onDatasetLoaded_(dataset);
                 } else {
-                    app_.loaded = false;
+                    app_.loaded = bool(onLoaded) && app_.foreground->traceCount > 0;
                     std::fprintf(stderr, "Failed to open SEG-Y file: %s\n", result.error.c_str());
                     // TODO(UI polish): surface this in-window (e.g. QMessageBox) instead of stderr only.
                 }
@@ -6174,6 +6250,10 @@ MainWindow::MainWindow() : QMainWindow() {
     panelB_.canvas->hide();
     setCentralWidget(splitter_);
     panelA_.canvas->setActivatedCallback([this]() { setActivePanel(&panelA_); });
+    for (Panel* p : {&panelA_, &panelB_}) {
+        p->canvas->setPickCallback(
+            [this, p](double traceCoord, double sampleCoord, bool remove) { handlePick(p, traceCoord, sampleCoord, remove); });
+    }
     for (Panel* p : {&panelA_, &panelB_}) {
         p->canvas->setBoxCompletedCallback([this, p]() {
             if (!pendingBoxZoom_ || p != activePanel_) return;
@@ -6291,6 +6371,7 @@ MainWindow::MainWindow() : QMainWindow() {
 
     // Processing: everything that computes a new dataset.
     QMenu* processingMenu = menuBar()->addMenu("&Processing");
+    QMenu* horizonsMenu = menuBar()->addMenu("Hori&zons");
     QAction* calculatorAction = processingMenu->addAction("&Calculator...");
     connect(calculatorAction, &QAction::triggered, this, &MainWindow::openCalculatorDialog);
     QMenu* filterMenu = processingMenu->addMenu("&Filter");
@@ -6301,6 +6382,25 @@ MainWindow::MainWindow() : QMainWindow() {
     connect(integrationAction, &QAction::triggered, this, [this]() { openTraceDerivative(true); });
     QAction* differentiationAction = filterMenu->addAction("Trace &Differentiation...");
     connect(differentiationAction, &QAction::triggered, this, [this]() { openTraceDerivative(false); });
+    {
+        QAction* managerAction = horizonsMenu->addAction("Horizon &Manager...");
+        connect(managerAction, &QAction::triggered, this, &MainWindow::openHorizonManager);
+        horizonsMenu->addSeparator();
+        QAction* seabedAction = horizonsMenu->addAction("Auto-pick &Seabed");
+        connect(seabedAction, &QAction::triggered, this, [this]() { autoPickSeabed(activePanel_); });
+        QAction* toHeaderAction = horizonsMenu->addAction("Write Horizon to &Header...");
+        connect(toHeaderAction, &QAction::triggered, this, [this]() { writeHorizonToHeader(activePanel_); });
+        horizonsMenu->addSeparator();
+        flattenAction_ = horizonsMenu->addAction("&Flatten...");
+        flattenAction_->setCheckable(true);
+        flattenAction_->setToolTip("Flatten on a horizon or a header time; switch off to go back");
+        connect(flattenAction_, &QAction::triggered, this, [this](bool on) { toggleFlatten(activePanel_, on); });
+        horizonsMenu->addSeparator();
+        QAction* exportAction = horizonsMenu->addAction("&Export Horizon (CSV)...");
+        connect(exportAction, &QAction::triggered, this, [this]() { exportHorizon(activePanel_); });
+        QAction* importAction = horizonsMenu->addAction("&Import Horizon (CSV)...");
+        connect(importAction, &QAction::triggered, this, [this]() { importHorizon(activePanel_); });
+    }
     QMenu* traceMathMenu = processingMenu->addMenu("Trace &Math");
     QAction* scaleAction = traceMathMenu->addAction("&Scale...");
     connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
@@ -6352,6 +6452,24 @@ MainWindow::MainWindow() : QMainWindow() {
     boxSelectAction_->setCheckable(true);
     boxSelectAction_->setToolTip("Draw a box to zoom into, or edit/delete the existing one");
     toolGroup->addAction(boxSelectAction_);
+    // Pick: click anchors of the active horizon (Horizons menu, Horizon Manager).
+    pickAction_ = toolbar->addAction(iconPick(), "Pick Horizon");
+    pickAction_->setCheckable(true);
+    pickAction_->setToolTip("Pick a horizon: click points, the traces in between are tracked; right click removes "
+                            "the nearest point");
+    toolGroup->addAction(pickAction_);
+    connect(pickAction_, &QAction::triggered, this, [this](bool checked) {
+        for (Panel* p : targetPanels()) {
+            p->app.tool = checked ? ToolMode::Pick : ToolMode::Arrow;
+            p->canvas->setCursor(checked ? QCursor(Qt::CrossCursor) : QCursor(Qt::ArrowCursor));
+        }
+        if (checked && app_->loaded) activeHorizonFor(activePanel_, true);
+        refreshHorizonManager();
+        refreshToolChrome();
+    });
+    // The Horizons menu exists already (created with the menu bar, before
+    // the toolbar): mirror the tool there, after Horizon Manager.
+    addMenuMirror(horizonsMenu, pickAction_, "&Pick Horizon", horizonsMenu->actions().value(1));
     connect(boxSelectAction_, &QAction::triggered, this, [this](bool checked) {
         for (Panel* p : targetPanels()) {
             p->app.tool = checked ? ToolMode::BoxSelect : ToolMode::Arrow;
@@ -6669,7 +6787,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // to begin with, and a QWidgetAction's widget can't be safely shown
     // in both the toolbar and a menu at once -- it would just move).
     toolbarOverflowCandidates_ = {
-        zoomAction_,          moozAction_,         panAction_,         boxSelectAction_,
+        zoomAction_,          moozAction_,         panAction_,         boxSelectAction_, pickAction_,
         seismicModeToolbarAction_, flipHorizontalAction_, identsAction_,  gainDetailAction_, gainUpAction_,
         gainDownAction_,      agcAction_,          spectrumAction_,     histogramAction_,   octaveBandAction_,
         autocorrelationAction_, xfAction_,
@@ -6721,6 +6839,7 @@ MainWindow::MainWindow() : QMainWindow() {
         {"mooz", "Undo Zoom (Mooz)", 0, {moozAction_}},
         {"pan", "Pan", 1, {panAction_}},
         {"boxSelect", "Box Select", 1, {boxSelectAction_}},
+        {"pick", "Pick Horizon", 1, {pickAction_}},
         {"seismicMode", "Seismic Display Toggle", 2, {seismicModeToolbarAction_}},
         {"flipHorizontal", "Flip Horizontal", 2, {flipHorizontalAction_}},
         {"idents", "Idents", 2, {identsAction_}},
@@ -7398,6 +7517,7 @@ void MainWindow::setActivePanel(Panel* panel) {
     // interaction does), so this can't loop back into itself.
     panAction_->setChecked(app_->tool == ToolMode::Pan);
     boxSelectAction_->setChecked(app_->tool == ToolMode::BoxSelect);
+    pickAction_->setChecked(app_->tool == ToolMode::Pick);
     gainSlider_->blockSignals(true);
     gainSlider_->setValue(int(std::lround(app_->display.gainDb)));
     gainSlider_->blockSignals(false);
@@ -7408,6 +7528,7 @@ void MainWindow::setActivePanel(Panel* panel) {
     refreshSeismicModeToolbarIcon();
     refreshAmplitudeProcessingControls();
     xfAction_->setChecked(app_->xf.active);
+    if (flattenAction_) flattenAction_->setChecked(app_->flatten.active);
     lockViewAction_->setChecked(app_->viewLocked);
     // Analyses that assume a time series mean nothing on an x-f display
     // (its samples are frequency bins in dB). Histogram stays: a
@@ -8398,7 +8519,7 @@ void MainWindow::openPreferencesDialog() {
         // which lump analysis, headers and panel controls together).
         auto categoryFor = [](const QString& id) -> QString {
             if (id == "zoom" || id == "mooz") return "Zoom";
-            if (id == "pan" || id == "boxSelect") return "Tools";
+            if (id == "pan" || id == "boxSelect" || id == "pick") return "Tools";
             if (id == "seismicMode" || id == "flipHorizontal" || id == "idents") return "Display";
             if (id == "displayParameters" || id == "gain" || id == "agc") return "Amplitude";
             if (id == "spectrum" || id == "histogram" || id == "octaveBands" || id == "autocorrelation" || id == "xf")
@@ -9623,6 +9744,697 @@ void MainWindow::runSubsetSort(Panel* panel, std::shared_ptr<Dataset> dataset, s
             flashStatusMessage(QString("%1 traces selected").arg(outcome->traces));
             panel->canvas->startLoading(outPath, history);
         });
+}
+
+namespace {
+const QColor kHorizonColors[] = {QColor(0xe8, 0x90, 0x5a), QColor(0x19, 0x9e, 0x70), QColor(0xd5, 0x51, 0x81),
+                                 QColor(0xc9, 0x85, 0x00), QColor(0x90, 0x85, 0xe9), QColor(0x39, 0x87, 0xe5)};
+
+segy::HorizonTraceFetch fetchFor(const std::shared_ptr<Dataset>& ds) {
+    return [ds](int64_t traceIdx, float* out) {
+        const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * ds->traceStrideBytes;
+        segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out, size_t(ds->binHeader.samplesPerTrace),
+                            ds->binHeader.formatCode);
+    };
+}
+} // namespace
+
+Horizon* MainWindow::activeHorizonFor(Panel* panel, bool create) {
+    if (!panel->app.loaded) return nullptr;
+    Dataset& ds = *panel->app.foreground;
+    if (ds.activeHorizon >= 0 && ds.activeHorizon < int(ds.horizons.size())) return &ds.horizons[size_t(ds.activeHorizon)];
+    if (!create) return nullptr;
+    Horizon hz;
+    hz.name = QString("Horizon %1").arg(ds.horizons.size() + 1);
+    hz.color = kHorizonColors[ds.horizons.size() % std::size(kHorizonColors)];
+    hz.timeMs.assign(size_t(ds.traceCount), std::numeric_limits<float>::quiet_NaN());
+    ds.horizons.push_back(std::move(hz));
+    ds.activeHorizon = int(ds.horizons.size()) - 1;
+    return &ds.horizons.back();
+}
+
+void MainWindow::handlePick(Panel* panel, double traceCoord, double sampleCoord, bool remove) {
+    if (!panel->app.loaded || panel->app.xf.active) return;
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    Horizon* hz = activeHorizonFor(panel, !remove);
+    if (!hz) return;
+    const double sampleMs = ds->binHeader.sampleIntervalUs / 1000.0;
+    const int64_t trace = std::clamp<int64_t>(int64_t(std::floor(traceCoord)), 0, ds->traceCount - 1);
+    const int searchSamples = std::max(1, int(std::lround(pickSearchMs_ / sampleMs)));
+    const int windowSamples = std::max(4, int(std::lround(pickWindowMs_ / sampleMs)));
+    const segy::HorizonTraceFetch fetch = fetchFor(ds);
+    if (remove) {
+        // The nearest anchor goes; the horizon is rebuilt along the
+        // remaining anchors (at their own picked times).
+        if (hz->anchors.empty()) return;
+        auto nearest = std::min_element(hz->anchors.begin(), hz->anchors.end(), [trace](int64_t a, int64_t b) {
+            return std::llabs(a - trace) < std::llabs(b - trace);
+        });
+        hz->anchors.erase(nearest);
+        std::vector<std::pair<int64_t, double>> keep;
+        for (int64_t a : hz->anchors) {
+            if (std::isfinite(hz->timeMs[size_t(a)])) keep.push_back({a, hz->timeMs[size_t(a)] / sampleMs});
+        }
+        std::fill(hz->timeMs.begin(), hz->timeMs.end(), std::numeric_limits<float>::quiet_NaN());
+        for (size_t k = 0; k < keep.size(); ++k) {
+            const auto [from, fromSample] = keep[k];
+            const auto [to, toSample] = k + 1 < keep.size() ? keep[k + 1] : keep[k];
+            std::vector<double> picks = segy::pickBetween(fetch, ds->binHeader.samplesPerTrace, from, fromSample, to,
+                                                          toSample, searchSamples, windowSamples, pickTrust_, pickMode_);
+            const int64_t dir = to >= from ? 1 : -1;
+            for (size_t i = 0; i < picks.size(); ++i) hz->timeMs[size_t(from + dir * int64_t(i))] = float(picks[i] * sampleMs);
+        }
+        panel->canvas->update();
+        refreshHorizonManager();
+        return;
+    }
+    if (hz->anchors.empty()) {
+        std::vector<double> single =
+            segy::pickBetween(fetch, ds->binHeader.samplesPerTrace, trace, sampleCoord, trace, sampleCoord, searchSamples,
+                              windowSamples, pickTrust_, pickMode_);
+        hz->timeMs[size_t(trace)] = float(single[0] * sampleMs);
+    } else {
+        // Track from the last anchor (at its picked time) to this click.
+        const int64_t from = hz->anchors.back();
+        const double fromSample = std::isfinite(hz->timeMs[size_t(from)]) ? hz->timeMs[size_t(from)] / sampleMs : sampleCoord;
+        std::vector<double> picks = segy::pickBetween(fetch, ds->binHeader.samplesPerTrace, from, fromSample, trace,
+                                                      sampleCoord, searchSamples, windowSamples, pickTrust_, pickMode_);
+        const int64_t dir = trace >= from ? 1 : -1;
+        for (size_t i = 0; i < picks.size(); ++i) hz->timeMs[size_t(from + dir * int64_t(i))] = float(picks[i] * sampleMs);
+    }
+    hz->anchors.push_back(trace);
+    panel->canvas->update();
+    refreshHorizonManager();
+}
+
+void MainWindow::autoPickSeabed(Panel* panel) {
+    if (!panel->app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    if (panel->app.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    const double threshold = seabedThresholdPercent_ / 100.0;
+    const segy::PickMode mode = pickMode_;
+    auto picks = std::make_shared<std::vector<double>>();
+    runBackgroundTask(
+        "Auto-picking the seabed",
+        [this, ds, threshold, mode, picks]() {
+            backgroundTaskTotal_ = 1;
+            *picks = segy::autoPickSeabed(fetchFor(ds), 0, ds->traceCount, ds->binHeader.samplesPerTrace, threshold, mode);
+            backgroundTaskDone_ = 1;
+        },
+        [this, panel, ds, picks]() {
+            if (panel->app.foreground != ds) return;
+            Horizon hz;
+            hz.name = "Seabed";
+            hz.color = QColor(0x39, 0x87, 0xe5);
+            const double sampleMs = ds->binHeader.sampleIntervalUs / 1000.0;
+            hz.timeMs.resize(picks->size());
+            for (size_t i = 0; i < picks->size(); ++i) hz.timeMs[i] = float((*picks)[i] * sampleMs);
+            ds->horizons.push_back(std::move(hz));
+            ds->activeHorizon = int(ds->horizons.size()) - 1;
+            panel->canvas->update();
+            refreshHorizonManager();
+            flashStatusMessage("Seabed picked: horizon \"Seabed\" (edit it with the Pick tool)");
+        });
+}
+
+void MainWindow::exportHorizon(Panel* panel) {
+    Horizon* hz = activeHorizonFor(panel, false);
+    if (!hz) {
+        flashStatusMessage("No horizon to export");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    const QString path = QFileDialog::getSaveFileName(this, "Export Horizon", hz->name + ".csv", "CSV (*.csv)");
+    if (path.isEmpty()) return;
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Export Horizon", "Could not write " + path);
+        return;
+    }
+    // One line per picked trace: trace number (1-based), CDP, FFID, offset, time.
+    QTextStream out(&file);
+    out << "trace,cdp,ffid,offset,time_ms\n";
+    int64_t written = 0;
+    for (int64_t t = 0; t < int64_t(hz->timeMs.size()); ++t) {
+        if (!std::isfinite(hz->timeMs[size_t(t)])) continue;
+        const segy::TraceHeader th = segy::parseTraceHeader(ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes);
+        out << (t + 1) << ',' << th.cdp << ',' << th.fieldRecord << ',' << th.offset << ','
+            << QString::number(hz->timeMs[size_t(t)], 'f', 2) << '\n';
+        ++written;
+    }
+    flashStatusMessage(QString("%1 picks exported to %2").arg(written).arg(QFileInfo(path).fileName()));
+}
+
+void MainWindow::importHorizon(Panel* panel) {
+    if (!panel->app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    const QString path = QFileDialog::getOpenFileName(this, "Import Horizon", QString(), "CSV (*.csv);;All files (*)");
+    if (path.isEmpty()) return;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Import Horizon", "Could not read " + path);
+        return;
+    }
+    // The exported layout: a header row naming the columns; "trace" (1-based)
+    // and "time_ms" are what's needed.
+    QTextStream in(&file);
+    const QStringList header = in.readLine().split(',');
+    const int traceColumn = header.indexOf("trace"), timeColumn = header.indexOf("time_ms");
+    if (traceColumn < 0 || timeColumn < 0) {
+        QMessageBox::warning(this, "Import Horizon", "Expected a header row with \"trace\" and \"time_ms\" columns.");
+        return;
+    }
+    Horizon hz;
+    hz.name = QFileInfo(path).completeBaseName();
+    hz.color = kHorizonColors[ds->horizons.size() % std::size(kHorizonColors)];
+    hz.timeMs.assign(size_t(ds->traceCount), std::numeric_limits<float>::quiet_NaN());
+    int64_t read = 0;
+    while (!in.atEnd()) {
+        const QStringList fields = in.readLine().split(',');
+        if (fields.size() <= std::max(traceColumn, timeColumn)) continue;
+        bool okTrace = false, okTime = false;
+        const qlonglong trace = fields[traceColumn].toLongLong(&okTrace);
+        const double ms = fields[timeColumn].toDouble(&okTime);
+        if (!okTrace || !okTime || trace < 1 || trace > ds->traceCount) continue;
+        hz.timeMs[size_t(trace - 1)] = float(ms);
+        ++read;
+    }
+    ds->horizons.push_back(std::move(hz));
+    ds->activeHorizon = int(ds->horizons.size()) - 1;
+    panel->canvas->update();
+    refreshHorizonManager();
+    flashStatusMessage(QString("%1 picks imported").arg(read));
+}
+
+namespace {
+// A time per trace from a trace-header integer (`msPerUnit` ms per count);
+// 0 counts as "no value" (NaN).
+std::vector<double> headerTimesMs(const Dataset& ds, int firstByte, int size, double msPerUnit) {
+    std::vector<double> ms(size_t(ds.traceCount), std::numeric_limits<double>::quiet_NaN());
+    for (int64_t t = 0; t < ds.traceCount; ++t) {
+        const uint8_t* header = ds.file.data() + segy::kHeaderTotalSize + size_t(t) * ds.traceStrideBytes;
+        const int64_t v = segy::readHeaderInt(header, firstByte, size, true);
+        if (v != 0) ms[size_t(t)] = double(v) * msPerUnit;
+    }
+    return ms;
+}
+
+void writeHeaderIntBigEndian(std::vector<uint8_t>& header, int firstByte, int size, int64_t value) {
+    for (int k = 0; k < size; ++k) {
+        header[size_t(firstByte - 1 + k)] = uint8_t((uint64_t(value) >> (8 * (size - 1 - k))) & 0xff);
+    }
+}
+
+// The header-field controls shared by Flatten and Write Horizon to Header.
+struct HeaderTimeControls {
+    QSpinBox* byte = nullptr;
+    QComboBox* size = nullptr;
+    QDoubleSpinBox* unit = nullptr;
+};
+
+HeaderTimeControls addHeaderTimeControls(QGridLayout* grid, int row, int firstByte, int size, double msPerUnit) {
+    HeaderTimeControls c;
+    c.byte = new QSpinBox();
+    c.byte->setRange(1, 237);
+    c.byte->setValue(firstByte);
+    c.byte->setToolTip("First byte (1-based) of the header field; 57 = Shell SEABED_TWT");
+    c.size = new QComboBox();
+    c.size->addItem("4 bytes", 4);
+    c.size->addItem("2 bytes", 2);
+    c.size->setCurrentIndex(size == 2 ? 1 : 0);
+    c.unit = new QDoubleSpinBox();
+    c.unit->setRange(0.0001, 1000.0);
+    c.unit->setDecimals(4);
+    c.unit->setValue(msPerUnit);
+    c.unit->setSuffix(" ms per unit");
+    c.unit->setToolTip("Time of one header count; PARAGON's SEABED_TWT is in 0.01 ms (405097 = 4050.97 ms)");
+    grid->addWidget(new QLabel("Header byte"), row, 0);
+    grid->addWidget(c.byte, row, 1);
+    grid->addWidget(c.size, row, 2);
+    grid->addWidget(c.unit, row, 3);
+    return c;
+}
+} // namespace
+
+void MainWindow::toggleFlatten(Panel* panel, bool on) {
+    AppState& app = panel->app;
+    if (!on) {
+        if (app.flatten.active && app.flatten.original) {
+            const segy::ViewRange view = app.view;
+            std::shared_ptr<Dataset> original = app.flatten.original;
+            panel->canvas->setForegroundDataset(original); // also clears app.flatten
+            app.view = view; // same trace/sample space
+            panel->canvas->update();
+            refreshHorizonManager();
+            flashStatusMessage("Flatten off");
+        }
+        setActivePanel(activePanel_);
+        return;
+    }
+    auto refuse = [&](const QString& why) {
+        flashStatusMessage(why);
+        setActivePanel(activePanel_);
+    };
+    if (!app.loaded || app.loading) return refuse("No data selected");
+    if (app.xf.active) return refuse("Not available on an x-f display");
+    std::shared_ptr<Dataset> ds = app.foreground;
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QString("Flatten") + datasetTitleSuffix(app));
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    QGridLayout* grid = new QGridLayout();
+    QComboBox* source = new QComboBox();
+    for (size_t i = 0; i < ds->horizons.size(); ++i) source->addItem("Horizon: " + ds->horizons[i].name, int(i));
+    source->addItem("Trace header time", -1);
+    if (ds->activeHorizon >= 0 && ds->activeHorizon < int(ds->horizons.size())) source->setCurrentIndex(ds->activeHorizon);
+    grid->addWidget(new QLabel("Flatten on"), 0, 0);
+    grid->addWidget(source, 0, 1, 1, 3);
+    HeaderTimeControls header = addHeaderTimeControls(grid, 1, headerTimeByte_, headerTimeSize_, headerTimeMsPerUnit_);
+    QLabel* summary = new QLabel();
+    summary->setStyleSheet("color: #9a9ca3;");
+    grid->addWidget(summary, 2, 0, 1, 4);
+    QDoubleSpinBox* reference = new QDoubleSpinBox();
+    reference->setRange(-1e7, 1e7);
+    reference->setDecimals(1);
+    reference->setSuffix(" ms");
+    reference->setToolTip("The time the horizon is moved to (default: its minimum)");
+    QPushButton* minimumButton = new QPushButton("Minimum");
+    grid->addWidget(new QLabel("Flatten to"), 3, 0);
+    grid->addWidget(reference, 3, 1);
+    grid->addWidget(minimumButton, 3, 2);
+    layout->addLayout(grid);
+    QCheckBox* newDataset = new QCheckBox("Create a new dataset (default: a display you switch off again)");
+    layout->addWidget(newDataset);
+    QLineEdit* nameEdit = new QLineEdit(QString::fromStdString(ds->name) + "_flat");
+    nameEdit->setEnabled(false);
+    layout->addWidget(nameEdit);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    buttons->addStretch();
+    QPushButton* ok = new QPushButton("Flatten");
+    QPushButton* cancel = new QPushButton("Cancel");
+    ok->setDefault(true);
+    buttons->addWidget(ok);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+
+    std::vector<double> values;
+    double minimum = 0.0;
+    auto recompute = [&](bool resetReference) {
+        const bool fromHeader = source->currentData().toInt() < 0;
+        header.byte->setEnabled(fromHeader);
+        header.size->setEnabled(fromHeader);
+        header.unit->setEnabled(fromHeader);
+        if (fromHeader) {
+            values = headerTimesMs(*ds, header.byte->value(), header.size->currentData().toInt(), header.unit->value());
+        } else {
+            const Horizon& hz = ds->horizons[size_t(source->currentData().toInt())];
+            values.assign(hz.timeMs.begin(), hz.timeMs.end());
+        }
+        int64_t count = 0;
+        double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+        for (double v : values) {
+            if (!std::isfinite(v)) continue;
+            ++count;
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        minimum = count ? lo : 0.0;
+        summary->setText(count ? QString("%1 of %2 traces have a time: %3 to %4 ms; gaps are interpolated.")
+                                     .arg(count)
+                                     .arg(ds->traceCount)
+                                     .arg(lo, 0, 'f', 1)
+                                     .arg(hi, 0, 'f', 1)
+                               : QString("No trace has a time here."));
+        ok->setEnabled(count > 0);
+        if (resetReference) reference->setValue(minimum);
+    };
+    recompute(true);
+    connect(source, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&](int) { recompute(true); });
+    connect(header.byte, QOverload<int>::of(&QSpinBox::valueChanged), &dialog, [&](int) { recompute(true); });
+    connect(header.size, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&](int) { recompute(true); });
+    connect(header.unit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), &dialog, [&](double) { recompute(true); });
+    connect(minimumButton, &QPushButton::clicked, &dialog, [&]() { reference->setValue(minimum); });
+    connect(newDataset, &QCheckBox::toggled, nameEdit, &QWidget::setEnabled);
+    connect(ok, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) {
+        setActivePanel(activePanel_);
+        return;
+    }
+    const bool fromHeader = source->currentData().toInt() < 0;
+    if (fromHeader) {
+        headerTimeByte_ = header.byte->value();
+        headerTimeSize_ = header.size->currentData().toInt();
+        headerTimeMsPerUnit_ = header.unit->value();
+    }
+    const QString what = fromHeader
+                             ? QString("header bytes %1-%2").arg(headerTimeByte_).arg(headerTimeByte_ + headerTimeSize_ - 1)
+                             : source->currentText().mid(9);
+    const QString history = QString("FLATTEN ON %1 TO %2 MS").arg(what.toUpper()).arg(reference->value(), 0, 'f', 1);
+    runFlatten(panel, values, reference->value(), newDataset->isChecked(),
+               newDataset->isChecked() ? nameEdit->text() : QString::fromStdString(ds->name) + "_flatten_display",
+               history);
+    setActivePanel(activePanel_);
+}
+
+void MainWindow::runFlatten(Panel* panel, std::vector<double> sourceMs, double referenceMs, bool newDataset,
+                            const QString& outputName, const QString& historyLine) {
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    const int samplesPerTrace = ds->binHeader.samplesPerTrace;
+    const double sampleMs = ds->binHeader.sampleIntervalUs / 1000.0;
+    if (sampleMs <= 0.0) return;
+    auto filled = std::make_shared<std::vector<double>>(segy::fillHorizonGaps(std::move(sourceMs)));
+    std::vector<std::string> history = ds->processingHistory;
+    history.push_back(historyLine.toStdString());
+    const std::filesystem::path outPath = scratchSegyPath(outputName);
+    struct Outcome {
+        bool ok = false;
+        std::string error;
+    };
+    auto outcome = std::make_shared<Outcome>();
+    runBackgroundTask(
+        QString("Flatten: %1").arg(QString::fromStdString(ds->name)),
+        [this, ds, filled, referenceMs, sampleMs, samplesPerTrace, outPath, history, outputName, outcome]() {
+            segy::ThreadPool pool;
+            backgroundTaskTotal_ = ds->traceCount;
+            std::vector<segy::WriteTrace> traces(size_t(ds->traceCount));
+            std::atomic<int64_t> done{0};
+            pool.parallelFor(size_t(ds->traceCount), 64, [&](size_t begin, size_t end) {
+                for (size_t t = begin; t < end; ++t) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
+                    segy::WriteTrace& out = traces[t];
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                    segy::flattenTrace(out.samples, (*filled)[t] / sampleMs, referenceMs / sampleMs);
+                    backgroundTaskDone_ = done.fetch_add(1) + 1;
+                }
+            });
+            QStringList inputBlocks;
+            inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
+                               .arg(QString::fromStdString(ds->name))
+                               .arg(ds->traceCount)
+                               .arg(samplesPerTrace)
+                               .arg(ds->binHeader.sampleIntervalUs);
+            const QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, ds->traceCount,
+                                                           samplesPerTrace, ds->binHeader.sampleIntervalUs);
+            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), ds->binHeader, traces, &outcome->error);
+        },
+        [this, panel, ds, filled, referenceMs, newDataset, outPath, history, outcome]() {
+            if (!outcome->ok) {
+                QMessageBox::warning(this, "Flatten", QString::fromStdString(outcome->error));
+                return;
+            }
+            if (newDataset) {
+                panel->canvas->startLoading(outPath, history);
+                return;
+            }
+            if (panel->app.foreground != ds) return; // the user moved on meanwhile
+            panel->canvas->startLoading(outPath, history, [this, panel, ds, filled, referenceMs](std::shared_ptr<Dataset> flat) {
+                const segy::ViewRange view = panel->app.view;
+                flat->name = ds->name + " (flattened)";
+                // The horizons, flattened along: horizon time - (source - reference).
+                for (const Horizon& h : ds->horizons) {
+                    Horizon copy = h;
+                    for (size_t t = 0; t < copy.timeMs.size() && t < filled->size(); ++t) {
+                        if (std::isfinite(copy.timeMs[t])) copy.timeMs[t] -= float((*filled)[t] - referenceMs);
+                    }
+                    flat->horizons.push_back(std::move(copy));
+                }
+                flat->activeHorizon = ds->activeHorizon;
+                panel->canvas->setForegroundDataset(flat);
+                panel->app.flatten.active = true;
+                panel->app.flatten.original = ds;
+                panel->app.view = view;
+                panel->canvas->update();
+                setActivePanel(activePanel_);
+                refreshWindowTitle();
+                refreshHorizonManager();
+                flashStatusMessage("Flattened display (Horizons > Flatten again to switch it off)");
+            });
+        });
+}
+
+void MainWindow::writeHorizonToHeader(Panel* panel) {
+    Horizon* hz = activeHorizonFor(panel, false);
+    if (!hz) {
+        flashStatusMessage("No horizon to write");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    QDialog dialog(this);
+    dialog.setWindowTitle(QString("Write Horizon to Header") + datasetTitleSuffix(panel->app));
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    QLabel* intro = new QLabel(QString("Writes \"%1\" into the trace headers of a new dataset "
+                                       "(traces without a pick keep their value).")
+                                   .arg(hz->name));
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+    QGridLayout* grid = new QGridLayout();
+    HeaderTimeControls header = addHeaderTimeControls(grid, 0, headerTimeByte_, headerTimeSize_, headerTimeMsPerUnit_);
+    layout->addLayout(grid);
+    QLineEdit* nameEdit = new QLineEdit(QString::fromStdString(ds->name) + "_" + hz->name.toLower());
+    layout->addWidget(nameEdit);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    buttons->addStretch();
+    QPushButton* ok = new QPushButton("Write");
+    QPushButton* cancel = new QPushButton("Cancel");
+    ok->setDefault(true);
+    buttons->addWidget(ok);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+    connect(ok, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) return;
+    headerTimeByte_ = header.byte->value();
+    headerTimeSize_ = header.size->currentData().toInt();
+    headerTimeMsPerUnit_ = header.unit->value();
+    const int firstByte = headerTimeByte_, size = headerTimeSize_;
+    const double msPerUnit = headerTimeMsPerUnit_;
+    auto times = std::make_shared<std::vector<float>>(hz->timeMs);
+    const QString outputName = nameEdit->text();
+    std::vector<std::string> history = ds->processingHistory;
+    history.push_back(QString("HORIZON %1 TO HEADER BYTES %2-%3 (%4 MS PER UNIT)")
+                          .arg(hz->name.toUpper())
+                          .arg(firstByte)
+                          .arg(firstByte + size - 1)
+                          .arg(msPerUnit)
+                          .toStdString());
+    const std::filesystem::path outPath = scratchSegyPath(outputName);
+    struct Outcome {
+        bool ok = false;
+        std::string error;
+    };
+    auto outcome = std::make_shared<Outcome>();
+    runBackgroundTask(
+        QString("Horizon to header: %1").arg(QString::fromStdString(ds->name)),
+        [this, ds, times, firstByte, size, msPerUnit, outPath, history, outputName, outcome]() {
+            segy::ThreadPool pool;
+            const int samplesPerTrace = ds->binHeader.samplesPerTrace;
+            backgroundTaskTotal_ = ds->traceCount;
+            std::vector<segy::WriteTrace> traces(size_t(ds->traceCount));
+            std::atomic<int64_t> done{0};
+            const int64_t limit = size == 2 ? 32767 : 2147483647;
+            pool.parallelFor(size_t(ds->traceCount), 64, [&](size_t begin, size_t end) {
+                for (size_t t = begin; t < end; ++t) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
+                    segy::WriteTrace& out = traces[t];
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    if (t < times->size() && std::isfinite((*times)[t])) {
+                        const int64_t v = std::clamp<int64_t>(std::llround((*times)[t] / msPerUnit), -limit, limit);
+                        writeHeaderIntBigEndian(out.headerBytes, firstByte, size, v);
+                    }
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                    backgroundTaskDone_ = done.fetch_add(1) + 1;
+                }
+            });
+            QStringList inputBlocks;
+            inputBlocks << QString("FILE: %1  TRACES: %2").arg(QString::fromStdString(ds->name)).arg(ds->traceCount);
+            const QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, ds->traceCount,
+                                                           samplesPerTrace, ds->binHeader.sampleIntervalUs);
+            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), ds->binHeader, traces, &outcome->error);
+        },
+        [this, panel, outPath, history, outcome]() {
+            if (!outcome->ok) {
+                QMessageBox::warning(this, "Write Horizon to Header", QString::fromStdString(outcome->error));
+                return;
+            }
+            panel->canvas->startLoading(outPath, history);
+        });
+}
+
+void MainWindow::openHorizonManager() {
+    if (!horizonManager_) {
+        horizonManager_ = new QWidget(this, Qt::Window);
+        horizonManager_->setWindowTitle("Horizon Manager");
+        horizonManager_->setStyleSheet("background-color: #1e1f22;");
+        QVBoxLayout* layout = new QVBoxLayout(horizonManager_);
+        QListWidget* list = new QListWidget();
+        list->setObjectName("horizonList");
+        layout->addWidget(list, 1);
+        QHBoxLayout* buttons = new QHBoxLayout();
+        auto button = [&](const QString& text, const QString& tip) {
+            QPushButton* b = new QPushButton(text);
+            b->setToolTip(tip);
+            buttons->addWidget(b);
+            return b;
+        };
+        QPushButton* newButton = button("New", "A new, empty horizon (becomes the active one)");
+        QPushButton* renameButton = button("Rename", "Rename the selected horizon");
+        QPushButton* colourButton = button("Colour", "Change the selected horizon's colour");
+        QPushButton* clearButton = button("Clear", "Remove all picks of the selected horizon");
+        QPushButton* deleteButton = button("Delete", "Delete the selected horizon");
+        layout->addLayout(buttons);
+
+        QGroupBox* pickGroup = new QGroupBox("Picking");
+        QGridLayout* grid = new QGridLayout(pickGroup);
+        QComboBox* modeCombo = new QComboBox();
+        modeCombo->addItem("Peak", int(segy::PickMode::Peak));
+        modeCombo->addItem("Trough", int(segy::PickMode::Trough));
+        modeCombo->addItem("Zero crossing", int(segy::PickMode::ZeroCrossing));
+        QDoubleSpinBox* searchSpin = new QDoubleSpinBox();
+        searchSpin->setRange(1.0, 500.0);
+        searchSpin->setDecimals(0);
+        searchSpin->setPrefix(QString(QChar(0x00B1)));
+        searchSpin->setSuffix(" ms");
+        searchSpin->setValue(pickSearchMs_);
+        searchSpin->setToolTip("Search window around the straight line between two points");
+        QDoubleSpinBox* trustSpin = new QDoubleSpinBox();
+        trustSpin->setRange(0.3, 1.0);
+        trustSpin->setDecimals(2);
+        trustSpin->setSingleStep(0.05);
+        trustSpin->setValue(pickTrust_);
+        trustSpin->setToolTip("Trace-to-trace correlation needed to follow the event; below it the pick stays on the line");
+        QDoubleSpinBox* windowSpin = new QDoubleSpinBox();
+        windowSpin->setRange(8.0, 500.0);
+        windowSpin->setDecimals(0);
+        windowSpin->setSuffix(" ms");
+        windowSpin->setValue(pickWindowMs_);
+        windowSpin->setToolTip("Correlation window around the previous pick");
+        QDoubleSpinBox* thresholdSpin = new QDoubleSpinBox();
+        thresholdSpin->setRange(1.0, 100.0);
+        thresholdSpin->setDecimals(0);
+        thresholdSpin->setSuffix(" %");
+        thresholdSpin->setValue(seabedThresholdPercent_);
+        thresholdSpin->setToolTip("Seabed: first amplitude above this share of the trace maximum");
+        grid->addWidget(new QLabel("Snap to"), 0, 0);
+        grid->addWidget(modeCombo, 0, 1);
+        grid->addWidget(new QLabel("Search"), 0, 2);
+        grid->addWidget(searchSpin, 0, 3);
+        grid->addWidget(new QLabel("Trust"), 1, 0);
+        grid->addWidget(trustSpin, 1, 1);
+        grid->addWidget(new QLabel("Window"), 1, 2);
+        grid->addWidget(windowSpin, 1, 3);
+        grid->addWidget(new QLabel("Seabed threshold"), 2, 0);
+        grid->addWidget(thresholdSpin, 2, 1);
+        QPushButton* seabedButton = new QPushButton("Auto-pick seabed");
+        grid->addWidget(seabedButton, 2, 2, 1, 2);
+        layout->addWidget(pickGroup);
+        QHBoxLayout* files = new QHBoxLayout();
+        QPushButton* exportButton = new QPushButton("Export CSV...");
+        QPushButton* importButton = new QPushButton("Import CSV...");
+        files->addWidget(exportButton);
+        files->addWidget(importButton);
+        files->addStretch();
+        layout->addLayout(files);
+        QLabel* hint = new QLabel("Pick Horizon tool: click points along an event; the traces in between are tracked. "
+                                  "Right click removes the nearest point.");
+        hint->setWordWrap(true);
+        hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+        layout->addWidget(hint);
+
+        connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [this, modeCombo](int) { pickMode_ = segy::PickMode(modeCombo->currentData().toInt()); });
+        connect(searchSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) { pickSearchMs_ = v; });
+        connect(trustSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) { pickTrust_ = v; });
+        connect(windowSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) { pickWindowMs_ = v; });
+        connect(thresholdSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+                [this](double v) { seabedThresholdPercent_ = v; });
+        connect(seabedButton, &QPushButton::clicked, this, [this]() { autoPickSeabed(activePanel_); });
+        connect(exportButton, &QPushButton::clicked, this, [this]() { exportHorizon(activePanel_); });
+        connect(importButton, &QPushButton::clicked, this, [this]() { importHorizon(activePanel_); });
+        connect(list, &QListWidget::currentRowChanged, this, [this](int row) {
+            if (!app_->loaded || row < 0 || row >= int(app_->foreground->horizons.size())) return;
+            app_->foreground->activeHorizon = row;
+            activePanel_->canvas->update();
+        });
+        connect(newButton, &QPushButton::clicked, this, [this]() {
+            if (!app_->loaded) return;
+            app_->foreground->activeHorizon = -1;
+            activeHorizonFor(activePanel_, true);
+            refreshHorizonManager();
+            activePanel_->canvas->update();
+        });
+        connect(renameButton, &QPushButton::clicked, this, [this]() {
+            Horizon* hz = activeHorizonFor(activePanel_, false);
+            if (!hz) return;
+            bool ok = false;
+            const QString name = QInputDialog::getText(this, "Rename Horizon", "Name", QLineEdit::Normal, hz->name, &ok);
+            if (ok && !name.trimmed().isEmpty()) hz->name = name.trimmed();
+            refreshHorizonManager();
+        });
+        connect(colourButton, &QPushButton::clicked, this, [this]() {
+            Horizon* hz = activeHorizonFor(activePanel_, false);
+            if (!hz) return;
+            const QColor colour = QColorDialog::getColor(hz->color, this, "Horizon Colour");
+            if (colour.isValid()) hz->color = colour;
+            refreshHorizonManager();
+            activePanel_->canvas->update();
+        });
+        connect(clearButton, &QPushButton::clicked, this, [this]() {
+            Horizon* hz = activeHorizonFor(activePanel_, false);
+            if (!hz) return;
+            std::fill(hz->timeMs.begin(), hz->timeMs.end(), std::numeric_limits<float>::quiet_NaN());
+            hz->anchors.clear();
+            refreshHorizonManager();
+            activePanel_->canvas->update();
+        });
+        connect(deleteButton, &QPushButton::clicked, this, [this]() {
+            if (!app_->loaded) return;
+            Dataset& ds = *app_->foreground;
+            if (ds.activeHorizon < 0 || ds.activeHorizon >= int(ds.horizons.size())) return;
+            ds.horizons.erase(ds.horizons.begin() + ds.activeHorizon);
+            ds.activeHorizon = ds.horizons.empty() ? -1 : 0;
+            refreshHorizonManager();
+            activePanel_->canvas->update();
+        });
+        horizonManager_->resize(520, 520);
+    }
+    refreshHorizonManager();
+    horizonManager_->show();
+    horizonManager_->raise();
+    horizonManager_->activateWindow();
+}
+
+void MainWindow::refreshHorizonManager() {
+    if (!horizonManager_) return;
+    auto* list = horizonManager_->findChild<QListWidget*>("horizonList");
+    if (!list) return;
+    QSignalBlocker block(list);
+    list->clear();
+    if (!app_->loaded) return;
+    const Dataset& ds = *app_->foreground;
+    for (const Horizon& hz : ds.horizons) {
+        int64_t picked = 0;
+        for (float v : hz.timeMs) picked += std::isfinite(v) ? 1 : 0;
+        QPixmap swatch(14, 14);
+        swatch.fill(hz.color);
+        list->addItem(new QListWidgetItem(QIcon(swatch), QString("%1   (%2 picks)").arg(hz.name).arg(picked)));
+    }
+    list->setCurrentRow(ds.activeHorizon);
+    horizonManager_->setWindowTitle(QString("Horizon Manager") + datasetTitleSuffix(*app_));
 }
 
 void MainWindow::openAutocorrelationDialog() {

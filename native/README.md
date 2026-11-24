@@ -3151,6 +3151,72 @@ Signal/Noise, f-k, Trace Inspector, Trace Header Ranges) and fixed:
   tooltips, tabs, selected table rows, and dark scroll bars (they were
   light and hatched).
 
+### Horizons (menu Horizons, toolbar Pick Horizon)
+
+Horizons are picked events: one time (ms) per trace, NaN where there is
+no pick. Each dataset keeps its own list in memory (`Dataset::horizons`,
+name, colour, picks, anchor traces); CSV export/import keeps them between
+sessions. The core is Qt-free (`viewer/horizons.h/.cpp`) and covered by
+segytest; the Qt shell converts samples to ms.
+
+- **Pick Horizon (toolbar pencil, Horizons > Pick Horizon):** left click
+  adds a point to the active horizon (a new one is made if there is
+  none). From the previous point to the click every trace is tracked
+  (`pickBetween`): the window (default 40 ms) around the previous pick is
+  correlated with the next trace at shifts within ±search (default 20 ms)
+  of the straight line between the two points. A correlation of at least
+  the trust value (default 0.7, range 0.3-1) moves the pick there,
+  snapped to the event; below it the pick stays on the line. Snap to peak
+  (default), trough or zero crossing, with parabolic or linear
+  refinement. Right click removes the nearest point; the horizon is
+  re-tracked along the remaining points.
+- **Auto-pick Seabed:** per trace the first sample whose |amplitude|
+  reaches the threshold (default 30%) of that trace's maximum, snapped
+  onto the event. Then:
+  - traces whose peak is at most 5% of the median trace peak are dead
+    and get no pick;
+  - a pick more than 10 samples from the median of its ±10 neighbours is
+    re-picked near that median (in place, left to right);
+  - picks are split into continuous stretches (a jump of more than 10
+    samples or a dead trace ends one). A stretch shorter than 50 traces
+    next to a long one is re-tracked from it, trace by trace. Tracking
+    stops where nothing within ±10 samples of the previous pick reaches
+    10% of the median trace peak (a seabed muted away while deeper data
+    remain).
+  On the PARAGON inline the result follows the seabed from 4050 to
+  1870 ms and ends where the data's top mute removes it, with no jump
+  into deeper reflectors. Tested on synthetic data with a noise burst,
+  empty traces, a weak-seabed run at the edge, and a muted seabed.
+- **Horizon Manager:** the list (colour swatch, pick count; the selected
+  one is active), New, Rename, Colour, Clear, Delete; the picking
+  settings (snap, search, trust, window, seabed threshold); Auto-pick
+  seabed; Export/Import CSV.
+- **CSV:** a header row `trace,cdp,ffid,offset,time_ms`, one line per
+  picked trace (trace 1-based). Import needs only the `trace` and
+  `time_ms` columns.
+- **Write Horizon to Header:** a new dataset with the active horizon in a
+  trace-header integer: default bytes 57-60 (Shell SEABED_TWT), 4 bytes,
+  0.01 ms per unit. Traces without a pick keep their value. This is an
+  option, never done automatically.
+- **Flatten (Horizons > Flatten..., checkable):** flattens on a horizon or
+  on a trace-header time (default bytes 57-60, 0.01 ms per unit; 0 counts
+  as no value). Gaps are interpolated linearly (`fillHorizonGaps`), ends
+  held constant. Each trace is shifted with linear interpolation so the
+  horizon lands on the reference time (default: the horizon's minimum).
+  By default it is a display: the panel shows a flattened copy that is
+  not in the dataset list (`SegyCanvas::startLoading` with an `onLoaded`
+  callback), with the horizons flattened along. The view stays the same.
+  Unchecking Flatten goes back to the original. Picking another
+  Foreground also ends it. Picks made on the flattened display stay on
+  that copy. "Create a new dataset" instead writes a normal dataset
+  (default name `<name>_flat`).
+- **Checked by screenshot** on PARAGON: auto-picked seabed; flatten on
+  it (straight at 1866.6 ms) and back; flatten on header bytes 57-60
+  (all 15082 traces, 1896.6-4051.3 ms; the seabed comes out flat, which
+  confirms the 0.01 ms unit). Not checked by screenshot: point-to-point
+  picking with the mouse (covered by the `pickBetween` test), the
+  Horizon Manager buttons, CSV round trip, Write Horizon to Header.
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`
