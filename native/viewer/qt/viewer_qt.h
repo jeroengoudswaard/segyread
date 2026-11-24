@@ -237,6 +237,11 @@ struct Dataset {
     // the output file's own EBCDIC text header, so a chain of derived
     // datasets keeps a readable record of how each one was produced.
     std::vector<std::string> processingHistory;
+    // Non-empty for File > Read Attribute SEG-Y: what the values are
+    // ("Interval velocity", "Epsilon", ...). Attribute datasets go to the
+    // dataset list only (not shown on load); the idea is to use them as a
+    // Background. Shown next to the name in the dataset picker.
+    std::string attribute;
 };
 
 // Same fields as the removed shells' AppState -- one shared struct instead
@@ -1843,6 +1848,9 @@ private:
     void flashStatusMessage(const QString& text);
 
     void openFile();
+    // File > Read Attribute SEG-Y: pick a file and what it holds; loaded in
+    // the background into the dataset list, not into a panel.
+    void openAttributeFile();
     void zoomToBox();
     void moozBack();
     void refreshToolChrome();

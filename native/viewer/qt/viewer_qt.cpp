@@ -3996,7 +3996,9 @@ void DatasetPickerDialog::setDatasets(const std::vector<std::shared_ptr<Dataset>
     }
     for (const std::shared_ptr<Dataset>& ds : datasets) {
         datasets_.push_back(ds);
-        list_->addItem(QString::fromStdString(ds->name));
+        QString label = QString::fromStdString(ds->name);
+        if (!ds->attribute.empty()) label += QString("   [%1]").arg(QString::fromStdString(ds->attribute));
+        list_->addItem(label);
         if (ds == current) currentRow = int(datasets_.size()) - 1;
     }
     list_->setCurrentRow(currentRow);
@@ -5920,6 +5922,8 @@ MainWindow::MainWindow() : QMainWindow() {
     QAction* openAction = fileMenu->addAction("&Open...");
     openAction->setShortcut(QKeySequence::Open);
     connect(openAction, &QAction::triggered, this, &MainWindow::openFile);
+    QAction* openAttributeAction = fileMenu->addAction("Read &Attribute SEG-Y...");
+    connect(openAttributeAction, &QAction::triggered, this, &MainWindow::openAttributeFile);
     QAction* saveSegyAction = fileMenu->addAction("&Save SEG-Y...");
     saveSegyAction->setShortcut(QKeySequence::Save);
     connect(saveSegyAction, &QAction::triggered, this, &MainWindow::openSaveSegyDialog);
@@ -8956,6 +8960,52 @@ void MainWindow::openFile() {
         // case this resets it before the new file's own render picks it up.
         if (!dialog.keepPreviousClip()) setGainDb(0.0);
         canvas_->startLoading(path);
+    });
+}
+
+void MainWindow::openAttributeFile() {
+    // Deferred like openFile(), for the same menu-closing reason.
+    QTimer::singleShot(0, this, [this]() {
+        SegyOpenDialog dialog(this);
+        dialog.setWindowTitle("Read Attribute SEG-Y");
+        if (dialog.exec() != QDialog::Accepted) return;
+        const std::filesystem::path path = dialog.selectedPath();
+        if (path.empty()) return;
+        static const QStringList kAttributes = {"Interval velocity", "Average velocity", "RMS velocity",
+                                                "Delta",             "Epsilon",          "Eta"};
+        bool ok = false;
+        const QString attribute = QInputDialog::getItem(this, "Read Attribute SEG-Y",
+                                                        QString("What does %1 contain?")
+                                                            .arg(QString::fromStdString(path.filename().string())),
+                                                        kAttributes, 0, false, &ok);
+        if (!ok) return;
+        auto result = std::make_shared<segy::LoadResult>();
+        runBackgroundTask(
+            QString("Reading attribute: %1").arg(QString::fromStdString(path.filename().string())),
+            [path, result]() {
+                // Own pool: the panels keep rendering meanwhile.
+                segy::ThreadPool pool;
+                *result = segy::loadSegyFile(path, pool);
+            },
+            [this, path, attribute, result]() {
+                if (!result->ok) {
+                    QMessageBox::warning(this, "Read Attribute SEG-Y", QString::fromStdString(result->error));
+                    return;
+                }
+                auto dataset = std::make_shared<Dataset>();
+                dataset->name = path.stem().string();
+                dataset->filePath = path;
+                dataset->file = std::move(result->file);
+                dataset->binHeader = result->binHeader;
+                dataset->traceCount = result->traceCount;
+                dataset->traceStrideBytes = result->traceStrideBytes;
+                dataset->pyramid = std::move(result->pyramid);
+                dataset->attribute = attribute.toStdString();
+                const QString name = QString::fromStdString(dataset->name);
+                registerDataset(std::move(dataset));
+                flashStatusMessage(QString("%1 (%2) added to the dataset list -- pick it as Background")
+                                       .arg(name, attribute));
+            });
     });
 }
 

@@ -2973,6 +2973,24 @@ used the left one). None of them run on an x-f display.
   below 10, so small amplitudes (e.g. after integration) no longer all
   read "0".
 
+### File > Read Attribute SEG-Y
+
+For velocity models and other attribute volumes. It opens the same file
+browser as Open, then asks what the file contains: interval velocity,
+average velocity, RMS velocity, delta, epsilon or eta.
+
+- **Loading:** the file loads in the background on its own thread pool
+  and goes into the **dataset list only**. Nothing changes on screen; the
+  idea is to pick it as a panel's Background.
+- **Tag:** the type is kept on the dataset (`Dataset::attribute`) and
+  shown in the dataset picker, e.g. `vel_model   [RMS velocity]`.
+- **Not yet:** the Background slot holds the dataset but nothing draws it
+  yet (phase 1 of Foreground/Background). Overlay display, and T-D
+  conversion with a loaded velocity, are on the list in COPILOT.md.
+- **Not checked with a screenshot:** the browser and type picker are
+  modal and couldn't be driven from a script. The load path is the same
+  as Open's.
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`

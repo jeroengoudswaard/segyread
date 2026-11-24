@@ -38,4 +38,27 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 18. **f-k display** — Separate window: one f-k plot per gather in view (or averaged), selectable panel and distance idents with scalar, velocity fan. *Status: done — Analysis > f-k display.*
 
-19. **Read Attribute SEG-Y (open)** — Separate input for velocity models and other attributes (interval, average, RMS velocity, delta, epsilon, eta), tagged at load, listed in the dataset list, not shown automatically, meant as background. *Status: to do.*
+19. **Read Attribute SEG-Y** — Separate input for velocity models and other attributes (interval, average, RMS velocity, delta, epsilon, eta), tagged at load, listed in the dataset list, not shown automatically, meant as background. *Status: done — File > Read Attribute SEG-Y; Background display itself is still to come.*
+
+20. **Trace Inspector (open)** — Per-trace header table (name, byte offset, value, description) plus the trace's samples with a small wiggle, after the user's RadExPro screenshot. Header definition selectable: SEG-Y rev 1.0, rev 2.0, Shell V2.1 (default; from the user's "SEGY trace identing" document, bytes 1-240). *Status: to do.*
+
+## Ideas to implement (registered 2026-11-24, to clarify with the user before building)
+
+21. **Send Zoom** — send one panel's zoom to the other.
+22. **Calculator does not always show all data sets** — bug: its dataset choice is incomplete.
+23. **Send Display** — send scaling, colour scale and display method to the other panel.
+24. **Crosshairs between two windows** — linked crosshair across the panels, on/off, default on.
+25. **Zoom without a box** — clicking Zoom with no box selected turns on "Draw a box to zoom".
+26. **Autocorrelation: zoom** — zoom option in the autocorrelation window.
+27. **Autocorrelation: lag window** — let the user set the +/- lag window, possibly asymmetric.
+28. **Peak-to-peak distance** — automatic estimate of the lag (nearest peak with a cross-correlation of 50%, if it exists), or a delta-T measuring tool.
+29. **Spectrum of the autocorrelation** — shown below it, default off.
+30. **XCOR in the calculator** — cross-correlation of two datasets, same display as the autocorrelation.
+31. **Verify diff/integrate** — check the trace differentiation/integration functionality.
+32. **Lock functionality** — work on Lock (see 17).
+33. **Always some headers at top** — ident rows always present at the top.
+34. **Auto-pick seabed.**
+35. **Flatten** — on an ident or a picked horizon.
+36. **Horizon picking, point to point** — straight lines between picks; use the trace-to-trace autocovariance to fill in between, with a single trust value between 0.3 and 1.
+37. **Picks in memory** — several user horizons; output of an event as IDENT/TIME.
+38. **Time-depth conversion** — with a velocity function loaded, T-D or D-T conversion; default output sampling 4 ms (time) or 8 m (depth).
