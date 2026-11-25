@@ -117,9 +117,13 @@ WiggleLayout computeWiggleLayout(const RenderContext& ctx, const ViewRange& view
             auto pixelYForSample = [&](double sampleIdx) -> float {
                 return float((sampleIdx - view.sampleStart) / sampleSpan * plotHeight);
             };
+            // Excursions are clipped at one trace spacing (two half lanes),
+            // like any wiggle plot: a strong event reaches its neighbour's
+            // baseline but never blacks out the traces beyond it.
+            const float maxExcursion = 2.0f * halfLanePixels;
             auto pixelXForValue = [&](float value) -> float {
                 if (reversePolarity) value = -value;
-                return baselineX + (value / clip) * halfLanePixels;
+                return baselineX + std::clamp((value / clip) * halfLanePixels, -maxExcursion, maxExcursion);
             };
 
             if (!useEnvelope) {

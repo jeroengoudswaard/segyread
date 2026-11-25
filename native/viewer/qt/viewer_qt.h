@@ -131,41 +131,20 @@ struct HistogramSettings {
     double userMax = 0.0;
 };
 
-// SpectrumDialog's current settings -- same "parameters UI only, real
-// computation built later" status as HistogramSettings. Field names and
-// the three normalize modes come straight from a reference frequency-
-// spectrum tool's own Utilities > Normalize/Smooth menus.
-enum class SpectrumNormalizeMode { AbsoluteSelectedCurve, RelativeEachCurve, AbsoluteFromUser };
+// SpectrumDialog's settings. The spectrum is always normalised to its own
+// peak (segy::computeSpectrum); the never-wired normalise modes are gone.
 struct SpectrumSettings {
-    bool useSelection = false; // false = Full View
-    SpectrumNormalizeMode normalizeMode = SpectrumNormalizeMode::AbsoluteSelectedCurve;
-    double userNormalizeValue = 0.0;
+    bool useSelection = false; // false = the visible data
     int smoothPoints = 1; // one of kSpectrumSmoothPoints in viewer_qt.cpp
 };
 
-// DisplayParametersDialog's settings, opened from the toolbar's gain
-// disclosure button -- modeled on a reference tool's "PanelDisplayDialog".
-// Wired to real rendering: seismicMode (app_.display.seismicMode), gain
-// (app_.display.gainDb), centerLine/positiveFill/negativeFill below, and
-// Reverse Polarity (moved to app_.display.reversePolarity -- see chrome.h --
-// since it applies to both display modes, not just wiggle). Everything else
-// here is still a placeholder the same way HistogramSettings/SpectrumSettings
-// are -- stored so the dialog's edits stick between opens, not yet read by
-// any renderer.
-enum class WiggleFillStyle { Solid, PeakAmplitude, Varifill, Band };
+// How wiggles are drawn (Display Parameters). Every field is read by the
+// wiggle painter; the placeholders that were never wired (fill styles,
+// blending, overlap, baselines, spacings) are gone.
 struct WigglePresentationSettings {
     bool centerLine = false;
     bool positiveFill = true;
     bool negativeFill = false;
-    bool wiggleTrace = true;
-    bool positiveOverNegative = true;
-    WiggleFillStyle variableAreaStyle = WiggleFillStyle::Solid;
-    WiggleFillStyle wiggleControlStyle = WiggleFillStyle::Solid;
-    double variableDensityBlending = 50.0;
-    double percentOverlap = 300.0;
-    double fillBaseline = 0.0;
-    double wiggleMinimumSpacing = 3.0;
-    double varMinimumSpacing = 1.0;
 };
 
 // Idents: small rows of trace-header values shown above/below the plot
@@ -576,14 +555,9 @@ private:
     AppState& app_;
     QRadioButton* fullViewRadio_ = nullptr;
     QRadioButton* selectionRadio_ = nullptr;
-    QRadioButton* absoluteSelectedRadio_ = nullptr;
-    QRadioButton* relativeEachRadio_ = nullptr;
-    QRadioButton* absoluteUserRadio_ = nullptr;
-    QDoubleSpinBox* userValueSpin_ = nullptr;
     QComboBox* smoothCombo_ = nullptr;
     std::function<void()> onApplied_;
 
-    void updateUserValueEnabled();
     void applySettings();
 };
 
@@ -802,14 +776,10 @@ private:
 // File > Open, modeled on a reference seismic tool's "2D Seismic File
 // Selection" dialog (Load Options panel above a custom Filter/Directories/
 // Files/Selection browser), rather than the platform-native QFileDialog.
-// Two things from that reference are deliberately NOT wired to real
-// behavior, present but inert: the Range/Min/Max trace-subset fields --
-// loading only a subset of a file's traces is a real segycore/pyramid-
-// builder feature, which always loads every trace unconditionally today,
-// scoped out of this dialog rather than half-implemented -- and "Use
-// Default Select/Sort Values" and "Clip at abs max/min", which don't map
-// onto anything this app currently has an alternate mode for. "Use
-// clipping from previously loaded window" IS wired: MainWindow::openFile()
+// The reference's inert extras (a trace Range/Min/Max subset, "Use Default
+// Select/Sort Values", "Clip at abs max/min") were removed: they did
+// nothing. "Use clipping from previously loaded window" is wired:
+// MainWindow::openFile()
 // reads it and, when unchecked (the reference tool's own default),
 // resets gain to 0 dB so each newly opened file gets a fresh auto-scaled
 // clip instead of inheriting whatever gain the previous file was left at.
@@ -892,11 +862,6 @@ public:
     bool keepPreviousClip() const;
 
 private:
-    QComboBox* rangeCombo_ = nullptr;
-    QSpinBox* minSpin_ = nullptr;
-    QSpinBox* maxSpin_ = nullptr;
-    QCheckBox* useDefaultsCheck_ = nullptr;
-    QCheckBox* clipAbsCheck_ = nullptr;
     QCheckBox* keepPrevClipCheck_ = nullptr;
 
     QLineEdit* filterEdit_ = nullptr;
@@ -974,14 +939,9 @@ private:
     QTableWidget* table_ = nullptr;
 };
 
-// Parameters dialog opened from the toolbar's gain disclosure button --
-// modeled on a reference tool's "PanelDisplayDialog", covering wiggle/
-// variable-density presentation style far beyond just gain. Only the
-// display-mode radio (synced with app_.display.seismicMode, same as the
-// toolbar's own toggle and the View menu) and the Gain field (synced with
-// the toolbar's gainSlider_/gainValueLabel_ via MainWindow::setGainDb) are
-// wired to real rendering; everything else writes to
-// AppState::wigglePresentation as a placeholder (see native/README.md).
+// View > Display Parameters: display mode, wiggle fill and centre line,
+// gain and polarity -- every control does something. The mode and gain stay
+// in sync with the toolbar and View menu through the callbacks below.
 class DisplayParametersDialog : public QDialog {
 public:
     explicit DisplayParametersDialog(AppState& app, QWidget* parent = nullptr);
@@ -1013,20 +973,11 @@ private:
     QCheckBox* centerLineCheck_ = nullptr;
     QCheckBox* positiveFillCheck_ = nullptr;
     QCheckBox* negativeFillCheck_ = nullptr;
-    QCheckBox* wiggleTraceCheck_ = nullptr;
-    QCheckBox* positiveOverNegativeCheck_ = nullptr;
-    QRadioButton* variableAreaStyleRadios_[4] = {};
-    QRadioButton* wiggleControlStyleRadios_[4] = {};
-    QDoubleSpinBox* blendingSpin_ = nullptr;
     QDoubleSpinBox* gainSpin_ = nullptr;
-    QDoubleSpinBox* percentOverlapSpin_ = nullptr;
-    QDoubleSpinBox* fillBaselineSpin_ = nullptr;
-    QDoubleSpinBox* wiggleMinSpacingSpin_ = nullptr;
-    QDoubleSpinBox* varMinSpacingSpin_ = nullptr;
     std::function<void(double)> onGainChanged_;
     std::function<void(segy::SeismicDisplayMode)> onModeChanged_;
 
-    void updateBlendingEnabled();
+    void updateWiggleEnabled();
     void applySettings();
 };
 

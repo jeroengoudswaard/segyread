@@ -182,8 +182,10 @@ constexpr int kIdentRowGap = 2;      // gap between stacked ident elements
 // width, not color saturation) -- boosting wiggle's effective gain by a
 // fixed offset compensates, purely a display-side adjustment local to this
 // call site (computeWiggleLayout's own default/tests are untouched).
-// Started at 6 dB, raised to 9 dB after still reading weak by comparison.
-constexpr double kWiggleGainBoostDb = 9.0;
+// Started at 6 dB, raised to 9 dB after still reading weak by comparison;
+// back to 0 since the robust clip (segy::autoClip: a 99th percentile, not
+// the absolute maximum) already gives wiggles their full excursion.
+constexpr double kWiggleGainBoostDb = 0.0;
 const ThemedColor kCanvasSurroundColor{QColor(0x14, 0x14, 0x16)};
 const ThemedColor kAccentColor{QColor(0xe8, 0x90, 0x5a)};
 const ThemedColor kSecondaryTextColor{QColor(0x9a, 0x9c, 0xa3)};
@@ -440,6 +442,54 @@ segy::RenderContext makeRenderContextFor(AppState& app) {
     ctx.traceStrideBytes = app.foreground->traceStrideBytes;
     ctx.pool = &app.pool;
     return ctx;
+}
+
+// Variable-area wiggle fill as horizontal pixel spans: per pixel row, the
+// trace's furthest excursion on each side of its baseline (from every line
+// segment that touches the row), filled from the baseline out in black.
+// Same area as filling a quad per segment, at one-pixel resolution, but a
+// few ms for a whole screen of traces instead of ~130 ms through
+// QPainterPath.
+void addWiggleFillSpans(QImage& image, const std::vector<QPointF>& points, double baselineX, bool fillPos,
+                        bool fillNeg) {
+    const int h = image.height(), w = image.width();
+    if (h <= 0 || w <= 0 || points.size() < 2) return;
+    thread_local std::vector<float> rowMax, rowMin;
+    rowMax.assign(size_t(h), -std::numeric_limits<float>::infinity());
+    rowMin.assign(size_t(h), std::numeric_limits<float>::infinity());
+    auto touch = [&](int row, double x) {
+        if (row < 0 || row >= h) return;
+        rowMax[size_t(row)] = std::max(rowMax[size_t(row)], float(x));
+        rowMin[size_t(row)] = std::min(rowMin[size_t(row)], float(x));
+    };
+    for (size_t i = 0; i + 1 < points.size(); ++i) {
+        QPointF a = points[i], b = points[i + 1];
+        if (a.y() > b.y()) std::swap(a, b);
+        const int r0 = int(std::floor(a.y())), r1 = int(std::floor(b.y()));
+        touch(r0, a.x());
+        touch(r1, b.x());
+        for (int r = std::max(r0 + 1, 0); r <= std::min(r1, h); ++r) {
+            // Where the segment crosses the row boundary y = r.
+            const double t = (double(r) - a.y()) / (b.y() - a.y());
+            const double x = a.x() + t * (b.x() - a.x());
+            touch(r - 1, x);
+            touch(r, x);
+        }
+    }
+    const QRgb black = qRgb(0, 0, 0);
+    const int base = int(std::lround(baselineX));
+    for (int y = 0; y < h; ++y) {
+        if (!(rowMax[size_t(y)] >= rowMin[size_t(y)])) continue;
+        QRgb* line = reinterpret_cast<QRgb*>(image.scanLine(y));
+        if (fillPos && rowMax[size_t(y)] > baselineX) {
+            const int x0 = std::max(base, 0), x1 = std::min(int(std::lround(rowMax[size_t(y)])), w - 1);
+            for (int x = x0; x <= x1; ++x) line[x] = black;
+        }
+        if (fillNeg && rowMin[size_t(y)] < baselineX) {
+            const int x0 = std::max(int(std::lround(rowMin[size_t(y)])), 0), x1 = std::min(base, w - 1);
+            for (int x = x0; x <= x1; ++x) line[x] = black;
+        }
+    }
 }
 
 // The clip the renderer really uses for `app` (segy::effectiveClip: one-sided
@@ -994,14 +1044,14 @@ void AmplitudeScaleWidget::paintEvent(QPaintEvent*) {
 
     painter.setPen(kSecondaryTextColor);
     int textX = barX + barW + kPad;
-    int textW = w - textX - kPad;
+    int textW = w - textX - 1; // up to the chip's edge: every pixel counts in 46 px
     // Signed labels with a real minus sign (U+2212); "+" only around a zero centre.
     // Whole numbers from 10 up, three significant digits below (small
     // amplitudes, e.g. after integration, would otherwise all read "0").
     // Whatever does not fit the narrow column drops digits, then becomes
     // 4.5k / 1.2M, so a label is never cut off.
     const QFontMetrics labelMetrics(painter.font());
-    const int labelRoom = w - (barX + barW + kPad) - 2;
+    const int labelRoom = textW;
     auto signedLabel = [&](float value, bool plusSign) {
         const double magnitude = std::fabs(double(value));
         const QString sign = value < 0.0f ? QString(QChar(0x2212)) : plusSign ? QString("+") : QString();
@@ -1463,30 +1513,6 @@ SpectrumDialog::SpectrumDialog(AppState& app, QWidget* parent) : QDialog(parent)
     rangeLayout->addWidget(selectionRadio_);
     layout->addWidget(rangeGroup);
 
-    QGroupBox* normalizeGroup = new QGroupBox("Normalize");
-    QVBoxLayout* normalizeLayout = new QVBoxLayout(normalizeGroup);
-    absoluteSelectedRadio_ = new QRadioButton("Absolute Max from Selected Curve");
-    relativeEachRadio_ = new QRadioButton("Relative Max to Each Curve");
-    absoluteUserRadio_ = new QRadioButton("Absolute Max from User");
-    absoluteSelectedRadio_->setChecked(true);
-    QButtonGroup* normalizeButtons = new QButtonGroup(this);
-    normalizeButtons->addButton(absoluteSelectedRadio_);
-    normalizeButtons->addButton(relativeEachRadio_);
-    normalizeButtons->addButton(absoluteUserRadio_);
-    normalizeLayout->addWidget(absoluteSelectedRadio_);
-    normalizeLayout->addWidget(relativeEachRadio_);
-    QHBoxLayout* userValueLayout = new QHBoxLayout();
-    userValueLayout->addWidget(absoluteUserRadio_);
-    userValueSpin_ = new QDoubleSpinBox();
-    userValueSpin_->setRange(-1e9, 1e9);
-    userValueSpin_->setDecimals(2);
-    userValueLayout->addWidget(userValueSpin_);
-    normalizeLayout->addLayout(userValueLayout);
-    layout->addWidget(normalizeGroup);
-
-    connect(absoluteUserRadio_, &QRadioButton::toggled, this, [this](bool checked) { userValueSpin_->setEnabled(checked); });
-    updateUserValueEnabled();
-
     QHBoxLayout* smoothLayout = new QHBoxLayout();
     smoothLayout->addWidget(new QLabel("Smooth (points)"));
     smoothCombo_ = new QComboBox();
@@ -1528,130 +1554,61 @@ void SpectrumDialog::showEvent(QShowEvent* event) {
     }
 }
 
-void SpectrumDialog::updateUserValueEnabled() { userValueSpin_->setEnabled(absoluteUserRadio_->isChecked()); }
-
 void SpectrumDialog::applySettings() {
     app_.spectrum.useSelection = selectionRadio_->isChecked();
-    if (absoluteSelectedRadio_->isChecked()) {
-        app_.spectrum.normalizeMode = SpectrumNormalizeMode::AbsoluteSelectedCurve;
-    } else if (relativeEachRadio_->isChecked()) {
-        app_.spectrum.normalizeMode = SpectrumNormalizeMode::RelativeEachCurve;
-    } else {
-        app_.spectrum.normalizeMode = SpectrumNormalizeMode::AbsoluteFromUser;
-    }
-    app_.spectrum.userNormalizeValue = userValueSpin_->value();
     app_.spectrum.smoothPoints = smoothCombo_->currentData().toInt();
 }
-
-namespace {
-// Shared by DisplayParametersDialog's two 4-way style groups (Variable
-// Area Control / Wiggle Control) -- same options, separate groups.
-QGroupBox* buildFillStyleGroup(const QString& title, QRadioButton* (&radios)[4], QWidget* parentDialog,
-                                QButtonGroup* group) {
-    QGroupBox* box = new QGroupBox(title);
-    QVBoxLayout* boxLayout = new QVBoxLayout(box);
-    const char* labels[4] = {"Solid", "PeakAmplitude", "Varifill", "Band"};
-    for (int i = 0; i < 4; ++i) {
-        radios[i] = new QRadioButton(labels[i], box);
-        group->addButton(radios[i]);
-        boxLayout->addWidget(radios[i]);
-    }
-    radios[0]->setChecked(true);
-    Q_UNUSED(parentDialog);
-    return box;
-}
-} // namespace
 
 DisplayParametersDialog::DisplayParametersDialog(AppState& app, QWidget* parent) : QDialog(parent), app_(app) {
     setWindowTitle("Display Parameters");
     setModal(false);
 
     QVBoxLayout* layout = new QVBoxLayout(this);
+    QGridLayout* grid = new QGridLayout();
+    grid->setHorizontalSpacing(12);
+    grid->setVerticalSpacing(8);
+    auto caption = [](const QString& text) {
+        QLabel* label = new QLabel(text);
+        label->setStyleSheet(themed("color: #9a9ca3;"));
+        return label;
+    };
 
-    // Top row: display mode (real, synced with the toolbar/View menu) plus
-    // two not-yet-wired placeholder checkboxes.
-    QHBoxLayout* topLayout = new QHBoxLayout();
     variableDensityRadio_ = new QRadioButton("Variable Density");
-    wiggleRadio_ = new QRadioButton("Wiggle Variable Area");
+    wiggleRadio_ = new QRadioButton("Wiggle");
     QButtonGroup* modeButtons = new QButtonGroup(this);
     modeButtons->addButton(variableDensityRadio_);
     modeButtons->addButton(wiggleRadio_);
-    topLayout->addWidget(variableDensityRadio_);
-    topLayout->addWidget(wiggleRadio_);
+    grid->addWidget(caption("Display"), 0, 0);
+    grid->addWidget(variableDensityRadio_, 0, 1);
+    grid->addWidget(wiggleRadio_, 0, 2);
+
+    positiveFillCheck_ = new QCheckBox("Positive Fill");
+    negativeFillCheck_ = new QCheckBox("Negative Fill");
+    centerLineCheck_ = new QCheckBox("Centre Line");
+    positiveFillCheck_->setToolTip("Positive Fill: fill the positive lobes black (variable area)");
+    negativeFillCheck_->setToolTip("Negative Fill: fill the negative lobes black");
+    centerLineCheck_->setToolTip("Centre Line: a grey zero line under every trace");
+    grid->addWidget(caption("Wiggle"), 1, 0);
+    grid->addWidget(positiveFillCheck_, 1, 1);
+    grid->addWidget(negativeFillCheck_, 1, 2);
+    grid->addWidget(centerLineCheck_, 2, 1);
+
+    gainSpin_ = new QDoubleSpinBox();
+    gainSpin_->setRange(-6.0, 24.0);
+    gainSpin_->setDecimals(1);
+    gainSpin_->setSuffix(" dB");
     reversePolarityCheck_ = new QCheckBox("Reverse Polarity");
-    centerLineCheck_ = new QCheckBox("Center Line");
-    topLayout->addWidget(reversePolarityCheck_);
-    topLayout->addWidget(centerLineCheck_);
-    topLayout->addStretch();
-    layout->addLayout(topLayout);
+    grid->addWidget(caption("Gain"), 3, 0);
+    grid->addWidget(gainSpin_, 3, 1);
+    grid->addWidget(reversePolarityCheck_, 3, 2);
+    layout->addLayout(grid);
 
     connect(variableDensityRadio_, &QRadioButton::toggled, this, [this](bool checked) {
         segy::SeismicDisplayMode mode = checked ? segy::SeismicDisplayMode::VariableDensity
                                                  : segy::SeismicDisplayMode::Wiggle;
         if (onModeChanged_) onModeChanged_(mode);
-        updateBlendingEnabled();
+        updateWiggleEnabled();
     });
-
-    QHBoxLayout* columnsLayout = new QHBoxLayout();
-
-    // Left column: fill/wiggle style checkboxes and the two 4-way style
-    // groups.
-    QVBoxLayout* leftColumn = new QVBoxLayout();
-    QHBoxLayout* fillRow = new QHBoxLayout();
-    positiveFillCheck_ = new QCheckBox("Positive Fill");
-    negativeFillCheck_ = new QCheckBox("Negative Fill");
-    positiveFillCheck_->setChecked(true);
-    fillRow->addWidget(positiveFillCheck_);
-    fillRow->addWidget(negativeFillCheck_);
-    leftColumn->addLayout(fillRow);
-
-    QHBoxLayout* wiggleRow = new QHBoxLayout();
-    wiggleTraceCheck_ = new QCheckBox("Wiggle");
-    positiveOverNegativeCheck_ = new QCheckBox("Positive Over Negative");
-    wiggleTraceCheck_->setChecked(true);
-    positiveOverNegativeCheck_->setChecked(true);
-    wiggleRow->addWidget(wiggleTraceCheck_);
-    wiggleRow->addWidget(positiveOverNegativeCheck_);
-    leftColumn->addLayout(wiggleRow);
-
-    QHBoxLayout* styleGroupsLayout = new QHBoxLayout();
-    QButtonGroup* variableAreaButtons = new QButtonGroup(this);
-    styleGroupsLayout->addWidget(
-        buildFillStyleGroup("Variable Area Control", variableAreaStyleRadios_, this, variableAreaButtons));
-    QButtonGroup* wiggleControlButtons = new QButtonGroup(this);
-    styleGroupsLayout->addWidget(
-        buildFillStyleGroup("Wiggle Control", wiggleControlStyleRadios_, this, wiggleControlButtons));
-    leftColumn->addLayout(styleGroupsLayout);
-
-    QHBoxLayout* blendingLayout = new QHBoxLayout();
-    blendingLayout->addWidget(new QLabel("Variable Density Blending"));
-    blendingSpin_ = new QDoubleSpinBox();
-    blendingSpin_->setRange(0.0, 100.0);
-    blendingLayout->addWidget(blendingSpin_);
-    leftColumn->addLayout(blendingLayout);
-    leftColumn->addStretch();
-    columnsLayout->addLayout(leftColumn);
-
-    // Right column: the numeric fields, Gain first since that's the one
-    // real (already-wired) control among them.
-    QVBoxLayout* rightColumn = new QVBoxLayout();
-    auto numericRow = [&](const QString& label, QDoubleSpinBox*& spin, double min, double max) {
-        QHBoxLayout* row = new QHBoxLayout();
-        row->addWidget(new QLabel(label));
-        spin = new QDoubleSpinBox();
-        spin->setRange(min, max);
-        row->addWidget(spin);
-        rightColumn->addLayout(row);
-    };
-    numericRow("Gain:", gainSpin_, -6.0, 24.0);
-    numericRow("Percent Overlap:", percentOverlapSpin_, 0.0, 1000.0);
-    numericRow("Fill Baseline:", fillBaselineSpin_, -1e9, 1e9);
-    numericRow("Wiggle Minimum Spacing:", wiggleMinSpacingSpin_, 0.0, 100.0);
-    numericRow("Var Minimum Spacing:", varMinSpacingSpin_, 0.0, 100.0);
-    rightColumn->addStretch();
-    columnsLayout->addLayout(rightColumn);
-
-    layout->addLayout(columnsLayout);
 
     addButtonRow(this, layout,
                  {
@@ -1661,7 +1618,6 @@ DisplayParametersDialog::DisplayParametersDialog(AppState& app, QWidget* parent)
                           accept();
                       }},
                      {"Apply", [this]() { applySettings(); }},
-                     {"Reset", [this]() { refreshFromAppState(); }},
                      {"Cancel", [this]() { reject(); }},
                  });
 
@@ -1673,7 +1629,10 @@ void DisplayParametersDialog::showEvent(QShowEvent* event) {
     refreshFromAppState();
 }
 
-void DisplayParametersDialog::updateBlendingEnabled() { blendingSpin_->setEnabled(variableDensityRadio_->isChecked()); }
+void DisplayParametersDialog::updateWiggleEnabled() {
+    const bool wiggle = wiggleRadio_->isChecked();
+    for (QCheckBox* check : {positiveFillCheck_, negativeFillCheck_, centerLineCheck_}) check->setEnabled(wiggle);
+}
 
 void DisplayParametersDialog::setGainChangedCallback(std::function<void(double)> callback) {
     onGainChanged_ = std::move(callback);
@@ -1684,48 +1643,27 @@ void DisplayParametersDialog::setModeChangedCallback(std::function<void(segy::Se
 }
 
 void DisplayParametersDialog::refreshFromAppState() {
+    variableDensityRadio_->blockSignals(true);
     variableDensityRadio_->setChecked(app_.display.seismicMode == segy::SeismicDisplayMode::VariableDensity);
     wiggleRadio_->setChecked(app_.display.seismicMode == segy::SeismicDisplayMode::Wiggle);
+    variableDensityRadio_->blockSignals(false);
     gainSpin_->setValue(app_.display.gainDb);
     const WigglePresentationSettings& w = app_.wigglePresentation;
     reversePolarityCheck_->setChecked(app_.display.reversePolarity);
     centerLineCheck_->setChecked(w.centerLine);
     positiveFillCheck_->setChecked(w.positiveFill);
     negativeFillCheck_->setChecked(w.negativeFill);
-    wiggleTraceCheck_->setChecked(w.wiggleTrace);
-    positiveOverNegativeCheck_->setChecked(w.positiveOverNegative);
-    variableAreaStyleRadios_[int(w.variableAreaStyle)]->setChecked(true);
-    wiggleControlStyleRadios_[int(w.wiggleControlStyle)]->setChecked(true);
-    blendingSpin_->setValue(w.variableDensityBlending);
-    percentOverlapSpin_->setValue(w.percentOverlap);
-    fillBaselineSpin_->setValue(w.fillBaseline);
-    wiggleMinSpacingSpin_->setValue(w.wiggleMinimumSpacing);
-    varMinSpacingSpin_->setValue(w.varMinimumSpacing);
-    updateBlendingEnabled();
+    updateWiggleEnabled();
 }
 
 void DisplayParametersDialog::applySettings() {
-    // Gain and seismicMode are the two real, already-wired settings here;
-    // route Gain through the callback so the toolbar slider/spin box stay
-    // in sync too, same single-source-of-truth pattern as any other gain
-    // change.
+    // Gain goes through the callback so the toolbar slider and label follow.
     if (onGainChanged_) onGainChanged_(gainSpin_->value());
     app_.display.reversePolarity = reversePolarityCheck_->isChecked();
     WigglePresentationSettings& w = app_.wigglePresentation;
     w.centerLine = centerLineCheck_->isChecked();
     w.positiveFill = positiveFillCheck_->isChecked();
     w.negativeFill = negativeFillCheck_->isChecked();
-    w.wiggleTrace = wiggleTraceCheck_->isChecked();
-    w.positiveOverNegative = positiveOverNegativeCheck_->isChecked();
-    for (int i = 0; i < 4; ++i) {
-        if (variableAreaStyleRadios_[i]->isChecked()) w.variableAreaStyle = WiggleFillStyle(i);
-        if (wiggleControlStyleRadios_[i]->isChecked()) w.wiggleControlStyle = WiggleFillStyle(i);
-    }
-    w.variableDensityBlending = blendingSpin_->value();
-    w.percentOverlap = percentOverlapSpin_->value();
-    w.fillBaseline = fillBaselineSpin_->value();
-    w.wiggleMinimumSpacing = wiggleMinSpacingSpin_->value();
-    w.varMinimumSpacing = varMinSpacingSpin_->value();
 }
 
 AmplitudeProcessingDialog::AmplitudeProcessingDialog(QWidget* parent) : QDialog(parent) {
@@ -1884,7 +1822,7 @@ CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
     addRadio_ = new QRadioButton("Add");
     subtractRadio_ = new QRadioButton("Subtract");
     crossRadio_ = new QRadioButton("Cross-correlate");
-    crossRadio_->setToolTip("A x B trace by trace (normalized), shown like the autocorrelation; no new dataset");
+    crossRadio_->setToolTip("A x B trace by trace (normalised), shown like the autocorrelation; no new dataset");
     addRadio_->setChecked(true);
     QButtonGroup* opGroup = new QButtonGroup(this);
     opGroup->addButton(addRadio_);
@@ -3719,7 +3657,7 @@ SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Wind
     minCorrelationSpin_->setRange(0.0, 1.0);
     minCorrelationSpin_->setDecimals(2);
     minCorrelationSpin_->setSingleStep(0.05);
-    minCorrelationSpin_->setToolTip("Pairs whose normalized correlation peak is below this are left out. (SIGCOR CCMIN)");
+    minCorrelationSpin_->setToolTip("Pairs whose normalised correlation peak is below this are left out. (SIGCOR CCMIN)");
     params->addWidget(caption("Skipped traces"));
     params->addWidget(distanceSpin_);
     params->addSpacing(16);
@@ -4603,38 +4541,6 @@ SegyOpenDialog::SegyOpenDialog(QWidget* parent) : QDialog(parent) {
 
     QVBoxLayout* layout = new QVBoxLayout(this);
 
-    QLabel* loadOptionsLabel = new QLabel("Load Options");
-    loadOptionsLabel->setStyleSheet(themed("font-style: italic; color: #9a9ca3;"));
-    layout->addWidget(loadOptionsLabel);
-
-    QHBoxLayout* rangeRow = new QHBoxLayout();
-    rangeCombo_ = new QComboBox();
-    rangeCombo_->addItem("traceno");
-    rangeRow->addWidget(new QLabel("Range"));
-    rangeRow->addWidget(rangeCombo_);
-    rangeRow->addWidget(new QLabel("Min"));
-    minSpin_ = new QSpinBox();
-    minSpin_->setRange(1, 1000000);
-    minSpin_->setValue(1);
-    rangeRow->addWidget(minSpin_);
-    rangeRow->addWidget(new QLabel("Max (0 = all)"));
-    maxSpin_ = new QSpinBox();
-    maxSpin_->setRange(0, 1000000);
-    maxSpin_->setValue(0);
-    rangeRow->addWidget(maxSpin_);
-    rangeRow->addStretch();
-    layout->addLayout(rangeRow);
-
-    // Present but not wired to real behavior -- see the class comment.
-    auto addPlaceholderCheck = [&](const QString& text) {
-        QCheckBox* check = new QCheckBox(text);
-        check->setToolTip("Not implemented yet -- has no effect on the load.");
-        layout->addWidget(check);
-        return check;
-    };
-    useDefaultsCheck_ = addPlaceholderCheck("Use Default Select/Sort Values");
-    clipAbsCheck_ = addPlaceholderCheck("Clip at abs max/min");
-
     keepPrevClipCheck_ = new QCheckBox("Use clipping from previously loaded window");
     keepPrevClipCheck_->setToolTip(
         "Unchecked (default): gain resets to 0 dB so this file gets a fresh "
@@ -4888,7 +4794,7 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
                "best match at the limit rejects the pair. The gate must be at least 2 x this + 3 samples long. "
                "(SIGCOR SHMAX)");
     QHBoxLayout* snChecks = new QHBoxLayout();
-    snEqualizeCheck_ = new QCheckBox("Equalize energy");
+    snEqualizeCheck_ = new QCheckBox("Equalise energy");
     snEqualizeCheck_->setChecked(sn.normalise);
     snEqualizeCheck_->setToolTip("After alignment, scale both gates of a pair to unit RMS. (SIGCOR IGNORM)");
     snRemoveDcCheck_ = new QCheckBox("Remove DC");
@@ -5953,9 +5859,6 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             segy::WiggleLayout wiggle = segy::computeWiggleLayout(
                 makeRenderContext(), app_.view, chrome.plotWidth, insetHeight,
                 app_.display.gainDb + kWiggleGainBoostDb, app_.display.reversePolarity, &app_.display.processing);
-            app_.lastRenderMs =
-                std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - wiggleStart)
-                    .count();
             painter.save();
             // Wiggle is deliberately crisp/non-smoothed -- see native/README.md.
             painter.setRenderHint(QPainter::Antialiasing, false);
@@ -5967,6 +5870,16 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             const WigglePresentationSettings& wp = app_.wigglePresentation;
             bool fillPos = wp.positiveFill;
             bool fillNeg = wp.negativeFill;
+            QImage fillImage;
+            if (app_.display.wiggleInfill && (fillPos || fillNeg)) {
+                fillImage = QImage(chrome.plotWidth, insetHeight, QImage::Format_ARGB32_Premultiplied);
+                fillImage.fill(Qt::transparent);
+            }
+            // Fill first (all traces), lines on top: same look as before,
+            // where each trace's fill sat under its own line.
+            std::vector<std::vector<QPointF>> traceLines;
+            std::vector<double> traceBaselines;
+            traceLines.reserve(wiggle.traces.size());
             for (const segy::WiggleTrace& tr : wiggle.traces) {
                 if (tr.linePoints.size() < 2) continue;
                 std::vector<QPointF> qpoints;
@@ -5982,58 +5895,16 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
                 }
 
                 if (app_.display.wiggleInfill && (fillPos || fillNeg)) {
-                    // "Variable area" fill, built per-segment as quads/
-                    // triangles clipped to the baseline rather than one
-                    // merged polygon -- adjacent pieces share only an edge,
-                    // never overlapping area, so the default odd-even fill
-                    // rule still comes out correct.
-                    //
-                    // A segment entirely on one side of the baseline is a
-                    // plain quad. A segment that crosses the baseline is
-                    // split at its exact linearly-interpolated zero-crossing
-                    // -- an earlier version instead clamped each endpoint's
-                    // X to the baseline while keeping its own Y, which
-                    // silently assumed the crossing sat at whichever
-                    // endpoint was already closest to zero; on a segment
-                    // that actually crosses partway through, that made the
-                    // filled lobe's tip bulge past the point where the
-                    // wiggle line itself reaches zero.
-                    QPainterPath fillPath;
-                    for (size_t i = 0; i + 1 < qpoints.size(); ++i) {
-                        double a0 = qpoints[i].x() - baselineX;
-                        double a1 = qpoints[i + 1].x() - baselineX;
-                        double y0 = qpoints[i].y();
-                        double y1 = qpoints[i + 1].y();
-
-                        if ((a0 >= 0.0) == (a1 >= 0.0)) {
-                            bool positiveSide = a0 >= 0.0;
-                            if (positiveSide ? !fillPos : !fillNeg) continue;
-                            fillPath.moveTo(baselineX, y0);
-                            fillPath.lineTo(qpoints[i].x(), y0);
-                            fillPath.lineTo(qpoints[i + 1].x(), y1);
-                            fillPath.lineTo(baselineX, y1);
-                            fillPath.closeSubpath();
-                            continue;
-                        }
-
-                        double t = a0 / (a0 - a1);
-                        double yCross = y0 + t * (y1 - y0);
-                        bool startsPositive = a0 > 0.0;
-                        if ((startsPositive && fillPos) || (!startsPositive && fillNeg)) {
-                            fillPath.moveTo(baselineX, y0);
-                            fillPath.lineTo(qpoints[i].x(), y0);
-                            fillPath.lineTo(baselineX, yCross);
-                            fillPath.closeSubpath();
-                        }
-                        if ((startsPositive && fillNeg) || (!startsPositive && fillPos)) {
-                            fillPath.moveTo(baselineX, yCross);
-                            fillPath.lineTo(qpoints[i + 1].x(), y1);
-                            fillPath.lineTo(baselineX, y1);
-                            fillPath.closeSubpath();
-                        }
-                    }
-                    painter.fillPath(fillPath, Qt::black);
+                    // "Variable area" fill as horizontal pixel spans in one
+                    // image for all traces (see addWiggleFillSpans) -- a
+                    // QPainterPath of per-segment quads cost ~130 ms a frame.
+                    addWiggleFillSpans(fillImage, qpoints, baselineX, fillPos, fillNeg);
                 }
+                traceBaselines.push_back(baselineX);
+                traceLines.push_back(std::move(qpoints));
+            }
+            if (!fillImage.isNull()) painter.drawImage(QPointF(0, 0), fillImage);
+            for (size_t k = 0; k < traceLines.size(); ++k) {
                 if (wp.centerLine) {
                     // Zero-amplitude reference line for this trace, full
                     // plot height -- drawn before the wiggle line itself so
@@ -6042,12 +5913,16 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
                     QPen centerPen(QColor(160, 160, 160));
                     centerPen.setWidth(0);
                     painter.setPen(centerPen);
-                    painter.drawLine(QPointF(baselineX, 0), QPointF(baselineX, insetHeight));
+                    painter.drawLine(QPointF(traceBaselines[k], 0), QPointF(traceBaselines[k], insetHeight));
                     painter.setPen(linePen);
                 }
-                painter.drawPolyline(qpoints.data(), int(qpoints.size()));
+                painter.drawPolyline(traceLines[k].data(), int(traceLines[k].size()));
             }
             painter.restore();
+            // Layout and drawing together: what the user waits for.
+            app_.lastRenderMs =
+                std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - wiggleStart)
+                    .count();
         }
 
         // Idents' "Display on Seismic" overlay lines (see
@@ -7553,7 +7428,8 @@ MainWindow::MainWindow() : QMainWindow() {
     viewMenu->addAction(wiggleInfillAction);
     addMenuMirror(viewMenu, flipHorizontalAction_, "Flip &Horizontal");
     viewMenu->addSeparator();
-    QMenu* gainMenu = viewMenu->addMenu("&Gain");
+    // Amplitude: gain, AGC, clip and polarity in one place.
+    QMenu* gainMenu = viewMenu->addMenu("&Amplitude");
     QAction* gainUpMenuAction = gainMenu->addAction("&Increase (+3 dB)");
     gainUpMenuAction->setShortcuts({QKeySequence(Qt::Key_Plus), QKeySequence(Qt::Key_Equal)});
     connect(gainUpMenuAction, &QAction::triggered, this,
@@ -7562,15 +7438,16 @@ MainWindow::MainWindow() : QMainWindow() {
     gainDownMenuAction->setShortcut(QKeySequence(Qt::Key_Minus));
     connect(gainDownMenuAction, &QAction::triggered, this,
             [this]() { setGainDb(std::clamp(app_->display.gainDb - 3.0, -6.0, 24.0)); });
-    gainMenu->addSeparator();
     QAction* setGainMenuAction = gainMenu->addAction("&Set Gain...");
     connect(setGainMenuAction, &QAction::triggered, this, &MainWindow::promptForGainDb);
-    addMenuMirror(viewMenu, agcAction_, "&AGC");
-    QAction* agcSettingsAction = viewMenu->addAction("AGC &Window and Level...");
+    gainMenu->addSeparator();
+    addMenuMirror(gainMenu, agcAction_, "&AGC");
+    QAction* agcSettingsAction = gainMenu->addAction("AGC &Window and Level...");
     connect(agcSettingsAction, &QAction::triggered, this, &MainWindow::openAgcSettings);
-    QAction* clipMenuAction = viewMenu->addAction("&Clip...");
+    gainMenu->addSeparator();
+    QAction* clipMenuAction = gainMenu->addAction("&Clip...");
     connect(clipMenuAction, &QAction::triggered, this, [this]() { activePanel_->canvas->openClipDialog(); });
-    addMenuMirror(viewMenu, reversePolarityAction_, "&Reverse Polarity");
+    addMenuMirror(gainMenu, reversePolarityAction_, "&Reverse Polarity");
     addMenuMirror(viewMenu, gainDetailAction_, "Display &Parameters...");
     viewMenu->addSeparator();
     // Rebuilt on every open, from whichever panel is active right then.
@@ -8736,12 +8613,6 @@ void MainWindow::computeAndShowSpectrum(Panel* panel) {
         flashStatusMessage("Not available on an x-f display");
         return;
     }
-    // Normalize mode/smooth-points UI is wired for real now, but always
-    // normalizes to the averaged spectrum's own peak regardless of which
-    // Normalize radio is picked (segy::computeSpectrum's one, fixed
-    // convention) -- distinguishing "Absolute Max from Selected Curve" vs.
-    // "Relative Max to Each Curve" vs. "...from User" is a real follow-up,
-    // not wired to the computation yet (see native/README.md).
     if (!panel->app.loaded) return;
     AppState& app = panel->app;
     AnalysisSource src = resolveAnalysisSource(app, app.spectrum.useSelection);
@@ -10142,7 +10013,7 @@ void MainWindow::computeAndShowSignalNoise(Panel* sourcePanel) {
             d.push_back({"Min correlation", QString::number(params.ccmin, 'f', 2)});
             d.push_back({"Taper", QString("Kaiser, beta %1").arg(params.kaiserBeta, 0, 'f', 1)});
             d.push_back({"FFT length", QString::number(r.fftLength)});
-            d.push_back({"Equalize energy", params.normalise ? "Yes" : "No"});
+            d.push_back({"Equalise energy", params.normalise ? "Yes" : "No"});
             d.push_back({"Remove DC", params.removeDc ? "Yes" : "No"});
 
             if (!r.error.empty()) {
@@ -10156,7 +10027,7 @@ void MainWindow::computeAndShowSignalNoise(Panel* sourcePanel) {
             } else if (r.pairsUsed == 0) {
                 display.emptyReason =
                     "No trace pair passed Min correlation and Max shift -- try a lower Min correlation, or a "
-                    "larger Max shift in Edit > Preferences.";
+                    "larger Max shift in File > Preferences.";
             } else {
                 const double ref = *std::max_element(r.tracePower.begin(), r.tracePower.end());
                 const float nan = std::numeric_limits<float>::quiet_NaN();

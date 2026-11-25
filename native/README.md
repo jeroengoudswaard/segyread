@@ -3509,6 +3509,33 @@ gain and AGC).
   f-k path matches the direct one (< 1e-4), mutes, robust clip in the
   wiggle test.
 
+### Fourth round: no placeholders, faster wiggles, one Amplitude menu
+
+- **Every control does something.** Removed what was stored but never
+  read: Display Parameters' fill-style groups, blending, overlap,
+  baseline, spacings, "Wiggle" and "Positive Over Negative" (nine
+  controls; the dialog is now Display / Wiggle fills and centre line /
+  Gain and Reverse Polarity, wiggle options greyed in variable density);
+  the Spectrum dialog's Normalise group (the spectrum is always normalised
+  to its own peak); File > Open's Range/Min/Max and two inert checkboxes.
+  `WigglePresentationSettings` keeps only centreLine/positiveFill/
+  negativeFill, `SpectrumSettings` only the source and smoothing.
+- **View > Amplitude** (was Gain): gain up/down/set, AGC and its window
+  and level, Clip, Reverse Polarity in one submenu; Display Parameters
+  stays at the top level. British spelling throughout (Colour, Centre,
+  Normalise, Equalise); "Edit > Preferences" in a message is now File.
+- **Wiggles 3-4x faster.** The variable-area fill was a QPainterPath of
+  one quad or triangle per line segment (~1M subpaths a frame, ~135 ms);
+  it is now `addWiggleFillSpans`: per pixel row the trace's extreme
+  excursion on each side (every segment touching the row), filled as
+  horizontal spans straight into one image for all traces, drawn under
+  the lines. 13-41 ms a frame on the 6 GB file. The status line's draw
+  time now includes the drawing in wiggle mode (it showed 0 ms).
+- **Wiggle amplitude.** With the robust clip, the 9 dB wiggle boost made
+  traces run over their neighbours; the boost is 0 dB and excursions are
+  clipped at one trace spacing (`computeWiggleLayout`), the usual wiggle
+  plot rule.
+
 ### UX pass: one zoom, fewer menus, two themes
 
 A review of every window, aiming for less: nothing shown twice, nothing

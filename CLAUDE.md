@@ -114,7 +114,7 @@ the MSVC runtime DLLs (`vcruntime140.dll`, `vcruntime140_1.dll`,
 |---|---|
 | Load + pyramid | 4.2–5.7 s (~1 GB/s, I/O bound) |
 | Repaint, full view | 25–80 ms (first paint after load up to ~140 ms) |
-| Wiggle, full view | ~150 ms per paint (still the slowest paint) |
+| Wiggle, full view | 13-41 ms per paint (span fill; was ~135 ms) |
 | x-f display | 0.36 s (at most 4096 traces, stride shown) |
 | Flatten (whole file, streamed) | 7.9 s |
 | Auto-pick seabed | 0.9 s |
