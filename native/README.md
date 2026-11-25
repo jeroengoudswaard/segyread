@@ -3263,6 +3263,92 @@ The core is `viewer/depth_conversion.h/.cpp` (Qt-free, tested):
   right. The depth axis reads "Depth (m)". Converting back to time gives
   the original section.
 
+### UX pass: one zoom, fewer menus, two themes
+
+A review of every window, aiming for less: nothing shown twice, nothing
+that does nothing, and the same gesture meaning the same thing
+everywhere.
+
+**Zoom.** One model, on the seismic display and on every chart
+(Spectrum, Signal/Noise, f-k, Autocorrelation):
+
+| Gesture | Does |
+|---|---|
+| Wheel | zoom in or out around the cursor (one wheel gesture is one Previous Zoom step) |
+| Left-drag | zoom to the rectangle when you let go (the pointer tool; on charts always) |
+| Double-click | previous zoom |
+| Right-click | Previous Zoom, Full View, Axis Ranges... (the same menu everywhere) |
+| Middle-drag | pan, in every tool but Box Select (there middle-click deletes the box) |
+| Backspace / Home (or R) | previous zoom / full view |
+
+The charts' Zoom / Unzoom / Box Select strips and the autocorrelation
+window's zoom buttons are gone: the gesture is the zoom. In the
+autocorrelation average a drag zooms the lag window and a plain click
+still measures delta-t. The toolbar keeps Previous Zoom and Full View;
+Zoom to Box (zoom to the active selection box) is in the View menu.
+Selection boxes are for the analyses only (Box Select tool).
+
+**Menus.** File, View, Analysis, Processing, Horizons, Window, Help:
+
+- *Edit* (Cut/Copy/Paste did nothing) and *Selection* (Select All / Clear
+  Selection did nothing) are gone. Preferences moved to File (Ctrl+,).
+- *File*: Open, Open Velocity or Attribute, Save As SEG-Y, Headers (Text,
+  Binary, Trace Header Ranges, Trace Inspector), Preferences, Exit.
+- *View*: zoom, tools, display (Variable Density / Wiggle inline instead of
+  a submenu), amplitude, idents / labels / data domain, Theme, Sidebar.
+  "Fit to Window" (a placeholder, same as Reset View) is gone.
+- *Window*: everything about the two panels (Split View, Side by Side /
+  Stacked, Equal Sizes, Lock Panels, Lock View, Linked Crosshair, Send
+  Zoom / Display).
+- *Analysis*: no ellipses -- every analysis now opens its result straight
+  away. Spectrum and Histogram used to open a parameters dialog first;
+  they now show the result (of the active selection box, or else the
+  whole dataset) like the others, with Parameters in the result window.
+- *Processing*: one flat list (the Filter and one-item Trace Math
+  submenus are gone).
+- *Horizons*: Pick Horizon first, then the manager, seabed, flatten,
+  import/export.
+- The result windows' File (Close) / Edit (empty) / Utilities menus became
+  one View menu (Grid Lines, Crosshair, Parameters...).
+- The Text/Binary Header toolbar buttons left the toolbar (File >
+  Headers).
+
+**Words and numbers.** Tooltips follow one pattern ("Name: what it
+does"). The status bar is a sentence ("Traces 7551-11331 of 15082 ·
+2027-4586 ms · IBM float, 4 ms · drawn in 7 ms") instead of
+"traces [0, 15082) samples [0, 2501) format=1 render=12.75ms (wheel=zoom,
+R=reset)". Trace numbers shown to the user count from 1 everywhere
+(Trace Info said 7550 where the status said 7551). In-window buttons that
+re-run an analysis are all "Recompute". Labels have no trailing colons.
+The QC Notes placeholder in the sidebar is gone, and the sidebar is
+narrower (220 px).
+
+**Cursors.** One function (`SegyCanvas::unsetCursorForTool`) picks the
+cursor per tool: arrow, open hand (closed while dragging), the box
+cursor, a cross for picking.
+
+**Icons.** SVG icons are rendered at 24, 48 and 72 px into one QIcon, so
+they stay sharp at 150-200% display scaling (they were a single 24 px
+bitmap scaled up). A new Full View icon (Tabler "arrows-maximize").
+
+**Themes** (`viewer/qt/theme.h/.cpp`, View > Theme). *Dark* stays the
+default. *Windows Grey* uses the native Windows 11 style with a Windows 11
+light palette (#f0f0f0 surfaces, white fields, Windows-blue accent) and
+light title bars. The UI is still written once, in the dark palette:
+`themed()` maps the dark colours in every style sheet and `tc()` maps
+painted colours (canvas surround, axis columns and labels, chart
+backgrounds, text, accent, icon strokes) to their grey counterparts. Data
+colours (seismic, curves, horizons) are never mapped. The theme is read
+at startup; switching it stores the choice and offers to restart
+(reopening the current file).
+
+**Help.** Mouse and Keyboard (F1): the gestures and keys above. Report a
+Bug: a short form that opens the default mail client with a message to
+the developer, with version, Qt, OS, theme and the current dataset's
+size filled in. About TraceLab: build, Qt version, and the libraries used
+(Qt under LGPL v3, Tabler Icons under MIT; everything else is written
+for the app).
+
 ### Performance pass on large files (6 GB, 603k traces)
 
 The test file was the PARAGON inline tiled 40 times: 603,280 traces of

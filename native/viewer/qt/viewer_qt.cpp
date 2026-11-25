@@ -1,4 +1,5 @@
 #include "viewer_qt.h"
+#include "theme.h"
 
 #include "axis_ticks.h"
 #include "segy_decode.h"
@@ -87,6 +88,11 @@
 #include <thread>
 #include <vector>
 #include <QElapsedTimer>
+#include <QDesktopServices>
+#include <QProcess>
+#include <QUrl>
+#include <QUrlQuery>
+#include <QSysInfo>
 
 namespace segyqt {
 
@@ -148,6 +154,14 @@ namespace {
 // constants rather than scattered hex literals since several places
 // (icons, canvas surround, amplitude scale widget) need to agree on them.
 constexpr int kCanvasMargin = 16; // dark surround around the inset plot
+
+// A palette colour that follows the theme on every use (see theme.h).
+struct ThemedColor {
+    QColor dark;
+    operator QColor() const { return tc(dark); }
+    QString name() const { return tc(dark).name(); }
+    QRgb rgb() const { return tc(dark).rgb(); }
+};
 // Reserved column for the amplitude-scale legend (see
 // SegyCanvas::plotAreaWidth) -- a fixed width subtracted from the plot's
 // own width whenever showColorBar is on, *regardless* of seismicMode, so
@@ -170,9 +184,9 @@ constexpr int kIdentRowGap = 2;      // gap between stacked ident elements
 // call site (computeWiggleLayout's own default/tests are untouched).
 // Started at 6 dB, raised to 9 dB after still reading weak by comparison.
 constexpr double kWiggleGainBoostDb = 9.0;
-const QColor kCanvasSurroundColor(0x14, 0x14, 0x16);
-const QColor kAccentColor(0xe8, 0x90, 0x5a);
-const QColor kSecondaryTextColor(0x9a, 0x9c, 0xa3);
+const ThemedColor kCanvasSurroundColor{QColor(0x14, 0x14, 0x16)};
+const ThemedColor kAccentColor{QColor(0xe8, 0x90, 0x5a)};
+const ThemedColor kSecondaryTextColor{QColor(0x9a, 0x9c, 0xa3)};
 
 // One color per selection box (AppState::selectionBoxes), assigned once at
 // creation from SelectionBox::colorIndex and never reassigned -- so
@@ -220,7 +234,8 @@ struct AnalysisSource {
     QColor color;
 };
 AnalysisSource resolveAnalysisSource(const AppState& app, bool useSelection) {
-    AnalysisSource src{0, app.foreground->traceCount, 0, app.foreground->binHeader.samplesPerTrace, Qt::white};
+    AnalysisSource src{0, app.foreground->traceCount, 0, app.foreground->binHeader.samplesPerTrace,
+                       tc(QColor(Qt::white))};
     if (!useSelection) return src;
     const SelectionBox* box = activeBox(app);
     if (!box || !box->complete) return src;
@@ -345,13 +360,13 @@ QIcon renderOverflowIcon(int hiddenCount) {
         p.setRenderHint(QPainter::Antialiasing, true);
         QRectF badgeRect(12, 0, 12, 12);
         p.setPen(Qt::NoPen);
-        p.setBrush(QColor(0xe8, 0x90, 0x5a)); // Dark Pro accent
+        p.setBrush(tc(QColor(0xe8, 0x90, 0x5a))); // Dark Pro accent
         p.drawEllipse(badgeRect);
         QFont font = p.font();
         font.setPixelSize(9);
         font.setBold(true);
         p.setFont(font);
-        p.setPen(QColor(0x1e, 0x1f, 0x22)); // dark text, readable on the accent orange
+        p.setPen(tc(QColor(0x1e, 0x1f, 0x22))); // dark text, readable on the accent orange
         p.drawText(badgeRect, Qt::AlignCenter, QString::number(std::min(hiddenCount, 99)));
     }
     return QIcon(pm);
@@ -633,7 +648,7 @@ QIcon colorScalePreviewIcon(segy::ColorScale scale, bool flipped) {
         painter.setPen(QColor(r, g, b));
         painter.drawLine(x, 0, x, kHeight - 1);
     }
-    painter.setPen(QColor(0x66, 0x68, 0x6d));
+    painter.setPen(tc(QColor(0x66, 0x68, 0x6d)));
     painter.drawRect(0, 0, kWidth - 1, kHeight - 1);
     return QIcon(pixmap);
 }
@@ -761,7 +776,7 @@ public:
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this);
-        painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
+        painter.fillRect(rect(), tc(QColor(0x1e, 0x1f, 0x22)));
         QRect plot = plotRect();
         if (plot.width() <= 0 || plot.height() <= 0) return;
         if (!raster_.isNull()) {
@@ -781,10 +796,10 @@ protected:
             if (y > plot.top() && y < plot.bottom()) painter.drawLine(plot.left(), y, plot.right(), y);
         }
 
-        painter.setPen(QColor(0x9a, 0x9c, 0xa3));
+        painter.setPen(tc(QColor(0x9a, 0x9c, 0xa3)));
         painter.drawLine(plot.topLeft(), plot.bottomLeft());
         painter.drawLine(plot.bottomLeft(), plot.bottomRight());
-        painter.setPen(QColor(0xe0, 0xe2, 0xe7));
+        painter.setPen(tc(QColor(0xe0, 0xe2, 0xe7)));
         painter.setFont(axisFont);
         for (const segy::AxisTick& tick : timeTicks) {
             int y = plot.top() + tick.pixelPos;
@@ -911,7 +926,7 @@ void AmplitudeScaleWidget::paintEvent(QPaintEvent*) {
     // Semi-transparent dark backing chip so the legend stays legible
     // sitting on top of whatever seismic colors happen to be underneath it
     // (this widget is an overlay on the plot, not a dock section anymore).
-    painter.fillRect(rect(), QColor(0x14, 0x14, 0x16, 200));
+    painter.fillRect(rect(), tc(QColor(0x14, 0x14, 0x16, 200)));
 
     QFontMetrics fm(painter.font());
     int textH = fm.height();
@@ -1076,7 +1091,7 @@ void ClipHistogramWidget::paintEvent(QPaintEvent*) {
         return s.empty() ? 0 : fm.horizontalAdvance(QString::fromStdString(s));
     };
 
-    painter.setPen(QColor(0x3c, 0x3f, 0x41));
+    painter.setPen(tc(QColor(0x3c, 0x3f, 0x41)));
     painter.drawRect(chart);
 
     int numBins = int(result_.percentOfTotal.size());
@@ -1101,12 +1116,12 @@ void ClipHistogramWidget::paintEvent(QPaintEvent*) {
     // The two draggable clip lines, drawn last so they sit on top of the bars.
     auto drawLine = [&](float value, bool active) {
         int x = xForValue(value);
-        QPen pen(active ? Qt::white : kAccentColor);
+        QPen pen(active ? QColor(Qt::white) : QColor(kAccentColor));
         pen.setWidth(active ? 2 : 1);
         painter.setPen(pen);
         painter.drawLine(x, chart.top(), x, chart.bottom());
         constexpr int kHandle = 6;
-        painter.setBrush(active ? Qt::white : kAccentColor);
+        painter.setBrush(active ? QColor(Qt::white) : QColor(kAccentColor));
         painter.drawRect(x - kHandle / 2, chart.top() - kHandle, kHandle, kHandle);
     };
     drawLine(-negClip_, draggingLine_ == 0);
@@ -1121,7 +1136,7 @@ ClipDialog::ClipDialog(AppState& app, QWidget* parent) : QDialog(parent), app_(a
     QLabel* hint = new QLabel(
         "Drag either line, or type exact values below. The seismic display updates live.");
     hint->setWordWrap(true);
-    hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
     layout->addWidget(hint);
 
     histogramWidget_ = new ClipHistogramWidget(this);
@@ -1656,7 +1671,7 @@ AmplitudeProcessingDialog::AmplitudeProcessingDialog(QWidget* parent) : QDialog(
 
     QLabel* hint = new QLabel("Display only: the data itself, Spectrum, Histogram and Save SEG-Y are unaffected.");
     hint->setWordWrap(true);
-    hint->setStyleSheet("color: #9a9ca3;");
+    hint->setStyleSheet(themed("color: #9a9ca3;"));
     layout->addWidget(hint);
 
     // --- Computed gain: time-gain pairs ---
@@ -1934,7 +1949,7 @@ BandpassDialog::BandpassDialog(QWidget* parent) : QDialog(parent) {
     QLabel* hint = new QLabel("Butterworth, applied zero-phase with scipy.signal.sosfiltfilt's method "
                               "(trace ends padded, steady-state start). Corners end up at -6 dB.");
     hint->setWordWrap(true);
-    hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
     layout->addWidget(hint);
 
     QHBoxLayout* nameRow = new QHBoxLayout();
@@ -2022,7 +2037,7 @@ SaveSegyDialog::SaveSegyDialog(QWidget* parent) : QDialog(parent) {
     layout->addLayout(fileRow);
 
     datasetSummaryLabel_ = new QLabel();
-    datasetSummaryLabel_->setStyleSheet("color: #9a9ca3;");
+    datasetSummaryLabel_->setStyleSheet(themed("color: #9a9ca3;"));
     layout->addWidget(datasetSummaryLabel_);
 
     layout->addWidget(new QLabel("EBCDIC Text Header Preview:"));
@@ -2033,7 +2048,7 @@ SaveSegyDialog::SaveSegyDialog(QWidget* parent) : QDialog(parent) {
     mono.setStyleHint(QFont::Monospace);
     mono.setPointSize(9);
     ebcdicPreview_->setFont(mono);
-    ebcdicPreview_->setStyleSheet("background: #f4f2ec; color: #1b1b1b;");
+    ebcdicPreview_->setStyleSheet(themed("background: #f4f2ec; color: #1b1b1b;"));
     layout->addWidget(ebcdicPreview_, 1);
 
     addButtonRow(this, layout,
@@ -2069,13 +2084,13 @@ OctaveBandDialog::OctaveBandDialog(QWidget* parent) : QDialog(parent) {
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QHBoxLayout* toolbarRow = new QHBoxLayout();
-    toolbarRow->addWidget(new QLabel("Source:"));
+    toolbarRow->addWidget(new QLabel("Source"));
     sourceCombo_ = new QComboBox();
     toolbarRow->addWidget(sourceCombo_);
-    toolbarRow->addWidget(new QLabel("Min Freq:"));
+    toolbarRow->addWidget(new QLabel("From"));
     minFreqCombo_ = new QComboBox();
     toolbarRow->addWidget(minFreqCombo_);
-    toolbarRow->addWidget(new QLabel("Max Freq:"));
+    toolbarRow->addWidget(new QLabel("to"));
     maxFreqCombo_ = new QComboBox();
     toolbarRow->addWidget(maxFreqCombo_);
     // Only powers of 2, per the original ask ("increments of 2^N") -- a
@@ -2087,11 +2102,11 @@ OctaveBandDialog::OctaveBandDialog(QWidget* parent) : QDialog(parent) {
     }
     minFreqCombo_->setCurrentText("2 Hz");
     maxFreqCombo_->setCurrentText("128 Hz");
-    QPushButton* applyButton = new QPushButton("Apply");
+    QPushButton* applyButton = new QPushButton("Recompute");
     connect(applyButton, &QPushButton::clicked, this, [this]() { emitApply(); });
     toolbarRow->addWidget(applyButton);
     toolbarRow->addSpacing(16);
-    toolbarRow->addWidget(new QLabel("Scale:"));
+    toolbarRow->addWidget(new QLabel("Scale"));
     scaleCombo_ = new QComboBox();
     scaleCombo_->addItem("Same as main display", 0);
     scaleCombo_->addItem("Per band", 1);
@@ -2159,7 +2174,7 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
         QWidget* col = new QWidget();
         col->setMinimumWidth(140);
         col->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-        col->setStyleSheet("border-right: 1px solid #3c3f41;");
+        col->setStyleSheet(themed("border-right: 1px solid #3c3f41;"));
         QVBoxLayout* colLayout = new QVBoxLayout(col);
         colLayout->setContentsMargins(4, 4, 4, 4);
         // Each filtered band's RMS level relative to the unfiltered data --
@@ -2181,9 +2196,9 @@ void OctaveBandDialog::setResult(const OctaveBandResult& result) {
         }
         QLabel* labelWidget = new QLabel(labelText);
         labelWidget->setAlignment(Qt::AlignCenter);
-        labelWidget->setStyleSheet(
+        labelWidget->setStyleSheet(themed(
             "QLabel { color: #f0f2f5; background-color: #303238; font-size: 12px; font-weight: bold; padding: 2px; "
-            "border: none; }");
+            "border: none; }"));
         colLayout->addWidget(labelWidget);
         OctaveBandPlotWidget* plotWidget = new OctaveBandPlotWidget();
         plotWidget->setBandData(band.data);
@@ -2286,6 +2301,7 @@ public:
     }
     std::function<void(double fromMs, double toMs)> onLagBox;
     std::function<void(const QString&)> onMeasure; // delta-t text, empty when cleared
+    std::function<void()> onDoubleClick;
 
 protected:
     QRect plotRect() const { return rect().adjusted(10, 24, -10, -38); }
@@ -2301,15 +2317,19 @@ protected:
         const double sample = ms * 1000.0 / std::max(1e-9, sampleIntervalUs_);
         return plot.top() + (sample - sampleStart_ + 0.5) / std::max(1, n) * plot.height();
     }
+    // The app's zoom gestures: drag a lag range to zoom to it, double-click
+    // to go back. A plain click measures delta-t instead.
     void mousePressEvent(QMouseEvent* event) override {
         if (event->button() != Qt::LeftButton || average_.size() < 2) return;
-        const double ms = lagMsAt(event->position().y());
-        if (boxMode_) {
-            dragging_ = true;
-            dragA_ = dragB_ = ms;
-            update();
-            return;
-        }
+        dragging_ = true;
+        dragA_ = dragB_ = lagMsAt(event->position().y());
+        pressY_ = event->position().y();
+        update();
+    }
+    void mouseDoubleClickEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton && onDoubleClick) onDoubleClick();
+    }
+    void measureAt(double ms) {
         // Delta-t measuring: first click, second click, third click clears.
         if (measureCount_ >= 2) measureCount_ = 0;
         measure_[measureCount_++] = ms;
@@ -2331,12 +2351,16 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override {
         if (!dragging_ || event->button() != Qt::LeftButton) return;
         dragging_ = false;
-        if (std::fabs(dragB_ - dragA_) > 0.0 && onLagBox) onLagBox(std::min(dragA_, dragB_), std::max(dragA_, dragB_));
+        if (std::fabs(event->position().y() - pressY_) < 5.0) {
+            measureAt(dragA_);
+        } else if (onLagBox) {
+            onLagBox(std::min(dragA_, dragB_), std::max(dragA_, dragB_));
+        }
         update();
     }
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this);
-        painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
+        painter.fillRect(rect(), tc(QColor(0x1e, 0x1f, 0x22)));
         QRect plot = plotRect();
         if (plot.width() <= 0 || plot.height() <= 0) return;
         painter.fillRect(plot, Qt::white);
@@ -2347,9 +2371,9 @@ protected:
             if (y > plot.top() && y < plot.bottom()) painter.drawLine(plot.left(), y, plot.right(), y);
         }
         auto xFor = [&](double v) { return plot.left() + (v + 1.0) * 0.5 * (plot.width() - 1); };
-        painter.setPen(QPen(QColor(0xd0, 0xd2, 0xd6), 1, Qt::DashLine));
+        painter.setPen(QPen(tc(QColor(0xd0, 0xd2, 0xd6)), 1, Qt::DashLine));
         for (double guide : {-0.5, 0.5}) painter.drawLine(QPointF(xFor(guide), plot.top()), QPointF(xFor(guide), plot.bottom()));
-        painter.setPen(QPen(QColor(0x9a, 0x9c, 0xa3), 1));
+        painter.setPen(QPen(tc(QColor(0x9a, 0x9c, 0xa3)), 1));
         painter.drawLine(QPointF(xFor(0.0), plot.top()), QPointF(xFor(0.0), plot.bottom()));
         if (sampleStart_ <= 0 && sampleEnd_ >= 0) {
             const double y0 = yForLagMs(0.0);
@@ -2373,7 +2397,7 @@ protected:
         // Side peak (peak-to-peak distance), mirrored to both sides of lag 0.
         if (!std::isnan(peakLag_)) {
             const double ms = std::fabs(peakLag_) * sampleIntervalUs_ / 1000.0;
-            painter.setPen(QPen(QColor(0xe8, 0x90, 0x5a), 1.5, Qt::DashLine));
+            painter.setPen(QPen(tc(QColor(0xe8, 0x90, 0x5a)), 1.5, Qt::DashLine));
             for (double s : {-1.0, 1.0}) {
                 const double y = yForLagMs(s * ms);
                 painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
@@ -2387,12 +2411,12 @@ protected:
         }
         if (dragging_) {
             const double ya = yForLagMs(dragA_), yb = yForLagMs(dragB_);
-            painter.setPen(QPen(QColor(0xe8, 0x90, 0x5a), 1.5, Qt::DashLine));
-            painter.setBrush(QColor(0xe8, 0x90, 0x5a, 40));
+            painter.setPen(QPen(tc(QColor(0xe8, 0x90, 0x5a)), 1.5, Qt::DashLine));
+            painter.setBrush(tc(QColor(0xe8, 0x90, 0x5a, 40)));
             painter.drawRect(QRectF(QPointF(plot.left(), ya), QPointF(plot.right(), yb)).normalized());
         }
         painter.restore();
-        painter.setPen(QColor(0xe0, 0xe2, 0xe7));
+        painter.setPen(tc(QColor(0xe0, 0xe2, 0xe7)));
         QFont axisFont = painter.font();
         axisFont.setPixelSize(10);
         painter.setFont(axisFont);
@@ -2408,6 +2432,7 @@ private:
     int sampleStart_ = 0;
     int sampleEnd_ = 0;
     double sampleIntervalUs_ = 0.0;
+    double pressY_ = 0.0;
     double peakLag_ = std::nan("");
     bool boxMode_ = false;
     bool dragging_ = false;
@@ -2440,10 +2465,11 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelat
     toolbarRow->addWidget(minLagSpin_);
     toolbarRow->addWidget(new QLabel("+lag"));
     toolbarRow->addWidget(maxLagSpin_);
-    QPushButton* applyButton = new QPushButton("Apply");
+    QPushButton* applyButton = new QPushButton("Recompute");
     toolbarRow->addWidget(applyButton);
     toolbarRow->addSpacing(12);
     QToolBar* zoomBar = new QToolBar(this);
+    zoomBar->setVisible(false); // zoom is a gesture now (drag / double-click)
     zoomBar->setIconSize(QSize(18, 18));
     zoomAction_ = zoomBar->addAction(iconMagnifier(true), "Zoom");
     zoomAction_->setToolTip("Zoom the lag axis to the box (without one: drag one on the average curve)");
@@ -2461,11 +2487,11 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelat
 
     QHBoxLayout* infoRow = new QHBoxLayout();
     peakLabel_ = new QLabel();
-    peakLabel_->setStyleSheet("color: #f0f2f5; font-weight: 600;");
+    peakLabel_->setStyleSheet(themed("color: #f0f2f5; font-weight: 600;"));
     infoRow->addWidget(peakLabel_);
     infoRow->addSpacing(16);
     infoLabel_ = new QLabel();
-    infoLabel_->setStyleSheet("color: #9a9ca3;");
+    infoLabel_->setStyleSheet(themed("color: #9a9ca3;"));
     infoRow->addWidget(infoLabel_, 1);
     layout->addLayout(infoRow);
 
@@ -2506,12 +2532,9 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelat
         hasLagBox_ = true;
         lagBoxA_ = fromMs;
         lagBoxB_ = toMs;
-        if (zoomWhenBoxDrawn_) {
-            zoomWhenBoxDrawn_ = false;
-            zoomToLagBox();
-        }
-        refreshZoomActions();
+        zoomToLagBox();
     };
+    averagePlot->onDoubleClick = [this]() { unzoomAction_->trigger(); };
     averagePlot->onMeasure = [this](const QString& text) { infoLabel_->setText(text); };
     connect(boxAction_, &QAction::toggled, this, [averagePlot](bool on) { averagePlot->setBoxMode(on); });
     connect(zoomAction_, &QAction::triggered, this, [this]() {
@@ -2611,11 +2634,9 @@ namespace {
 QMenuBar* buildResultWindowMenuBar(QWidget* window, std::function<void(bool)> onGridLinesToggled,
                                     std::function<void()> onParameters,
                                     std::function<void(bool)> onCrosshairToggled = nullptr) {
+    // One menu: what the window shows, and its parameters. (File > Close
+    // and an empty Edit menu only repeated the window's own close button.)
     QMenuBar* menuBar = new QMenuBar(window);
-    QMenu* fileMenu = menuBar->addMenu("&File");
-    QAction* closeAction = fileMenu->addAction("&Close");
-    QObject::connect(closeAction, &QAction::triggered, window, &QWidget::close);
-    menuBar->addMenu("&Edit");
     QMenu* viewMenu = menuBar->addMenu("&View");
     QAction* gridAction = viewMenu->addAction("&Grid Lines");
     gridAction->setCheckable(true);
@@ -2628,8 +2649,8 @@ QMenuBar* buildResultWindowMenuBar(QWidget* window, std::function<void(bool)> on
         QObject::connect(crosshairAction, &QAction::toggled, window, std::move(onCrosshairToggled));
     }
     if (onParameters) {
-        QMenu* utilitiesMenu = menuBar->addMenu("&Utilities");
-        QAction* paramsAction = utilitiesMenu->addAction("&Parameters...");
+        viewMenu->addSeparator();
+        QAction* paramsAction = viewMenu->addAction("&Parameters...");
         QObject::connect(paramsAction, &QAction::triggered, window, std::move(onParameters));
     }
     return menuBar;
@@ -2761,7 +2782,7 @@ void HistogramChartArea::paintEvent(QPaintEvent*) {
     // pure black background per the original request ---
     painter.setPen(kSecondaryTextColor);
     painter.drawText(QRect(0, bottomChart.top() - 22, w, 20), Qt::AlignHCenter, "Cumulative Percent");
-    painter.fillRect(bottomChart, Qt::black);
+    painter.fillRect(bottomChart, tc(QColor(Qt::black)));
     std::vector<segy::AxisTick> yTicksBottom =
         segy::computeNiceAxisTicks(0.0, 100.0, bottomChart.height(), kMaxLines, measureWidth);
     drawHorizontalGridlinesAndLabels(painter, bottomChart, yTicksBottom, gridColor, kSecondaryTextColor,
@@ -2833,7 +2854,7 @@ bool editAxisRanges(QWidget* parent, const QString& title, const QString& xName,
     QDoubleSpinBox* y1Spin = spin(y1, yDecimals);
     QLabel* minHeading = new QLabel("Min");
     QLabel* maxHeading = new QLabel("Max");
-    for (QLabel* heading : {minHeading, maxHeading}) heading->setStyleSheet("color: #7a7c82;");
+    for (QLabel* heading : {minHeading, maxHeading}) heading->setStyleSheet(themed("color: #7a7c82;"));
     grid->addWidget(minHeading, 0, 1);
     grid->addWidget(maxHeading, 0, 2);
     grid->addWidget(new QLabel(xName), 1, 0);
@@ -3004,29 +3025,68 @@ bool ZoomableChart::handleBoxRelease(QMouseEvent* event) {
     // A click without a drag is no box.
     const QPointF a = pixelAt(boxA_.x(), boxA_.y()), b = pixelAt(boxB_.x(), boxB_.y());
     hasBox_ = std::fabs(a.x() - b.x()) >= 4.0 && std::fabs(a.y() - b.y()) >= 4.0;
+    if (hasBox_) {
+        zoomToBox(); // the box is the zoom: no separate Zoom step
+        return true;
+    }
     update();
     notifyZoomState();
     return true;
+}
+
+void ZoomableChart::mouseDoubleClickEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton && chartRect().contains(event->position().toPoint())) unzoom();
+}
+
+void ZoomableChart::wheelEvent(QWheelEvent* event) {
+    const QPointF pos = event->position();
+    if (!chartRect().contains(pos.toPoint())) return;
+    const int notches = event->angleDelta().y() / 120;
+    if (notches == 0) return;
+    const double factor = std::pow(1.15, double(-notches));
+    const QPointF at = dataAt(pos);
+    const Range range{at.x() + (view_.x0 - at.x()) * factor, at.x() + (view_.x1 - at.x()) * factor,
+                      at.y() + (view_.y0 - at.y()) * factor, at.y() + (view_.y1 - at.y()) * factor};
+    // One wheel gesture is one step back for Previous Zoom, not one per notch.
+    static QElapsedTimer clock;
+    if (!clock.isValid()) clock.start();
+    const bool newGesture = clock.elapsed() - lastWheelMs_ > 600;
+    lastWheelMs_ = clock.elapsed();
+    for (ZoomableChart* chart : peers()) chart->applyWheelRange(range, newGesture);
+    notifyZoomState();
+}
+
+void ZoomableChart::applyWheelRange(const Range& range, bool newGesture) {
+    if (newGesture && manualRange_) history_.push_back(view_);
+    manualRange_ = true;
+    view_ = range;
+    viewChanged();
 }
 
 void ZoomableChart::paintBox(QPainter& painter) const {
     if (!hasBox_ && !draggingBox_) return;
     painter.save();
     painter.setClipRect(chartRect());
-    painter.setPen(QPen(QColor(0xe8, 0x90, 0x5a), 1.5, Qt::DashLine));
-    painter.setBrush(QColor(0xe8, 0x90, 0x5a, 40));
+    painter.setPen(QPen(tc(QColor(0xe8, 0x90, 0x5a)), 1.5, Qt::DashLine));
+    painter.setBrush(tc(QColor(0xe8, 0x90, 0x5a, 40)));
     painter.drawRect(QRectF(pixelAt(boxA_.x(), boxA_.y()), pixelAt(boxB_.x(), boxB_.y())).normalized());
     painter.restore();
 }
 
 void ZoomableChart::showAxisMenu(const QPoint& globalPos, const QString& xName, const QString& yName, int xDecimals,
                                  int yDecimals) {
+    // The same menu as the seismic display's.
     QMenu menu(this);
-    QAction* ranges = menu.addAction("Axis Ranges...");
-    QAction* reset = menu.addAction("Reset Axes");
+    QAction* previous = menu.addAction("Previous Zoom");
+    previous->setEnabled(manualRange_);
+    QAction* reset = menu.addAction("Full View");
     reset->setEnabled(manualRange_);
+    menu.addSeparator();
+    QAction* ranges = menu.addAction("Axis Ranges...");
     QAction* chosen = menu.exec(globalPos);
-    if (chosen == reset) {
+    if (chosen == previous) {
+        unzoom();
+    } else if (chosen == reset) {
         resetAxes();
     } else if (chosen == ranges) {
         double x0 = view_.x0, x1 = view_.x1, y0 = view_.y0, y1 = view_.y1;
@@ -3201,7 +3261,7 @@ void DbCurveChart::paintEvent(QPaintEvent*) {
             if (!curve.visible || size_t(hoverIndex_) >= curve.db.size()) continue;
             const float val = curve.db[size_t(hoverIndex_)];
             if (!std::isfinite(val) || val < v.y0 || val > v.y1) continue;
-            painter.setPen(QPen(kCanvasSurroundColor, 2)); // surface ring
+            painter.setPen(QPen(QColor(kCanvasSurroundColor), 2)); // surface ring
             painter.setBrush(curve.color);
             painter.drawEllipse(QPointF(x, yFor(val)), 4.5, 4.5);
         }
@@ -3211,8 +3271,7 @@ void DbCurveChart::paintEvent(QPaintEvent*) {
 
 void DbCurveChart::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::RightButton) {
-        // Right-click on an axis (outside the plot frame): axis ranges.
-        if (!chartRect().contains(event->position().toPoint()) && frequencyHz_.size() >= 2) {
+        if (frequencyHz_.size() >= 2) {
             showAxisMenu(event->globalPosition().toPoint(), "Frequency (Hz)", "Level (dB)", 1, 1);
         }
         return;
@@ -3254,9 +3313,10 @@ void DbCurveChart::leaveEvent(QEvent*) {
 // icons) as the seismic toolbar's, as a slim strip above the chart.
 QToolBar* buildChartZoomToolbar(ZoomableChart* chart, QWidget* parent) {
     QToolBar* bar = new QToolBar(parent);
+    bar->setVisible(false); // zoom is a gesture now: drag, double-click, wheel, right-click
     bar->setIconSize(QSize(18, 18));
     bar->setMovable(false);
-    bar->setStyleSheet("QToolBar { background: #141416; border: none; padding: 2px 8px; spacing: 4px; }");
+    bar->setStyleSheet(themed("QToolBar { background: #141416; border: none; padding: 2px 8px; spacing: 4px; }"));
     QAction* zoom = bar->addAction(iconMagnifier(true), "Zoom");
     zoom->setToolTip("Zoom to the box");
     QAction* unzoom = bar->addAction(iconMagnifier(false), "Unzoom");
@@ -3281,7 +3341,7 @@ namespace {
 // caption left, monospace value right.
 QLabel* readoutSectionLabel(const QString& text) {
     QLabel* label = new QLabel(text);
-    label->setStyleSheet("color: #7a7c82; font-size: 11px; letter-spacing: 1px; font-weight: 600;");
+    label->setStyleSheet(themed("color: #7a7c82; font-size: 11px; letter-spacing: 1px; font-weight: 600;"));
     return label;
 }
 
@@ -3292,11 +3352,11 @@ QWidget* readoutValueRow(QWidget* swatch, const QString& caption, QLabel*& value
     rowLayout->setSpacing(6);
     if (swatch) rowLayout->addWidget(swatch);
     QLabel* captionLabel = new QLabel(caption);
-    captionLabel->setStyleSheet("color: #9a9ca3;");
+    captionLabel->setStyleSheet(themed("color: #9a9ca3;"));
     rowLayout->addWidget(captionLabel);
     rowLayout->addStretch();
     valueOut = new QLabel("--");
-    valueOut->setStyleSheet("color: #d4d4d8; font-family: monospace;");
+    valueOut->setStyleSheet(themed("color: #d4d4d8; font-family: monospace;"));
     rowLayout->addWidget(valueOut);
     return row;
 }
@@ -3319,7 +3379,7 @@ QPixmap curveSwatch(const QColor& color, bool dashed) {
 CurveReadoutPanel::CurveReadoutPanel(QWidget* parent) : QWidget(parent) {
     setObjectName("curveReadout");
     setAttribute(Qt::WA_StyledBackground, true);
-    setStyleSheet("#curveReadout { background-color: #1a1b1e; border-left: 1px solid #2b2d31; }");
+    setStyleSheet(themed("#curveReadout { background-color: #1a1b1e; border-left: 1px solid #2b2d31; }"));
     setFixedWidth(210);
     QVBoxLayout* layout = new QVBoxLayout(this);
     layout->setContentsMargins(16, 16, 16, 16);
@@ -3337,7 +3397,7 @@ CurveReadoutPanel::CurveReadoutPanel(QWidget* parent) : QWidget(parent) {
     layout->addStretch();
     QLabel* hint = new QLabel("Hover over the chart to read values.");
     hint->setWordWrap(true);
-    hint->setStyleSheet("color: #68696e; font-style: italic; font-size: 11px;");
+    hint->setStyleSheet(themed("color: #68696e; font-style: italic; font-size: 11px;"));
     layout->addWidget(hint);
 }
 
@@ -3444,7 +3504,7 @@ SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Wind
         }));
 
     QWidget* header = new QWidget(this);
-    header->setStyleSheet("background-color: #141416;");
+    header->setStyleSheet(themed("background-color: #141416;"));
     QHBoxLayout* headerLayout = new QHBoxLayout(header);
     headerLayout->setContentsMargins(14, 10, 14, 10);
     headerLayout->setSpacing(16);
@@ -3454,7 +3514,7 @@ SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Wind
     // Curve toggles: a centred row along the bottom of the window, like a
     // legend under the chart (built here, placed below).
     QWidget* legendBar = new QWidget(this);
-    legendBar->setStyleSheet("background-color: #141416;");
+    legendBar->setStyleSheet(themed("background-color: #141416;"));
     QHBoxLayout* toggles = new QHBoxLayout(legendBar);
     toggles->setContentsMargins(14, 8, 14, 8);
     toggles->setSpacing(24);
@@ -3479,7 +3539,7 @@ SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Wind
     params->setSpacing(8);
     auto caption = [](const QString& text) {
         QLabel* label = new QLabel(text);
-        label->setStyleSheet("color: #9a9ca3;");
+        label->setStyleSheet(themed("color: #9a9ca3;"));
         return label;
     };
     distanceSpin_ = new QSpinBox();
@@ -3516,7 +3576,7 @@ SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Wind
     shiftLabel_->setTextFormat(Qt::RichText);
     shiftLabel_->setAlignment(Qt::AlignCenter);
     shiftLabel_->setAttribute(Qt::WA_TransparentForMouseEvents);
-    shiftLabel_->setStyleSheet("background: transparent; color: #d4d4d8;");
+    shiftLabel_->setStyleSheet(themed("background: transparent; color: #d4d4d8;"));
     shiftButtonLayout->addWidget(shiftLabel_);
     connect(shiftButton_, &QPushButton::clicked, this, [this]() { showDetails(); });
     recomputeButton_ = new QPushButton("Recompute");
@@ -3605,7 +3665,7 @@ void SignalNoiseWindow::showDetails() {
         detailsTable_->setFocusPolicy(Qt::NoFocus);
         detailsTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
         detailsTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-        detailsTable_->setStyleSheet("QTableWidget { background: #1a1b1e; border: none; }");
+        detailsTable_->setStyleSheet(themed("QTableWidget { background: #1a1b1e; border: none; }"));
         layout->addWidget(detailsTable_);
     }
     detailsTable_->clearSpans();
@@ -3621,15 +3681,15 @@ void SignalNoiseWindow::showDetails() {
             font.setPointSizeF(font.pointSizeF() * 0.85);
             font.setLetterSpacing(QFont::AbsoluteSpacing, 1.0);
             label->setFont(font);
-            label->setForeground(QColor(0x7a, 0x7c, 0x82));
+            label->setForeground(tc(QColor(0x7a, 0x7c, 0x82)));
             detailsTable_->setItem(row, 0, label);
             detailsTable_->setItem(row, 1, new QTableWidgetItem());
             detailsTable_->setSpan(row, 0, 1, 2);
             continue;
         }
-        label->setForeground(QColor(0x9a, 0x9c, 0xa3));
+        label->setForeground(tc(QColor(0x9a, 0x9c, 0xa3)));
         QTableWidgetItem* value = new QTableWidgetItem(entry.second);
-        value->setForeground(QColor(0xd4, 0xd4, 0xd8));
+        value->setForeground(tc(QColor(0xd4, 0xd4, 0xd8)));
         value->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         detailsTable_->setItem(row, 0, label);
         detailsTable_->setItem(row, 1, value);
@@ -3649,9 +3709,9 @@ void SignalNoiseWindow::setRecomputeCallback(std::function<void()> callback) { o
 void SignalNoiseWindow::setParamsEditedCallback(std::function<void()> callback) { onParamsEdited_ = std::move(callback); }
 
 void SignalNoiseWindow::setRecomputeUseful(bool useful) {
-    recomputeButton_->setStyleSheet(useful ? "QPushButton { background: #e8905a; color: #1e1f22; border: 1px solid #e8905a; }"
+    recomputeButton_->setStyleSheet(themed(useful ? "QPushButton { background: #e8905a; color: #1e1f22; border: 1px solid #e8905a; }"
                                              "QPushButton:hover { background: #f0a06c; }"
-                                           : QString());
+                                           : QString()));
     recomputeButton_->setToolTip(useful ? "The data or the parameters changed: recompute"
                                         : "Up to date with the data and parameters");
 }
@@ -3790,7 +3850,7 @@ void FkChart::paintEvent(QPaintEvent*) {
     // What the panels and the k axis are, e.g. "Panel: CDP = 543" and
     // "Range: offset = 0-3000 (scalar 1, dx 25 m)".
     // The range keeps its full text; the panel text gets what's left.
-    painter.setPen(QColor(0xd4, 0xd4, 0xd8));
+    painter.setPen(tc(QColor(0xd4, 0xd4, 0xd8)));
     const QFontMetrics topMetrics(font);
     const int rangeWidth = data_.rangeText.isEmpty() ? 0 : std::min(chart.width(), topMetrics.horizontalAdvance(data_.rangeText) + 4);
     const int panelWidth = std::max(0, chart.width() - rangeWidth - (rangeWidth > 0 ? 16 : 0));
@@ -3861,15 +3921,15 @@ void FkChart::paintEvent(QPaintEvent*) {
             }
         }
         for (const auto& [box, label] : labels) {
-            painter.fillRect(box, QColor(0x14, 0x14, 0x16)); // opaque: readable over the raster
-            painter.setPen(QColor(0xf0, 0xf2, 0xf5));
+            painter.fillRect(box, tc(QColor(0x14, 0x14, 0x16))); // opaque: readable over the raster
+            painter.setPen(tc(QColor(0xf0, 0xf2, 0xf5)));
             painter.drawText(box, Qt::AlignCenter, label);
         }
         painter.setFont(font);
     }
     painter.restore();
     paintBox(painter);
-    painter.setPen(QColor(0x3c, 0x3f, 0x41));
+    painter.setPen(tc(QColor(0x3c, 0x3f, 0x41)));
     painter.setBrush(Qt::NoBrush);
     painter.drawRect(chart);
 
@@ -3907,7 +3967,7 @@ void FkChart::paintEvent(QPaintEvent*) {
 
 void FkChart::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::RightButton) {
-        if (!chartRect().contains(event->position().toPoint()) && data_.frequencies >= 2) {
+        if (data_.frequencies >= 2) {
             showAxisMenu(event->globalPosition().toPoint(),
                          data_.spacingKnown ? "Wavenumber (cycles/km)" : "Wavenumber (cycles/trace)", "Frequency (Hz)",
                          data_.spacingKnown ? 2 : 4, 1);
@@ -3967,13 +4027,13 @@ FkWindow::FkWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
         }));
 
     QWidget* header = new QWidget(this);
-    header->setStyleSheet("background-color: #141416;");
+    header->setStyleSheet(themed("background-color: #141416;"));
     QHBoxLayout* headerLayout = new QHBoxLayout(header);
     headerLayout->setContentsMargins(14, 10, 14, 10);
     headerLayout->setSpacing(10);
     auto caption = [](const QString& text) {
         QLabel* label = new QLabel(text);
-        label->setStyleSheet("color: #9a9ca3;");
+        label->setStyleSheet(themed("color: #9a9ca3;"));
         return label;
     };
     gatherCombo_ = new QComboBox();
@@ -4047,10 +4107,10 @@ FkWindow::FkWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
 
     // The k-axis line (ident, range, scalar, dx), then counts and gate.
     rangeLabel_ = new QLabel();
-    rangeLabel_->setStyleSheet("background-color: #141416; color: #d4d4d8; padding: 0 14px 2px 14px;");
+    rangeLabel_->setStyleSheet(themed("background-color: #141416; color: #d4d4d8; padding: 0 14px 2px 14px;"));
     mainLayout_->addWidget(rangeLabel_);
     infoLabel_ = new QLabel();
-    infoLabel_->setStyleSheet("background-color: #141416; color: #9a9ca3; padding: 0 14px 8px 14px;");
+    infoLabel_->setStyleSheet(themed("background-color: #141416; color: #9a9ca3; padding: 0 14px 8px 14px;"));
     infoLabel_->setWordWrap(true);
     mainLayout_->addWidget(infoLabel_);
     zoomBar_ = new QToolBar(this); // replaced by a real one once there are charts
@@ -4061,21 +4121,21 @@ FkWindow::FkWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
     scroll_->setFrameShape(QFrame::NoFrame);
     scroll_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     chartsHost_ = new QWidget();
-    chartsHost_->setStyleSheet("background-color: #141416;");
+    chartsHost_->setStyleSheet(themed("background-color: #141416;"));
     chartsLayout_ = new QHBoxLayout(chartsHost_);
     chartsLayout_->setContentsMargins(0, 0, 0, 0);
     chartsLayout_->setSpacing(0);
     emptyLabel_ = new QLabel("Computing...");
     emptyLabel_->setAlignment(Qt::AlignCenter);
     emptyLabel_->setWordWrap(true);
-    emptyLabel_->setStyleSheet("color: #9a9ca3;");
+    emptyLabel_->setStyleSheet(themed("color: #9a9ca3;"));
     chartsLayout_->addWidget(emptyLabel_);
     scroll_->setWidget(chartsHost_);
 
     readout_ = new QWidget(this);
     readout_->setObjectName("fkReadout");
     readout_->setAttribute(Qt::WA_StyledBackground, true);
-    readout_->setStyleSheet("#fkReadout { background-color: #1a1b1e; border-left: 1px solid #2b2d31; }");
+    readout_->setStyleSheet(themed("#fkReadout { background-color: #1a1b1e; border-left: 1px solid #2b2d31; }"));
     readout_->setFixedWidth(210);
     QVBoxLayout* readoutLayout = new QVBoxLayout(readout_);
     readoutLayout->setContentsMargins(16, 16, 16, 16);
@@ -4089,7 +4149,7 @@ FkWindow::FkWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
     readoutLayout->addStretch();
     QLabel* hint = new QLabel("Positive k: events that get later on later traces.");
     hint->setWordWrap(true);
-    hint->setStyleSheet("color: #68696e; font-style: italic; font-size: 11px;");
+    hint->setStyleSheet(themed("color: #68696e; font-style: italic; font-size: 11px;"));
     readoutLayout->addWidget(hint);
 
     QHBoxLayout* body = new QHBoxLayout();
@@ -4198,9 +4258,9 @@ void FkWindow::setRecomputeCallback(std::function<void()> callback) { onRecomput
 void FkWindow::setParamsEditedCallback(std::function<void()> callback) { onParamsEdited_ = std::move(callback); }
 
 void FkWindow::setRecomputeUseful(bool useful) {
-    recomputeButton_->setStyleSheet(useful ? "QPushButton { background: #e8905a; color: #1e1f22; border: 1px solid #e8905a; }"
+    recomputeButton_->setStyleSheet(themed(useful ? "QPushButton { background: #e8905a; color: #1e1f22; border: 1px solid #e8905a; }"
                                              "QPushButton:hover { background: #f0a06c; }"
-                                           : QString());
+                                           : QString()));
     recomputeButton_->setToolTip(useful ? "The data or the settings changed: recompute"
                                         : "Up to date with the data and settings");
 }
@@ -4320,9 +4380,9 @@ DatasetSlotWidget::DatasetSlotWidget(const QString& label, QWidget* parent) : QW
     pickButton_->setFlat(true);
     pickButton_->setCursor(Qt::PointingHandCursor);
     pickButton_->setToolTip("Select dataset...");
-    pickButton_->setStyleSheet(
+    pickButton_->setStyleSheet(themed(
         "QPushButton { background: transparent; border: none; } "
-        "QPushButton:hover { background: #3c3f41; border-radius: 2px; }");
+        "QPushButton:hover { background: #3c3f41; border-radius: 2px; }"));
     pickButton_->move(width() - 22, 14);
     connect(pickButton_, &QPushButton::clicked, this, [this]() { if (onPick_) onPick_(); });
 }
@@ -4348,20 +4408,20 @@ void DatasetSlotWidget::setPickCallback(std::function<void()> callback) { onPick
 void DatasetSlotWidget::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     QRect r = rect().adjusted(0, 0, -1, -1);
-    painter.fillRect(r, QColor(0x2b, 0x2d, 0x30));
-    painter.setPen(QColor(0x3c, 0x3f, 0x41));
+    painter.fillRect(r, tc(QColor(0x2b, 0x2d, 0x30)));
+    painter.setPen(tc(QColor(0x3c, 0x3f, 0x41)));
     painter.drawRect(r);
 
     QFont captionFont = font();
     captionFont.setPixelSize(9);
     painter.setFont(captionFont);
-    painter.setPen(QColor(0x9a, 0x9c, 0xa3));
+    painter.setPen(tc(QColor(0x9a, 0x9c, 0xa3)));
     painter.drawText(QRect(4, 1, width() - 8, 12), Qt::AlignLeft | Qt::AlignVCenter, label_);
 
     QFont nameFont = font();
     nameFont.setPixelSize(11);
     painter.setFont(nameFont);
-    painter.setPen(QColor(0xd4, 0xd4, 0xd8));
+    painter.setPen(tc(QColor(0xd4, 0xd4, 0xd8)));
     QString shown = datasetName_.isEmpty() ? QString(QChar(0x2014)) /* em dash; QChar keeps it independent of source encoding */ : datasetName_;
     QRect nameRect(4, 15, width() - 8 - 20, 16);
     painter.drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter,
@@ -4375,7 +4435,7 @@ SegyOpenDialog::SegyOpenDialog(QWidget* parent) : QDialog(parent) {
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QLabel* loadOptionsLabel = new QLabel("Load Options:");
-    loadOptionsLabel->setStyleSheet("font-style: italic; color: #9a9ca3;");
+    loadOptionsLabel->setStyleSheet(themed("font-style: italic; color: #9a9ca3;"));
     layout->addWidget(loadOptionsLabel);
 
     QHBoxLayout* rangeRow = new QHBoxLayout();
@@ -4414,7 +4474,7 @@ SegyOpenDialog::SegyOpenDialog(QWidget* parent) : QDialog(parent) {
     layout->addWidget(keepPrevClipCheck_);
 
     QLabel* browseLabel = new QLabel("Open Seismic File:");
-    browseLabel->setStyleSheet("font-style: italic; color: #9a9ca3; margin-top: 8px;");
+    browseLabel->setStyleSheet(themed("font-style: italic; color: #9a9ca3; margin-top: 8px;"));
     layout->addWidget(browseLabel);
 
     layout->addWidget(new QLabel("Filter"));
@@ -4570,11 +4630,11 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
             // A plain 1 px strip: a styled QFrame::HLine rendered ~3 px and too bright.
             QWidget* line = new QWidget();
             line->setFixedHeight(1);
-            line->setStyleSheet("background-color: #34363b;");
+            line->setStyleSheet(themed("background-color: #34363b;"));
             grid->addWidget(line, row++, 0, 1, 3);
         }
         QLabel* heading = new QLabel(toolbarItems[i].category.toUpper());
-        heading->setStyleSheet("color: #7a7c82; font-size: 10px; letter-spacing: 1px; font-weight: 600;");
+        heading->setStyleSheet(themed("color: #7a7c82; font-size: 10px; letter-spacing: 1px; font-weight: 600;"));
         const int blockRows = int((end - i + 1) / 2);
         grid->addWidget(heading, row, 0, blockRows, 1, Qt::AlignTop | Qt::AlignLeft);
         for (size_t k = i; k < end; ++k) {
@@ -4596,7 +4656,7 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     buttonsRow->addWidget(showAll);
     buttonsRow->addStretch();
     QLabel* buttonsHint = new QLabel("Hidden buttons stay available from the menus.");
-    buttonsHint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    buttonsHint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
     buttonsRow->addWidget(buttonsHint);
     buttonsLayout->addLayout(buttonsRow);
     layout->addWidget(buttonsGroup);
@@ -4691,7 +4751,7 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     layout->addLayout(scaleRow);
 #ifndef Q_OS_WIN
     QLabel* scaleHint = new QLabel("Takes effect after restarting the app.");
-    scaleHint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    scaleHint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
     layout->addWidget(scaleHint);
 #endif
 
@@ -4758,12 +4818,12 @@ EbcdicHeaderWidget::EbcdicHeaderWidget(QWidget* parent) : QWidget(parent) {
     // deliberately pure black/white instead -- the classic terminal look
     // this kind of fixed-width mainframe text is normally read in, not
     // just "some more text on the app's usual dark-grey background."
-    setStyleSheet("background-color: #1e1f22;");
+    setStyleSheet(themed("background-color: #1e1f22;"));
     QVBoxLayout* layout = new QVBoxLayout(this);
     textEdit_ = new QPlainTextEdit(this);
     textEdit_->setReadOnly(true);
     textEdit_->setLineWrapMode(QPlainTextEdit::NoWrap);
-    textEdit_->setStyleSheet("background-color: black; color: white; border: none;");
+    textEdit_->setStyleSheet(themed("background-color: black; color: white; border: none;"));
     QFont mono("monospace");
     mono.setStyleHint(QFont::Monospace);
     mono.setPointSize(10);
@@ -4884,7 +4944,7 @@ QString annotateBinHeaderValue(int offset, int32_t value) {
 
 BinaryHeaderWidget::BinaryHeaderWidget(QWidget* parent) : QWidget(parent) {
     setWindowTitle("Binary Header");
-    setStyleSheet("background-color: #1e1f22;"); // matches the app's dark chrome, same as EbcdicHeaderWidget
+    setStyleSheet(themed("background-color: #1e1f22;")); // matches the app's dark chrome, same as EbcdicHeaderWidget
     QVBoxLayout* layout = new QVBoxLayout(this);
     constexpr int kFieldCount = sizeof(kBinHeaderFields) / sizeof(kBinHeaderFields[0]);
     table_ = new QTableWidget(kFieldCount, 3, this);
@@ -5144,7 +5204,7 @@ std::string SegyCanvas::statusLineText() const {
         } else if (const SelectionBox* box = activeBox(app_)) {
             std::snprintf(buf, sizeof(buf),
                           "Box %d/%d selected: traces [%.0f, %.0f]  samples [%.0f, %.0f]  -- "
-                          "click Zoom in the toolbar, Del to remove, or click empty space for a new box",
+                          "View > Zoom to Box zooms to it, middle-click deletes it, click empty space for a new box",
                           app_.activeBoxIndex + 1, int(app_.selectionBoxes.size()), std::min(box->traceA, box->traceB),
                           std::max(box->traceA, box->traceB), std::min(box->sampleA, box->sampleB),
                           std::max(box->sampleA, box->sampleB));
@@ -5159,10 +5219,20 @@ std::string SegyCanvas::statusLineText() const {
     // Hover info (trace/time/amplitude) moved to the dock's Trace Info
     // section -- see currentHoverInfo()/notifyHoverChanged() -- so the
     // status bar always shows the summary line now, in every tool mode.
-    const char* hint = (app_.tool == ToolMode::Pan) ? "drag=pan, wheel=zoom, R=reset" : "wheel=zoom, R=reset";
-    std::snprintf(buf, sizeof(buf), "traces [%.0f, %.0f)  samples [%.0f, %.0f)  format=%d  render=%.2fms  (%s)",
-                  app_.view.traceStart, app_.view.traceEnd, app_.view.sampleStart, app_.view.sampleEnd,
-                  int(app_.foreground->binHeader.formatCode), app_.lastRenderMs, hint);
+    // Plain words: what is in view, the sample format, and the draw time.
+    const segy::BinaryHeader& bh = app_.foreground->binHeader;
+    const double step = bh.sampleIntervalUs / 1000.0;
+    const char* unit = app_.display.frequencyAxis ? "Hz" : app_.display.depthAxis ? "m" : "ms";
+    const int format = bh.formatCode;
+    const char* formatName = format == 1 ? "IBM float" : format == 5 ? "IEEE float" : format == 2 ? "32-bit integer"
+                           : format == 3 ? "16-bit integer" : format == 8 ? "8-bit integer" : "format ?";
+    const int64_t firstTrace = int64_t(std::max(0.0, std::floor(app_.view.traceStart))) + 1;
+    const int64_t lastTrace = std::min<int64_t>(app_.foreground->traceCount, int64_t(std::ceil(app_.view.traceEnd)));
+    std::snprintf(buf, sizeof(buf),
+                  "Traces %lld\xe2\x80\x93%lld of %lld   \xc2\xb7   %.0f\xe2\x80\x93%.0f %s   \xc2\xb7   %s, %g %s   \xc2\xb7   drawn in %.0f ms",
+                  (long long)firstTrace, (long long)lastTrace, (long long)app_.foreground->traceCount,
+                  app_.view.sampleStart * step, app_.view.sampleEnd * step, unit, formatName, step, unit,
+                  app_.lastRenderMs);
     return buf;
 }
 
@@ -5419,7 +5489,7 @@ void SegyCanvas::paintIdentText(QPainter& painter, const segy::ChromeLayout& chr
     QFontMetrics fm(font);
     painter.save();
     painter.setFont(font);
-    painter.setPen(Qt::white);
+    painter.setPen(tc(QColor(Qt::white)));
 
     // A label that would touch the previous one in its row is skipped, so a
     // narrow window or long values (e.g. 163004113) never pile up.
@@ -5476,7 +5546,7 @@ void SegyCanvas::paintIdentText(QPainter& painter, const segy::ChromeLayout& chr
             linePen.setWidth(0);
             painter.setPen(linePen);
             painter.drawPath(path);
-            painter.setPen(Qt::white);
+            painter.setPen(tc(QColor(Qt::white)));
         }
         int labelX = kCanvasMargin + chrome.plotX + 2;
         painter.drawText(QPoint(labelX, y + fm.ascent()), QString::number(maxVal, 'f', 1));
@@ -5650,6 +5720,14 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         QImage image(reinterpret_cast<uchar*>(app_.pixels.data()), insetWidth, insetHeight,
                      int(insetWidth * sizeof(uint32_t)), QImage::Format_RGB32);
         painter.drawImage(QPoint(kCanvasMargin, topInset), image);
+        if (lightTheme()) {
+            // The raster leaves the axis columns black; light ones here.
+            const QColor axisBackground = tc(QColor(Qt::black));
+            painter.fillRect(QRect(kCanvasMargin + chrome.leftScaleX, topInset, chrome.leftScaleWidth, insetHeight),
+                             axisBackground);
+            painter.fillRect(QRect(kCanvasMargin + chrome.rightScaleX, topInset, chrome.rightScaleWidth, insetHeight),
+                             axisBackground);
+        }
 
         // Idents (see native/README.md): rows + plot above the image,
         // rows below it -- disjoint from the image region, so no clip
@@ -5667,7 +5745,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             int rightTitleX =
                 kCanvasMargin + chrome.rightScaleX + chrome.columnGap + chrome.numbersColumnWidth + chrome.columnGap;
 
-            painter.setPen(Qt::white);
+            painter.setPen(tc(QColor(Qt::white)));
             int lastLabelEnd = std::numeric_limits<int>::min();
             for (const segy::TimeTick& tick : chrome.ticks) {
                 // Labels are centered on their tick's Y position, so one
@@ -5890,6 +5968,15 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             painter.restore();
         }
 
+        if (zoomBandActive_) {
+            painter.save();
+            painter.setPen(QPen(QColor(kAccentColor), 1.5, Qt::DashLine));
+            QColor fill = kAccentColor;
+            fill.setAlpha(40);
+            painter.setBrush(fill);
+            painter.drawRect(QRect(zoomBandStart_, zoomBandEnd_).normalized());
+            painter.restore();
+        }
         lap("horizons");
         // Linked crosshair: where the cursor is on the other panel (same
         // trace index and time), black underlay + white dashes like the
@@ -5956,6 +6043,29 @@ void SegyCanvas::mousePressEvent(QMouseEvent* event) {
             return;
         }
     }
+    // Middle-drag pans in every tool but Box Select (where middle-click
+    // deletes the box).
+    if (event->button() == Qt::MiddleButton && app_.tool != ToolMode::BoxSelect) {
+        if (refuseIfViewLocked()) return;
+        middlePanning_ = true;
+        app_.dragAnchorX = event->pos().x();
+        app_.dragAnchorY = event->pos().y();
+        app_.dragAnchorView = app_.view;
+        setCursor(Qt::ClosedHandCursor);
+        return;
+    }
+    if (event->button() == Qt::RightButton && (app_.tool == ToolMode::Arrow || app_.tool == ToolMode::Pan)) {
+        showAxisRangeMenu(event->globalPosition().toPoint());
+        return;
+    }
+    if (app_.tool == ToolMode::Arrow && event->button() == Qt::LeftButton) {
+        double traceCoord = 0.0, sampleCoord = 0.0;
+        if (dataCoordAt(event->pos().x(), event->pos().y(), traceCoord, sampleCoord) && !app_.viewLocked) {
+            zoomBandActive_ = true;
+            zoomBandStart_ = zoomBandEnd_ = event->pos();
+        }
+        return;
+    }
     if (app_.tool == ToolMode::Pick) {
         double traceCoord = 0.0, sampleCoord = 0.0;
         if ((event->button() == Qt::LeftButton || event->button() == Qt::RightButton) && onPick_ &&
@@ -5969,6 +6079,7 @@ void SegyCanvas::mousePressEvent(QMouseEvent* event) {
     } else if (app_.tool == ToolMode::Pan && event->button() == Qt::LeftButton) {
         if (refuseIfViewLocked()) return;
         app_.dragging = true;
+        setCursor(Qt::ClosedHandCursor);
         app_.dragAnchorX = event->pos().x();
         app_.dragAnchorY = event->pos().y();
         app_.dragAnchorView = app_.view;
@@ -5979,11 +6090,19 @@ void SegyCanvas::mousePressEvent(QMouseEvent* event) {
 void SegyCanvas::showAxisRangeMenu(const QPoint& globalPos) {
     if (!app_.loaded) return;
     if (refuseIfViewLocked()) return;
+    // The same menu as every chart's.
     QMenu menu(this);
+    QAction* previous = menu.addAction("Previous Zoom");
+    previous->setEnabled(!app_.zoomHistory.empty());
+    QAction* reset = menu.addAction("Full View");
+    menu.addSeparator();
     QAction* ranges = menu.addAction("Axis Ranges...");
-    QAction* reset = menu.addAction("Reset View");
     QAction* chosen = menu.exec(globalPos);
     if (!chosen) return;
+    if (chosen == previous) {
+        if (onPreviousZoom_) onPreviousZoom_();
+        return;
+    }
     const int64_t traceCount = app_.foreground->traceCount;
     const int samplesPerTrace = app_.foreground->binHeader.samplesPerTrace;
     const double sampleMs = app_.foreground->binHeader.sampleIntervalUs / 1000.0; // Hz per bin on x-f
@@ -6021,7 +6140,12 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
     hovering_ = true;
     bool needsRepaint = false;
 
-    if (app_.tool == ToolMode::Pan && app_.dragging) {
+    if (zoomBandActive_) {
+        zoomBandEnd_ = event->pos();
+        update();
+        return;
+    }
+    if ((app_.tool == ToolMode::Pan && app_.dragging) || middlePanning_) {
         int insetWidth = std::max(1, plotAreaWidth());
         IdentInsets insets = identInsets();
         int insetHeight = std::max(1, this->height() - (kCanvasMargin + insets.top) - (kCanvasMargin + insets.bottom));
@@ -6064,7 +6188,64 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
     if (needsRepaint) update();
 }
 
-void SegyCanvas::mouseReleaseEvent(QMouseEvent*) { app_.dragging = false; }
+void SegyCanvas::mouseReleaseEvent(QMouseEvent* event) {
+    if (zoomBandActive_ && event->button() == Qt::LeftButton) finishZoomBand();
+    if (middlePanning_ && event->button() == Qt::MiddleButton) middlePanning_ = false;
+    if (app_.dragging) app_.dragging = false;
+    unsetCursorForTool();
+}
+
+void SegyCanvas::finishZoomBand() {
+    zoomBandActive_ = false;
+    update();
+    const QRect band = QRect(zoomBandStart_, zoomBandEnd_).normalized();
+    if (band.width() < 8 || band.height() < 8) return; // a click, not a zoom
+    double t0, s0, t1, s1;
+    if (!dataCoordAt(band.left(), band.top(), t0, s0) || !dataCoordAt(band.right(), band.bottom(), t1, s1)) {
+        // Clamp to the plot: use the band corners that fall inside it.
+        dataCoordAt(std::max(band.left(), 0), std::max(band.top(), 0), t0, s0);
+        dataCoordAt(band.right(), band.bottom(), t1, s1);
+    }
+    if (refuseIfViewLocked()) return;
+    app_.zoomHistory.push_back(app_.view);
+    app_.view.traceStart = std::min(t0, t1);
+    app_.view.traceEnd = std::max(t0, t1);
+    app_.view.sampleStart = std::min(s0, s1);
+    app_.view.sampleEnd = std::max(s0, s1);
+    segy::clampView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
+    if (notifyViewChanged_) notifyViewChanged_();
+    notifyStateChanged();
+    update();
+}
+
+void SegyCanvas::mouseDoubleClickEvent(QMouseEvent* event) {
+    if (event->button() != Qt::LeftButton) return;
+    if (app_.tool != ToolMode::Arrow && app_.tool != ToolMode::Pan) return;
+    zoomBandActive_ = false;
+    if (onPreviousZoom_) onPreviousZoom_();
+}
+
+void SegyCanvas::showFullView() {
+    if (!app_.loaded || refuseIfViewLocked()) return;
+    app_.zoomHistory.push_back(app_.view);
+    segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
+    if (notifyViewChanged_) notifyViewChanged_();
+    notifyStateChanged();
+    update();
+}
+
+void SegyCanvas::zoomByFactor(double factor) {
+    if (!app_.loaded || refuseIfViewLocked()) return;
+    const int insetWidth = std::max(1, plotAreaWidth());
+    IdentInsets insets = identInsets();
+    const int insetHeight = std::max(1, height() - (kCanvasMargin + insets.top) - (kCanvasMargin + insets.bottom));
+    app_.zoomHistory.push_back(app_.view);
+    segy::zoomAt(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace, insetWidth,
+                 insetHeight, insetWidth / 2, insetHeight / 2, factor);
+    if (notifyViewChanged_) notifyViewChanged_();
+    notifyStateChanged();
+    update();
+}
 
 void SegyCanvas::wheelEvent(QWheelEvent* event) {
     if (!app_.loaded) return;
@@ -6083,6 +6264,13 @@ void SegyCanvas::wheelEvent(QWheelEvent* event) {
     // Forward/up notches zoom in, matching the removed shells' convention.
     int notches = event->angleDelta().y() / 120;
     double factor = std::pow(1.15, double(-notches));
+    static QElapsedTimer wheelClock;
+    if (!wheelClock.isValid()) wheelClock.start();
+    if (wheelClock.elapsed() - lastWheelMs_ > 600) {
+        app_.zoomHistory.push_back(app_.view);
+        notifyStateChanged();
+    }
+    lastWheelMs_ = wheelClock.elapsed();
     segy::zoomAt(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace, insetWidth, insetHeight, px, py, factor);
     if (notifyViewChanged_) notifyViewChanged_();
     updateStatusBar();
@@ -6090,7 +6278,7 @@ void SegyCanvas::wheelEvent(QWheelEvent* event) {
 }
 
 void SegyCanvas::keyPressEvent(QKeyEvent* event) {
-    if (event->key() == Qt::Key_R && app_.loaded) {
+    if ((event->key() == Qt::Key_R || event->key() == Qt::Key_Home) && app_.loaded) {
         if (refuseIfViewLocked()) return;
         segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
         if (notifyViewChanged_) notifyViewChanged_();
@@ -6383,52 +6571,37 @@ MainWindow::MainWindow() : QMainWindow() {
     }
     panelB_.canvas->setActivatedCallback([this]() { setActivePanel(&panelB_); });
 
-    // Same dummy-vs-real split as the removed shells: only File > Open and
-    // File > Exit do anything. The rest are deliberately inert placeholders
-    // (an addAction() with no connected slot literally does nothing when
-    // clicked) so the app has the conventional File/Edit/Selection/View/
-    // Help menu bar of a normal desktop app without pretending to implement
-    // features that don't exist yet.
+    // The menu bar, in order (see native/README.md, "Menus"). Everything is
+    // filled in below or after the toolbar, once the actions exist.
     QMenu* fileMenu = menuBar()->addMenu("&File");
+    QMenu* viewMenu = menuBar()->addMenu("&View");
+    QMenu* analysisMenu = menuBar()->addMenu("&Analysis");
+    QMenu* processingMenu = menuBar()->addMenu("&Processing");
+    QMenu* horizonsMenu = menuBar()->addMenu("Hori&zons");
+    QMenu* windowMenu = menuBar()->addMenu("&Window");
+    QMenu* helpMenu = menuBar()->addMenu("&Help");
+
     QAction* openAction = fileMenu->addAction("&Open...");
     openAction->setShortcut(QKeySequence::Open);
     connect(openAction, &QAction::triggered, this, &MainWindow::openFile);
-    QAction* openAttributeAction = fileMenu->addAction("Read &Attribute SEG-Y...");
+    QAction* openAttributeAction = fileMenu->addAction("Open &Velocity or Attribute...");
+    openAttributeAction->setToolTip("A velocity model or another attribute SEG-Y, for the dataset list");
     connect(openAttributeAction, &QAction::triggered, this, &MainWindow::openAttributeFile);
-    QAction* saveSegyAction = fileMenu->addAction("&Save SEG-Y...");
+    QAction* saveSegyAction = fileMenu->addAction("&Save As SEG-Y...");
     saveSegyAction->setShortcut(QKeySequence::Save);
     connect(saveSegyAction, &QAction::triggered, this, &MainWindow::openSaveSegyDialog);
-    // Text/Binary Header entries are inserted before this separator once
-    // their toolbar actions exist -- see the menu mirrors after the toolbar.
-    QAction* fileExitSeparator = fileMenu->addSeparator();
+    fileMenu->addSeparator();
+    QMenu* headersMenu = fileMenu->addMenu("&Headers"); // filled after the toolbar
+    fileMenu->addSeparator();
+    QAction* preferencesAction = fileMenu->addAction("&Preferences...");
+    preferencesAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Comma));
+    connect(preferencesAction, &QAction::triggered, this, &MainWindow::openPreferencesDialog);
+    fileMenu->addSeparator();
     QAction* exitAction = fileMenu->addAction("E&xit");
+    exitAction->setShortcut(QKeySequence::Quit);
     connect(exitAction, &QAction::triggered, qApp, &QApplication::quit);
 
-    // Undo/Redo removed for now (per the original ask) -- nothing in this
-    // app is undoable yet; Calculator and the filters (Processing menu,
-    // below) produce a *new* dataset each time rather than modifying one
-    // in place.
-    QMenu* editMenu = menuBar()->addMenu("&Edit");
-    editMenu->addAction("Cu&t");
-    editMenu->addAction("&Copy");
-    editMenu->addAction("&Paste");
-    editMenu->addSeparator();
-    QAction* preferencesAction = editMenu->addAction("&Preferences...");
-    connect(preferencesAction, &QAction::triggered, this, &MainWindow::openPreferencesDialog);
-
-    QMenu* selectionMenu = menuBar()->addMenu("&Selection");
-    selectionMenu->addAction("Select &All");
-    selectionMenu->addAction("&Clear Selection");
-
-    QMenu* viewMenu = menuBar()->addMenu("&View");
-    viewMenu->addAction("Zoom &In");
-    viewMenu->addAction("Zoom &Out");
-    viewMenu->addAction("&Reset View");
-    viewMenu->addSeparator();
-    viewMenu->addAction("&Fit to Window");
-    viewMenu->addSeparator();
-
-    QMenu* domainMenu = viewMenu->addMenu("Data &Domain");
+    QMenu* domainMenu = new QMenu("Data &Domain", this);
     {
         QActionGroup* domainGroup = new QActionGroup(this);
         domainTimeAction_ = domainMenu->addAction("&Time");
@@ -6443,7 +6616,7 @@ MainWindow::MainWindow() : QMainWindow() {
         connect(domainTimeAction_, &QAction::triggered, this, [this]() { setDatasetDomain(activePanel_, false); });
         connect(domainDepthAction_, &QAction::triggered, this, [this]() { setDatasetDomain(activePanel_, true); });
     }
-    QMenu* datasetLabelsMenu = viewMenu->addMenu("Dataset Labels");
+    QMenu* datasetLabelsMenu = new QMenu("Dataset &Labels", this);
     QActionGroup* datasetLabelsGroup = new QActionGroup(this);
     const std::pair<const char*, DatasetLabelPosition> labelPositions[] = {
         {"Top Left", DatasetLabelPosition::TopLeft},
@@ -6475,21 +6648,20 @@ MainWindow::MainWindow() : QMainWindow() {
     // reachable from the toolbar's single toggle button now (below); both
     // drive the same app_.display.seismicMode and stay in sync with each
     // other.
-    QMenu* seismicDisplayMenu = viewMenu->addMenu("&Seismic Display");
     QActionGroup* seismicDisplayMenuGroup = new QActionGroup(this);
-    variableDensityMenuAction_ = seismicDisplayMenu->addAction("&Variable Density");
+    variableDensityMenuAction_ = new QAction("&Variable Density", this);
     variableDensityMenuAction_->setCheckable(true);
     variableDensityMenuAction_->setChecked(true);
     seismicDisplayMenuGroup->addAction(variableDensityMenuAction_);
     connect(variableDensityMenuAction_, &QAction::triggered, this,
             [this]() { setSeismicMode(segy::SeismicDisplayMode::VariableDensity); });
-    wiggleMenuAction_ = seismicDisplayMenu->addAction("&Wiggle");
+    wiggleMenuAction_ = new QAction("&Wiggle", this);
     wiggleMenuAction_->setCheckable(true);
     seismicDisplayMenuGroup->addAction(wiggleMenuAction_);
     connect(wiggleMenuAction_, &QAction::triggered, this,
             [this]() { setSeismicMode(segy::SeismicDisplayMode::Wiggle); });
 
-    QAction* wiggleInfillAction = viewMenu->addAction("Wiggle &Infill");
+    QAction* wiggleInfillAction = new QAction("Wiggle &Infill", this);
     wiggleInfillAction->setCheckable(true);
     wiggleInfillAction->setChecked(true);
     connect(wiggleInfillAction, &QAction::triggered, this, [this](bool checked) {
@@ -6499,50 +6671,51 @@ MainWindow::MainWindow() : QMainWindow() {
         }
     });
 
-    // Filled in after the toolbar, like the File/Selection/View additions --
-    // created here only so it lands in the menu bar before Help.
-    QMenu* analysisMenu = menuBar()->addMenu("&Analysis");
-
-    // Processing: everything that computes a new dataset.
-    QMenu* processingMenu = menuBar()->addMenu("&Processing");
-    QMenu* horizonsMenu = menuBar()->addMenu("Hori&zons");
+    // Processing: everything that computes a new dataset, one flat list.
     QAction* calculatorAction = processingMenu->addAction("&Calculator...");
     connect(calculatorAction, &QAction::triggered, this, &MainWindow::openCalculatorDialog);
-    QMenu* filterMenu = processingMenu->addMenu("&Filter");
-    QAction* bandpassAction = filterMenu->addAction("&Bandpass...");
+    processingMenu->addSeparator();
+    QAction* bandpassAction = processingMenu->addAction("&Bandpass Filter...");
     connect(bandpassAction, &QAction::triggered, this, &MainWindow::openBandpassDialog);
-    filterMenu->addSeparator();
-    QAction* integrationAction = filterMenu->addAction("Trace &Integration...");
+    QAction* integrationAction = processingMenu->addAction("&Integration...");
     connect(integrationAction, &QAction::triggered, this, [this]() { openTraceDerivative(true); });
-    QAction* differentiationAction = filterMenu->addAction("Trace &Differentiation...");
+    QAction* differentiationAction = processingMenu->addAction("&Differentiation...");
     connect(differentiationAction, &QAction::triggered, this, [this]() { openTraceDerivative(false); });
+    QAction* scaleAction = processingMenu->addAction("&Scale...");
+    connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
+    processingMenu->addSeparator();
+    QAction* timeDepthAction = processingMenu->addAction("&Time-Depth Conversion...");
+    connect(timeDepthAction, &QAction::triggered, this, &MainWindow::openTimeDepthConversion);
+
+    // Horizons (Pick Horizon goes first, once the toolbar action exists).
     {
         QAction* managerAction = horizonsMenu->addAction("Horizon &Manager...");
         connect(managerAction, &QAction::triggered, this, &MainWindow::openHorizonManager);
         horizonsMenu->addSeparator();
         QAction* seabedAction = horizonsMenu->addAction("Auto-pick &Seabed");
         connect(seabedAction, &QAction::triggered, this, [this]() { autoPickSeabed(activePanel_); });
-        QAction* toHeaderAction = horizonsMenu->addAction("Write Horizon to &Header...");
-        connect(toHeaderAction, &QAction::triggered, this, [this]() { writeHorizonToHeader(activePanel_); });
-        horizonsMenu->addSeparator();
         flattenAction_ = horizonsMenu->addAction("&Flatten...");
         flattenAction_->setCheckable(true);
-        flattenAction_->setToolTip("Flatten on a horizon or a header time; switch off to go back");
+        flattenAction_->setToolTip("Flatten on a horizon or a header time; choose again to go back");
         connect(flattenAction_, &QAction::triggered, this, [this](bool on) { toggleFlatten(activePanel_, on); });
         horizonsMenu->addSeparator();
-        QAction* exportAction = horizonsMenu->addAction("&Export Horizon (CSV)...");
-        connect(exportAction, &QAction::triggered, this, [this]() { exportHorizon(activePanel_); });
-        QAction* importAction = horizonsMenu->addAction("&Import Horizon (CSV)...");
+        QAction* importAction = horizonsMenu->addAction("&Import Horizon...");
         connect(importAction, &QAction::triggered, this, [this]() { importHorizon(activePanel_); });
+        QAction* exportAction = horizonsMenu->addAction("&Export Horizon...");
+        connect(exportAction, &QAction::triggered, this, [this]() { exportHorizon(activePanel_); });
+        QAction* toHeaderAction = horizonsMenu->addAction("Write Horizon to &Header...");
+        connect(toHeaderAction, &QAction::triggered, this, [this]() { writeHorizonToHeader(activePanel_); });
     }
-    QAction* timeDepthAction = processingMenu->addAction("&Time-Depth Conversion...");
-    connect(timeDepthAction, &QAction::triggered, this, &MainWindow::openTimeDepthConversion);
-    QMenu* traceMathMenu = processingMenu->addMenu("Trace &Math");
-    QAction* scaleAction = traceMathMenu->addAction("&Scale...");
-    connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
 
-    QMenu* helpMenu = menuBar()->addMenu("&Help");
-    helpMenu->addAction("&About");
+    // Help.
+    QAction* mouseHelpAction = helpMenu->addAction("&Mouse and Keyboard");
+    mouseHelpAction->setShortcut(QKeySequence::HelpContents);
+    connect(mouseHelpAction, &QAction::triggered, this, &MainWindow::showMouseAndKeyboardHelp);
+    QAction* reportBugAction = helpMenu->addAction("&Report a Bug...");
+    connect(reportBugAction, &QAction::triggered, this, &MainWindow::reportBug);
+    helpMenu->addSeparator();
+    QAction* aboutAction = helpMenu->addAction("&About TraceLab");
+    connect(aboutAction, &QAction::triggered, this, &MainWindow::showAbout);
 
     // Toolbar: docks below the menu bar automatically, though Preferences
     // can move it to any of the 4 sides (see applyToolbarPosition, called
@@ -6557,15 +6730,24 @@ MainWindow::MainWindow() : QMainWindow() {
     toolbar_->setIconSize(QSize(20, 20));
     QToolBar* toolbar = toolbar_; // short alias for the many toolbar->... calls below
 
-    zoomAction_ = toolbar->addAction(iconMagnifier(true), "Zoom");
-    zoomAction_->setToolTip("Zoom to the selection box (without one: draw a box, then it zooms)");
-    zoomAction_->setEnabled(false);
-    connect(zoomAction_, &QAction::triggered, this, &MainWindow::zoomToBox);
-
-    moozAction_ = toolbar->addAction(iconMagnifier(false), "Mooz");
-    moozAction_->setToolTip("Undo the last box zoom");
+    // Zooming is done with the mouse (see native/README.md, "Zoom"): the
+    // toolbar keeps the two steps you can't do with a gesture alone.
+    moozAction_ = toolbar->addAction(iconMagnifier(false), "Previous Zoom");
+    moozAction_->setToolTip("Back to the previous zoom (Backspace, or double-click the display)");
     moozAction_->setEnabled(false);
     connect(moozAction_, &QAction::triggered, this, &MainWindow::moozBack);
+
+    fullViewAction_ = toolbar->addAction(iconFullView(), "Full View");
+    fullViewAction_->setToolTip("Show all traces and samples (Home)");
+    connect(fullViewAction_, &QAction::triggered, this, [this]() {
+        for (Panel* p : targetPanels()) p->canvas->showFullView();
+    });
+
+    // Zoom to the selection box: in the View menu only.
+    zoomAction_ = new QAction(iconMagnifier(true), "Zoom to Box", this);
+    zoomAction_->setToolTip("Zoom to the selection box");
+    zoomAction_->setEnabled(false);
+    connect(zoomAction_, &QAction::triggered, this, &MainWindow::zoomToBox);
 
     toolbarSeparators_.push_back(toolbar->addSeparator());
 
@@ -6574,30 +6756,30 @@ MainWindow::MainWindow() : QMainWindow() {
 
     panAction_ = toolbar->addAction(iconHand(), "Pan");
     panAction_->setCheckable(true);
-    panAction_->setToolTip("Drag to pan");
+    panAction_->setToolTip("Pan: drag to move the view (the middle mouse button pans in any tool)");
     toolGroup->addAction(panAction_);
     connect(panAction_, &QAction::triggered, this, [this](bool checked) {
         for (Panel* p : targetPanels()) {
             p->app.tool = checked ? ToolMode::Pan : ToolMode::Arrow;
-            p->canvas->setCursor(checked ? QCursor(Qt::OpenHandCursor) : QCursor(Qt::ArrowCursor));
+            p->canvas->unsetCursorForTool();
         }
         refreshToolChrome();
     });
 
     boxSelectAction_ = toolbar->addAction(iconRectangle(), "Box Select");
     boxSelectAction_->setCheckable(true);
-    boxSelectAction_->setToolTip("Draw a box to zoom into, or edit/delete the existing one");
+    boxSelectAction_->setToolTip("Box Select: draw a box for Spectrum, Histogram and the other analyses; "
+                                 "drag a corner to change it, middle-click to delete it");
     toolGroup->addAction(boxSelectAction_);
     // Pick: click anchors of the active horizon (Horizons menu, Horizon Manager).
     pickAction_ = toolbar->addAction(iconPick(), "Pick Horizon");
     pickAction_->setCheckable(true);
-    pickAction_->setToolTip("Pick a horizon: click points, the traces in between are tracked; right click removes "
-                            "the nearest point");
+    pickAction_->setToolTip("Pick Horizon: click points, the traces between are tracked; right-click removes a point");
     toolGroup->addAction(pickAction_);
     connect(pickAction_, &QAction::triggered, this, [this](bool checked) {
         for (Panel* p : targetPanels()) {
             p->app.tool = checked ? ToolMode::Pick : ToolMode::Arrow;
-            p->canvas->setCursor(checked ? QCursor(Qt::CrossCursor) : QCursor(Qt::ArrowCursor));
+            p->canvas->unsetCursorForTool();
         }
         if (checked && app_->loaded) activeHorizonFor(activePanel_, true);
         refreshHorizonManager();
@@ -6605,11 +6787,11 @@ MainWindow::MainWindow() : QMainWindow() {
     });
     // The Horizons menu exists already (created with the menu bar, before
     // the toolbar): mirror the tool there, after Horizon Manager.
-    addMenuMirror(horizonsMenu, pickAction_, "&Pick Horizon", horizonsMenu->actions().value(1));
+    addMenuMirror(horizonsMenu, pickAction_, "&Pick Horizon", horizonsMenu->actions().value(0));
     connect(boxSelectAction_, &QAction::triggered, this, [this](bool checked) {
         for (Panel* p : targetPanels()) {
             p->app.tool = checked ? ToolMode::BoxSelect : ToolMode::Arrow;
-            p->canvas->setCursor(checked ? makeBoxSelectCursor() : QCursor(Qt::ArrowCursor));
+            p->canvas->unsetCursorForTool();
         }
         refreshToolChrome();
     });
@@ -6631,7 +6813,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // something renderer.cpp/wiggle.cpp know about.
     flipHorizontalAction_ = toolbar->addAction(iconArrowsHorizontal(), "Flip Horizontal");
     flipHorizontalAction_->setCheckable(true);
-    flipHorizontalAction_->setToolTip("Mirror the display left-right");
+    flipHorizontalAction_->setToolTip("Flip Horizontal: mirror the display left to right");
     connect(flipHorizontalAction_, &QAction::triggered, this, [this](bool checked) {
         for (Panel* p : targetPanels()) p->app.display.flipHorizontal = checked;
         refreshToolChrome();
@@ -6643,7 +6825,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // app_->idents every time it's opened (same approach as
     // toolbarMoreMenu_), not persisted, not kept live-in-sync.
     identsAction_ = toolbar->addAction(iconIdents(), "Idents");
-    identsAction_->setToolTip("Trace-header rows/plot, and lines on the seismic");
+    identsAction_->setToolTip("Idents: trace-header values above and below the display");
     connect(identsAction_, &QAction::triggered, this, [this]() {
         QMenu menu(this);
         populateIdentsMenu(menu);
@@ -6668,7 +6850,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // "Gain" label was replaced with a disclosure button (caret-up-down)
     // that opens the fuller DisplayParametersDialog.
     gainDetailAction_ = toolbar->addAction(iconAdjustments(), "Display Parameters");
-    gainDetailAction_->setToolTip("Display parameters");
+    gainDetailAction_->setToolTip("Display Parameters: colours, clip, wiggle and gain");
     connect(gainDetailAction_, &QAction::triggered, this, [this]() {
         // Binds to whichever panel is active the *first* time this opens
         // (a C++ reference can't be rebound to the other panel later if
@@ -6729,7 +6911,7 @@ MainWindow::MainWindow() : QMainWindow() {
     gainValueLabel_ = new QLabel(this);
     gainValueLabel_->setAlignment(Qt::AlignCenter);
     gainValueLabel_->setContentsMargins(0, 0, 0, 0);
-    gainValueLabel_->setStyleSheet("color: #d4d4d8; font-size: 10px;");
+    gainValueLabel_->setStyleSheet(themed("color: #d4d4d8; font-size: 10px;"));
     // Its fixed width (matching a toolbar icon button's actual rendered
     // width, so it lines up flush instead of leaving dead space beside it)
     // is set later, in applyToolbarPosition() -- querying any button's
@@ -6752,7 +6934,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // the panel already had -- it only flips agcEnabled.
     agcAction_ = toolbar->addAction(iconAgc(), "AGC");
     agcAction_->setCheckable(true);
-    agcAction_->setToolTip("Automatic Gain Control (right-click for window/level and computed gain)");
+    agcAction_->setToolTip("AGC: automatic gain control (right-click for its window and level)");
     connect(agcAction_, &QAction::triggered, this, [this](bool checked) {
         segy::AmplitudeProcessing processing = app_->display.processing;
         processing.agcEnabled = checked;
@@ -6768,12 +6950,30 @@ MainWindow::MainWindow() : QMainWindow() {
     // delete) apply to both panels at once instead of just the active
     // one, icon swaps lock-open/lock-closed accordingly.
     spectrumAction_ = toolbar->addAction(iconChartArea(), "Spectrum");
-    spectrumAction_->setToolTip("Spectrum parameters");
-    connect(spectrumAction_, &QAction::triggered, this, [this]() { openSpectrumDialog(); });
+    // Like every other analysis: the result straight away (of the active
+    // selection box, or else the whole dataset); its window has Parameters.
+    spectrumAction_->setToolTip("Amplitude spectrum of the selection box, or of the whole dataset");
+    connect(spectrumAction_, &QAction::triggered, this, [this]() {
+        if (!activePanel_->app.loaded) {
+            flashStatusMessage("No data selected");
+            return;
+        }
+        const SelectionBox* box = activeBox(activePanel_->app);
+        activePanel_->app.spectrum.useSelection = box && box->complete;
+        computeAndShowSpectrum(activePanel_);
+    });
 
     histogramAction_ = toolbar->addAction(iconChartBar(), "Histogram");
-    histogramAction_->setToolTip("Histogram parameters");
-    connect(histogramAction_, &QAction::triggered, this, [this]() { openHistogramDialog(); });
+    histogramAction_->setToolTip("Amplitude histogram of the selection box, or of the whole dataset");
+    connect(histogramAction_, &QAction::triggered, this, [this]() {
+        if (!activePanel_->app.loaded) {
+            flashStatusMessage("No data selected");
+            return;
+        }
+        const SelectionBox* box = activeBox(activePanel_->app);
+        activePanel_->app.histogram.useSelection = box && box->complete;
+        computeAndShowHistogram(activePanel_);
+    });
 
     // Octave Band Display: bandpass-filters the active panel's *visible*
     // data into a row of 2^N Hz bands in a new window -- see
@@ -6781,7 +6981,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // default 2-128 Hz range (the window's own Source/Min/Max controls
     // change it afterward), rather than a parameters dialog first.
     octaveBandAction_ = toolbar->addAction(iconColumns3(), "Octave Bands");
-    octaveBandAction_->setToolTip("Octave band display of the visible data");
+    octaveBandAction_->setToolTip("The view split into octave bands (2-128 Hz)");
     connect(octaveBandAction_, &QAction::triggered, this, [this]() {
         if (!activePanel_->app.loaded) {
             flashStatusMessage("No data selected");
@@ -6795,7 +6995,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // Autocorrelation: opens on the active panel's visible data with the
     // dialog's current length (200 ms the first time).
     autocorrelationAction_ = toolbar->addAction(iconAutocorrelation(), "Autocorrelation");
-    autocorrelationAction_->setToolTip("Autocorrelation of the visible data (lags -L..+L)");
+    autocorrelationAction_->setToolTip("Autocorrelation of the view");
     connect(autocorrelationAction_, &QAction::triggered, this, [this]() {
         if (!activePanel_->app.loaded) {
             flashStatusMessage("No data selected");
@@ -6807,15 +7007,15 @@ MainWindow::MainWindow() : QMainWindow() {
 
     // x-f display: per-trace amplitude spectra of what's on screen, in dB
     // (see native/README.md). Toggling off restores the seismic display.
-    xfAction_ = toolbar->addAction(iconXf(), "x-f display");
+    xfAction_ = toolbar->addAction(iconXf(), "x-f Display");
     xfAction_->setCheckable(true);
-    xfAction_->setToolTip("x-f display: amplitude spectrum (dB) of every trace in view, 0 to Nyquist");
+    xfAction_->setToolTip("x-f Display: the amplitude spectrum (dB) of every trace in view; click again to go back");
     connect(xfAction_, &QAction::triggered, this, [this](bool checked) { toggleXf(activePanel_, checked); });
 
     // Text/Binary header viewers: no settings to keep sticky, so these just
     // re-populate from whichever panel is active on every click, unlike
     // Histogram/Spectrum/Display Parameters above.
-    ebcdicHeaderAction_ = toolbar->addAction(iconFileDescription(), "Text Header");
+    ebcdicHeaderAction_ = new QAction(iconFileDescription(), "Text Header", this);
     ebcdicHeaderAction_->setToolTip("EBCDIC text header (80x40, fixed)");
     connect(ebcdicHeaderAction_, &QAction::triggered, this, [this]() {
         if (!app_->loaded) return;
@@ -6835,7 +7035,7 @@ MainWindow::MainWindow() : QMainWindow() {
         ebcdicHeaderWidget_->activateWindow();
     });
 
-    binaryHeaderAction_ = toolbar->addAction(iconFileDigit(), "Binary Header");
+    binaryHeaderAction_ = new QAction(iconFileDigit(), "Binary Header", this);
     binaryHeaderAction_->setToolTip("Binary header fields");
     connect(binaryHeaderAction_, &QAction::triggered, this, [this]() {
         if (!app_->loaded) return;
@@ -6852,7 +7052,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // independent pan/zoom/tool state -- see the Panel struct.
     splitViewAction_ = toolbar->addAction(iconLayoutColumns(), "Split View");
     splitViewAction_->setCheckable(true);
-    splitViewAction_->setToolTip("Split into two panels (right-click for split options)");
+    splitViewAction_->setToolTip("Two panels (Window menu: layout, lock, linked crosshair)");
     connect(splitViewAction_, &QAction::triggered, this, [this](bool checked) {
         panelB_.canvas->setVisible(checked);
         // A QSplitter remembers the hidden widget's old handle position
@@ -6884,7 +7084,7 @@ MainWindow::MainWindow() : QMainWindow() {
 
     lockAction_ = toolbar->addAction(iconLock(false), "Lock Panels");
     lockAction_->setCheckable(true);
-    lockAction_->setToolTip("Lock: apply toolbar/menu actions to both panels at once");
+    lockAction_->setToolTip("Lock Panels: toolbar and menu actions apply to both panels");
     connect(lockAction_, &QAction::triggered, this, [this](bool checked) {
         lockAction_->setIcon(iconLock(checked));
     });
@@ -6893,7 +7093,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // given new axis ranges until unlocked -- see SegyCanvas's guards.
     lockViewAction_ = toolbar->addAction(iconLockView(), "Lock View");
     lockViewAction_->setCheckable(true);
-    lockViewAction_->setToolTip("Lock View: fix this panel's view so zoom/unzoom/pan can't change it");
+    lockViewAction_->setToolTip("Lock View: this panel's zoom and position stay fixed");
     connect(lockViewAction_, &QAction::triggered, this, [this](bool checked) {
         app_->viewLocked = checked;
         flashStatusMessage(checked ? "View locked" : "View unlocked");
@@ -6915,7 +7115,7 @@ MainWindow::MainWindow() : QMainWindow() {
     sidebarToggleAction_ = toolbar->addAction(iconSidebarCollapse(), "Sidebar");
     sidebarToggleAction_->setCheckable(true);
     sidebarToggleAction_->setChecked(true);
-    sidebarToggleAction_->setToolTip("Show/hide the sidebar");
+    sidebarToggleAction_->setToolTip("Sidebar: the values under the cursor");
 
     // Toolbar overflow (see native/README.md) -- every plain icon button
     // above is a candidate; the gain slider/value-label/spacer are
@@ -6923,11 +7123,11 @@ MainWindow::MainWindow() : QMainWindow() {
     // to begin with, and a QWidgetAction's widget can't be safely shown
     // in both the toolbar and a menu at once -- it would just move).
     toolbarOverflowCandidates_ = {
-        zoomAction_,          moozAction_,         panAction_,         boxSelectAction_, pickAction_,
+        moozAction_,          fullViewAction_,     panAction_,         boxSelectAction_, pickAction_,
         seismicModeToolbarAction_, flipHorizontalAction_, identsAction_,  gainDetailAction_, gainUpAction_,
         gainDownAction_,      agcAction_,          spectrumAction_,     histogramAction_,   octaveBandAction_,
         autocorrelationAction_, xfAction_,
-        ebcdicHeaderAction_,  binaryHeaderAction_, splitViewAction_,   lockAction_, lockViewAction_,
+        splitViewAction_,   lockAction_, lockViewAction_,
         sidebarToggleAction_,
     };
     // A QToolButton parented to toolbar_ but deliberately NOT added via
@@ -6971,8 +7171,8 @@ MainWindow::MainWindow() : QMainWindow() {
     // is the sidebar toggle past the expanding spacer, which has no
     // separator of its own.
     toolbarItems_ = {
-        {"zoom", "Zoom to Selection", 0, {zoomAction_}},
-        {"mooz", "Undo Zoom (Mooz)", 0, {moozAction_}},
+        {"mooz", "Previous Zoom", 0, {moozAction_}},
+        {"fullView", "Full View", 0, {fullViewAction_}},
         {"pan", "Pan", 1, {panAction_}},
         {"boxSelect", "Box Select", 1, {boxSelectAction_}},
         {"pick", "Pick Horizon", 1, {pickAction_}},
@@ -6986,9 +7186,7 @@ MainWindow::MainWindow() : QMainWindow() {
         {"histogram", "Histogram", 4, {histogramAction_}},
         {"octaveBands", "Octave Bands", 4, {octaveBandAction_}},
         {"autocorrelation", "Autocorrelation", 4, {autocorrelationAction_}},
-        {"xf", "x-f display", 4, {xfAction_}},
-        {"textHeader", "Text Header", 4, {ebcdicHeaderAction_}},
-        {"binaryHeader", "Binary Header", 4, {binaryHeaderAction_}},
+        {"xf", "x-f Display", 4, {xfAction_}},
         {"splitView", "Split View", 4, {splitViewAction_}},
         {"lock", "Lock Panels", 4, {lockAction_}},
         {"lockView", "Lock View", 4, {lockViewAction_}},
@@ -7012,36 +7210,51 @@ MainWindow::MainWindow() : QMainWindow() {
         });
     }
 
-    // Every toolbar function in a menu too (COPILOT.md item 1), so hiding
-    // a button never strands its feature -- mirrors, not the toolbar
-    // actions themselves; see addMenuMirror's comment.
-    fileMenu->insertSeparator(fileExitSeparator);
-    addMenuMirror(fileMenu, ebcdicHeaderAction_, "&Text Header", fileExitSeparator);
-    {
-        QAction* rangesAction = new QAction("Trace Header &Ranges...", fileMenu);
-        fileMenu->insertAction(fileExitSeparator, rangesAction);
-        connect(rangesAction, &QAction::triggered, this, &MainWindow::openTraceHeaderRanges);
-        QAction* inspectorAction = new QAction("Trace &Inspector...", fileMenu);
-        fileMenu->insertAction(fileExitSeparator, inspectorAction);
-        connect(inspectorAction, &QAction::triggered, this, &MainWindow::openTraceInspector);
-    }
-    addMenuMirror(fileMenu, binaryHeaderAction_, "&Binary Header", fileExitSeparator);
+    // Every toolbar function is in a menu too (COPILOT.md item 1), so hiding
+    // a button never strands its feature -- mirrors, not the toolbar actions
+    // themselves; see addMenuMirror's comment.
 
-    selectionMenu->addSeparator();
-    addMenuMirror(selectionMenu, boxSelectAction_, "&Box Select Tool");
-    addMenuMirror(selectionMenu, zoomAction_, "&Zoom to Selection");
-    addMenuMirror(selectionMenu, moozAction_, "&Undo Zoom (Mooz)");
+    // File > Headers.
+    addMenuMirror(headersMenu, ebcdicHeaderAction_, "&Text Header");
+    addMenuMirror(headersMenu, binaryHeaderAction_, "&Binary Header");
+    headersMenu->addSeparator();
+    QAction* rangesAction = headersMenu->addAction("Trace Header &Ranges...");
+    connect(rangesAction, &QAction::triggered, this, &MainWindow::openTraceHeaderRanges);
+    QAction* inspectorAction = headersMenu->addAction("Trace &Inspector...");
+    connect(inspectorAction, &QAction::triggered, this, &MainWindow::openTraceInspector);
 
+    // View: zoom, tools, display, amplitude, annotations, appearance.
+    QAction* zoomInAction = viewMenu->addAction("Zoom &In");
+    zoomInAction->setShortcut(QKeySequence::ZoomIn);
+    connect(zoomInAction, &QAction::triggered, this, [this]() {
+        for (Panel* p : targetPanels()) p->canvas->zoomByFactor(1.0 / 1.5);
+    });
+    QAction* zoomOutAction = viewMenu->addAction("Zoom &Out");
+    zoomOutAction->setShortcut(QKeySequence::ZoomOut);
+    connect(zoomOutAction, &QAction::triggered, this, [this]() {
+        for (Panel* p : targetPanels()) p->canvas->zoomByFactor(1.5);
+    });
+    QAction* previousZoomMenuAction = addMenuMirror(viewMenu, moozAction_, "&Previous Zoom");
+    previousZoomMenuAction->setShortcut(Qt::Key_Backspace);
+    QAction* fullViewMenuAction = addMenuMirror(viewMenu, fullViewAction_, "&Full View");
+    fullViewMenuAction->setShortcut(Qt::Key_Home);
+    addMenuMirror(viewMenu, zoomAction_, "Zoom to &Box");
     viewMenu->addSeparator();
-    addMenuMirror(viewMenu, panAction_, "&Pan Tool");
+    addMenuMirror(viewMenu, panAction_, "P&an");
+    addMenuMirror(viewMenu, boxSelectAction_, "Bo&x Select");
+    viewMenu->addSeparator();
+    viewMenu->addAction(variableDensityMenuAction_);
+    viewMenu->addAction(wiggleMenuAction_);
+    viewMenu->addAction(wiggleInfillAction);
     addMenuMirror(viewMenu, flipHorizontalAction_, "Flip &Horizontal");
-    addMenuMirror(viewMenu, gainDetailAction_, "Display &Parameters...");
-
+    viewMenu->addSeparator();
     QMenu* gainMenu = viewMenu->addMenu("&Gain");
-    QAction* gainUpMenuAction = gainMenu->addAction("&Increase Gain (+3 dB)");
+    QAction* gainUpMenuAction = gainMenu->addAction("&Increase (+3 dB)");
+    gainUpMenuAction->setShortcut(QKeySequence(Qt::Key_Plus));
     connect(gainUpMenuAction, &QAction::triggered, this,
             [this]() { setGainDb(std::clamp(app_->display.gainDb + 3.0, -6.0, 24.0)); });
-    QAction* gainDownMenuAction = gainMenu->addAction("&Decrease Gain (-3 dB)");
+    QAction* gainDownMenuAction = gainMenu->addAction("&Decrease (-3 dB)");
+    gainDownMenuAction->setShortcut(QKeySequence(Qt::Key_Minus));
     connect(gainDownMenuAction, &QAction::triggered, this,
             [this]() { setGainDb(std::clamp(app_->display.gainDb - 3.0, -6.0, 24.0)); });
     gainMenu->addSeparator();
@@ -7050,41 +7263,53 @@ MainWindow::MainWindow() : QMainWindow() {
     addMenuMirror(viewMenu, agcAction_, "&AGC");
     QAction* amplitudeProcessingMenuAction = viewMenu->addAction("A&mplitude Processing...");
     connect(amplitudeProcessingMenuAction, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
-
+    addMenuMirror(viewMenu, gainDetailAction_, "Display &Parameters...");
+    viewMenu->addSeparator();
     // Rebuilt on every open, from whichever panel is active right then.
     QMenu* identsMenu = viewMenu->addMenu("I&dents");
     connect(identsMenu, &QMenu::aboutToShow, this, [this, identsMenu]() {
         clearMenuCompletely(identsMenu);
         populateIdentsMenu(*identsMenu);
     });
-
+    viewMenu->addMenu(datasetLabelsMenu);
+    viewMenu->addMenu(domainMenu);
     viewMenu->addSeparator();
-    addMenuMirror(viewMenu, splitViewAction_, "Split &View");
-    QMenu* splitLayoutMenu = viewMenu->addMenu("Split &Layout");
-    QAction* split50MenuAction = splitLayoutMenu->addAction("Set Split &50%");
-    connect(split50MenuAction, &QAction::triggered, this, &MainWindow::resetSplitToHalf);
-    splitLayoutMenu->addSeparator();
+    QMenu* themeMenu = viewMenu->addMenu("&Theme");
+    {
+        QActionGroup* themeGroup = new QActionGroup(this);
+        QAction* darkTheme = themeMenu->addAction("&Dark");
+        QAction* greyTheme = themeMenu->addAction("&Windows Grey");
+        for (QAction* a : {darkTheme, greyTheme}) {
+            a->setCheckable(true);
+            themeGroup->addAction(a);
+        }
+        (lightTheme() ? greyTheme : darkTheme)->setChecked(true);
+        connect(darkTheme, &QAction::triggered, this, [this]() { switchTheme(UiTheme::Dark); });
+        connect(greyTheme, &QAction::triggered, this, [this]() { switchTheme(UiTheme::WindowsGrey); });
+    }
+    addMenuMirror(viewMenu, sidebarToggleAction_, "Side&bar");
+
+    // Window: the two panels.
+    addMenuMirror(windowMenu, splitViewAction_, "&Split View");
     QActionGroup* splitOrientationGroup = new QActionGroup(this);
-    QAction* sideBySideAction = splitLayoutMenu->addAction("&Side by Side");
-    QAction* stackedAction = splitLayoutMenu->addAction("S&tacked");
+    QAction* sideBySideAction = windowMenu->addAction("Side by Si&de");
+    QAction* stackedAction = windowMenu->addAction("S&tacked");
     for (QAction* a : {sideBySideAction, stackedAction}) {
         a->setCheckable(true);
         a->setActionGroup(splitOrientationGroup);
     }
     connect(sideBySideAction, &QAction::triggered, this, [this]() { setSplitOrientation(Qt::Horizontal); });
     connect(stackedAction, &QAction::triggered, this, [this]() { setSplitOrientation(Qt::Vertical); });
-    connect(splitLayoutMenu, &QMenu::aboutToShow, this, [this, sideBySideAction, stackedAction]() {
+    QAction* split50MenuAction = windowMenu->addAction("&Equal Sizes");
+    connect(split50MenuAction, &QAction::triggered, this, &MainWindow::resetSplitToHalf);
+    connect(windowMenu, &QMenu::aboutToShow, this, [this, sideBySideAction, stackedAction]() {
         sideBySideAction->setChecked(splitter_->orientation() == Qt::Horizontal);
         stackedAction->setChecked(splitter_->orientation() == Qt::Vertical);
     });
-    addMenuMirror(viewMenu, lockAction_, "Lock Pa&nels");
-    addMenuMirror(viewMenu, lockViewAction_, "Lock &View");
-    viewMenu->addSeparator();
-    QAction* sendZoomAction = viewMenu->addAction("Send &Zoom to Other Panel");
-    connect(sendZoomAction, &QAction::triggered, this, &MainWindow::sendZoomToOtherPanel);
-    QAction* sendDisplayAction = viewMenu->addAction("Send &Display to Other Panel");
-    connect(sendDisplayAction, &QAction::triggered, this, &MainWindow::sendDisplayToOtherPanel);
-    linkedCrosshairAction_ = viewMenu->addAction("Linked &Crosshair");
+    windowMenu->addSeparator();
+    addMenuMirror(windowMenu, lockAction_, "&Lock Panels");
+    addMenuMirror(windowMenu, lockViewAction_, "Lock &View");
+    linkedCrosshairAction_ = windowMenu->addAction("Linked &Crosshair");
     linkedCrosshairAction_->setCheckable(true);
     linkedCrosshairAction_->setChecked(true);
     linkedCrosshairAction_->setToolTip("Show the cursor position of one panel as a crosshair on the other");
@@ -7093,32 +7318,35 @@ MainWindow::MainWindow() : QMainWindow() {
             for (Panel* p : {&panelA_, &panelB_}) p->canvas->setLinkedCrosshair(false, 0.0, 0.0);
         }
     });
+    windowMenu->addSeparator();
+    QAction* sendZoomAction = windowMenu->addAction("Send &Zoom to Other Panel");
+    connect(sendZoomAction, &QAction::triggered, this, &MainWindow::sendZoomToOtherPanel);
+    QAction* sendDisplayAction = windowMenu->addAction("Send &Display to Other Panel");
+    connect(sendDisplayAction, &QAction::triggered, this, &MainWindow::sendDisplayToOtherPanel);
 
-    viewMenu->addSeparator();
-    addMenuMirror(viewMenu, sidebarToggleAction_, "Side&bar");
-
-    addMenuMirror(analysisMenu, spectrumAction_, "&Spectrum...");
-    addMenuMirror(analysisMenu, histogramAction_, "&Histogram...");
+    // Analysis: on what is in view (or the active selection box).
+    addMenuMirror(analysisMenu, spectrumAction_, "&Spectrum");
+    addMenuMirror(analysisMenu, histogramAction_, "&Histogram");
+    addMenuMirror(analysisMenu, autocorrelationAction_, "&Autocorrelation");
     addMenuMirror(analysisMenu, octaveBandAction_, "&Octave Bands");
-    addMenuMirror(analysisMenu, autocorrelationAction_, "&Autocorrelation...");
     analysisMenu->addSeparator();
-    addMenuMirror(analysisMenu, xfAction_, "&x-f display");
-    fkAction_ = analysisMenu->addAction("&f-k display...");
-    connect(fkAction_, &QAction::triggered, this, [this]() {
-        if (!activePanel_->app.loaded) {
-            flashStatusMessage("No data selected");
-            return;
-        }
-        computeAndShowFk(activePanel_);
-    });
-    analysisMenu->addSeparator();
-    signalNoiseAction_ = analysisMenu->addAction("Signal/&Noise...");
+    signalNoiseAction_ = analysisMenu->addAction("Signal/&Noise");
     connect(signalNoiseAction_, &QAction::triggered, this, [this]() {
         if (!activePanel_->app.loaded) {
             flashStatusMessage("No data selected");
             return;
         }
         computeAndShowSignalNoise(activePanel_);
+    });
+    analysisMenu->addSeparator();
+    addMenuMirror(analysisMenu, xfAction_, "&x-f Display");
+    fkAction_ = analysisMenu->addAction("&f-k Display");
+    connect(fkAction_, &QAction::triggered, this, [this]() {
+        if (!activePanel_->app.loaded) {
+            flashStatusMessage("No data selected");
+            return;
+        }
+        computeAndShowFk(activePanel_);
     });
 
     // Right dock: relocated color bar (Amplitude Scale) and hover readout
@@ -7134,7 +7362,7 @@ MainWindow::MainWindow() : QMainWindow() {
 
     auto sectionLabel = [](const QString& text) {
         QLabel* label = new QLabel(text);
-        label->setStyleSheet("color: #7a7c82; font-size: 11px; letter-spacing: 1px; font-weight: 600;");
+        label->setStyleSheet(themed("color: #7a7c82; font-size: 11px; letter-spacing: 1px; font-weight: 600;"));
         return label;
     };
     auto valueRow = [&](const QString& caption, QLabel*& valueOut) {
@@ -7142,9 +7370,9 @@ MainWindow::MainWindow() : QMainWindow() {
         QHBoxLayout* rowLayout = new QHBoxLayout(row);
         rowLayout->setContentsMargins(0, 0, 0, 0);
         QLabel* captionLabel = new QLabel(caption);
-        captionLabel->setStyleSheet("color: #9a9ca3;");
+        captionLabel->setStyleSheet(themed("color: #9a9ca3;"));
         valueOut = new QLabel("--");
-        valueOut->setStyleSheet("color: #d4d4d8; font-family: monospace;");
+        valueOut->setStyleSheet(themed("color: #d4d4d8; font-family: monospace;"));
         rowLayout->addWidget(captionLabel);
         rowLayout->addStretch();
         rowLayout->addWidget(valueOut);
@@ -7162,15 +7390,9 @@ MainWindow::MainWindow() : QMainWindow() {
     // Amplitude Scale used to be a section here; it's now an overlay
     // legend on the canvas itself (see AmplitudeScaleWidget / setAmplitudeScale).
 
-    dockLayout->addWidget(sectionLabel("QC NOTES"));
-    QLabel* qcPlaceholder = new QLabel("No issues flagged on this line yet.");
-    qcPlaceholder->setWordWrap(true);
-    qcPlaceholder->setStyleSheet("color: #68696e; font-style: italic;");
-    dockLayout->addWidget(qcPlaceholder);
-
     dockLayout->addStretch();
     dock_->setWidget(dockContent);
-    dock_->setFixedWidth(260);
+    dock_->setFixedWidth(220);
     addDockWidget(Qt::RightDockWidgetArea, dock_);
     connect(sidebarToggleAction_, &QAction::triggered, dock_, &QDockWidget::setVisible);
 
@@ -7183,6 +7405,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // view at all.
     for (Panel* p : {&panelA_, &panelB_}) {
         p->canvas->setStatusWidgets(statusBar(), [this]() { refreshToolChrome(); });
+        p->canvas->setPreviousZoomCallback([this]() { moozBack(); });
         p->canvas->setHoverInfoCallback([this](const HoverInfo& info) { updateHoverInfo(info); });
         p->canvas->setDatasetLoadedCallback([this](std::shared_ptr<Dataset> dataset) {
             registerDataset(std::move(dataset));
@@ -7617,10 +7840,10 @@ void MainWindow::flashStatusMessage(const QString& text) {
     // as text) -- so the color override has to go on the status bar's own
     // QSS instead, which does take precedence over the app-wide
     // "QStatusBar { color: ... }" rule for as long as it's set.
-    statusBar()->setStyleSheet("QStatusBar { color: #e8905a; }");
+    statusBar()->setStyleSheet(themed("QStatusBar { color: #e8905a; }"));
     statusBar()->showMessage(text, 2000);
     QTimer::singleShot(2000, this, [this]() {
-        statusBar()->setStyleSheet(QString());
+        statusBar()->setStyleSheet(themed(QString()));
         if (canvas_) canvas_->refreshStatusBar();
     });
 }
@@ -7815,6 +8038,187 @@ void MainWindow::refreshToolChrome() {
     refreshRecomputeButtons();
 }
 
+void SegyCanvas::unsetCursorForTool() {
+    switch (app_.tool) {
+    case ToolMode::Pan: setCursor(Qt::OpenHandCursor); break;
+    case ToolMode::BoxSelect: setCursor(makeBoxSelectCursor()); break;
+    case ToolMode::Pick: setCursor(Qt::CrossCursor); break;
+    default: setCursor(Qt::ArrowCursor); break;
+    }
+}
+
+void MainWindow::showAbout() {
+    QDialog dialog(this);
+    dialog.setWindowTitle("About TraceLab");
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(28, 24, 28, 20);
+    layout->setSpacing(12);
+    QHBoxLayout* head = new QHBoxLayout();
+    QLabel* logo = new QLabel();
+    logo->setPixmap(QIcon(QStringLiteral(":/app_icon.png")).pixmap(56, 56));
+    head->addWidget(logo);
+    QLabel* title = new QLabel(QString("<div style='font-size:20px; font-weight:600;'>TraceLab</div>"
+                                       "<div style='color:%1;'>2D SEG-Y viewer and QC</div>")
+                                   .arg(QColor(kSecondaryTextColor).name()));
+    head->addWidget(title, 1);
+    layout->addLayout(head);
+    const QString text = QString(
+        "<p>Built %1 with Qt %2 (running %3), %4.</p>"
+        "<p style='margin-top:10px;'><b>Libraries</b></p>"
+        "<table cellspacing='0' cellpadding='2'>"
+        "<tr><td>Qt %3</td><td>&nbsp;&nbsp;LGPL v3</td><td>&nbsp;&nbsp;user interface, SVG icons</td></tr>"
+        "<tr><td>Tabler Icons</td><td>&nbsp;&nbsp;MIT</td><td>&nbsp;&nbsp;toolbar icons</td></tr>"
+        "<tr><td>C++17 standard library</td><td></td><td>&nbsp;&nbsp;everything else</td></tr>"
+        "</table>"
+        "<p style='margin-top:10px;'>The SEG-Y reading, IBM-float decoding (scalar and AVX2), pyramid, renderer, "
+        "FFT, Butterworth filters, spectra, f-k, SIGCOR signal/noise, horizon tracking and time-depth "
+        "conversion are written for this application, with no third-party code.</p>"
+        "<p style='margin-top:10px;'>Header layouts: SEG-Y rev 1.0 and rev 2.0 (SEG), Shell SEGY trace "
+        "identing V2.1.</p>")
+        .arg(QString::fromLatin1(__DATE__), QString::fromLatin1(QT_VERSION_STR), QString::fromLatin1(qVersion()),
+             QSysInfo::buildCpuArchitecture());
+    QLabel* body = new QLabel(text);
+    body->setWordWrap(true);
+    body->setTextFormat(Qt::RichText);
+    layout->addWidget(body);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    QPushButton* bug = new QPushButton("Report a Bug...");
+    QPushButton* close = new QPushButton("Close");
+    close->setDefault(true);
+    buttons->addWidget(bug);
+    buttons->addStretch();
+    buttons->addWidget(close);
+    layout->addLayout(buttons);
+    connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(bug, &QPushButton::clicked, &dialog, [this, &dialog]() {
+        dialog.accept();
+        reportBug();
+    });
+    dialog.resize(520, dialog.sizeHint().height());
+    dialog.exec();
+}
+
+void MainWindow::reportBug() {
+    // The developer's address, by the user's own request: reports go to
+    // them. Opens the default mail client with what helps reproduce it.
+    static const QString kDeveloper = QStringLiteral("jeroengoudswaard@gmail.com");
+    QDialog dialog(this);
+    dialog.setWindowTitle("Report a Bug");
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(20, 18, 20, 16);
+    QLabel* intro = new QLabel("What happened, and what did you expect? Your mail program opens with this text "
+                               "and the details below, ready to send.");
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+    QPlainTextEdit* description = new QPlainTextEdit();
+    description->setPlaceholderText("Steps: 1. Open ...  2. ...  What went wrong: ...");
+    description->setMinimumHeight(140);
+    layout->addWidget(description);
+    QString details = QString("TraceLab, built %1\nQt %2 on %3 (%4)\nTheme: %5\n")
+                          .arg(QString::fromLatin1(__DATE__), QString::fromLatin1(qVersion()),
+                               QSysInfo::prettyProductName(), QSysInfo::currentCpuArchitecture(),
+                               lightTheme() ? "Windows Grey" : "Dark");
+    if (app_->loaded) {
+        details += QString("Dataset: %1 (%2 traces x %3 samples, %4 us, format %5)\n")
+                       .arg(QString::fromStdString(app_->foreground->name))
+                       .arg(app_->foreground->traceCount)
+                       .arg(app_->foreground->binHeader.samplesPerTrace)
+                       .arg(app_->foreground->binHeader.sampleIntervalUs)
+                       .arg(app_->foreground->binHeader.formatCode);
+    }
+    QLabel* detailsLabel = new QLabel(details.trimmed());
+    detailsLabel->setStyleSheet(themed("color: #9a9ca3;"));
+    layout->addWidget(detailsLabel);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    QLabel* address = new QLabel(QString("To: %1").arg(kDeveloper));
+    address->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    address->setStyleSheet(themed("color: #9a9ca3;"));
+    buttons->addWidget(address);
+    buttons->addStretch();
+    QPushButton* send = new QPushButton("Open in Mail");
+    QPushButton* cancel = new QPushButton("Cancel");
+    send->setDefault(true);
+    buttons->addWidget(send);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+    connect(send, &QPushButton::clicked, &dialog, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    dialog.resize(560, 360);
+    if (dialog.exec() != QDialog::Accepted) return;
+    QUrlQuery query;
+    query.addQueryItem("subject", "TraceLab bug report");
+    query.addQueryItem("body", description->toPlainText().trimmed() + "\n\n--\n" + details);
+    QUrl url(QStringLiteral("mailto:") + kDeveloper);
+    url.setQuery(query);
+    if (!QDesktopServices::openUrl(url)) {
+        QMessageBox::information(this, "Report a Bug",
+                                 QString("No mail program is set up. Please send the report to %1.").arg(kDeveloper));
+    }
+}
+
+void MainWindow::showMouseAndKeyboardHelp() {
+    QDialog dialog(this);
+    dialog.setWindowTitle("Mouse and Keyboard");
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(24, 20, 24, 16);
+    const QString muted = QColor(kSecondaryTextColor).name();
+    auto row = [&muted](const QString& key, const QString& what) {
+        return QString("<tr><td style='padding:3px 18px 3px 0; white-space:nowrap;'><b>%1</b></td>"
+                       "<td style='padding:3px 0; color:%3;'>%2</td></tr>").arg(key, what, muted);
+    };
+    QString html = "<p><b>Zoom works the same on the seismic and on every chart.</b></p><table>";
+    html += row("Wheel", "zoom in or out around the cursor");
+    html += row("Drag", "zoom to the rectangle (the pointer tool; on charts always)");
+    html += row("Double-click", "back to the previous zoom");
+    html += row("Right-click", "Previous Zoom, Full View, Axis Ranges...");
+    html += row("Middle-drag", "pan (in any tool but Box Select)");
+    html += "</table><p style='margin-top:12px;'><b>Tools</b> (toolbar; click again for the pointer)</p><table>";
+    html += row("Pan", "drag to move");
+    html += row("Box Select", "a box for the analyses; drag a corner to change it, middle-click to delete");
+    html += row("Pick Horizon", "click points, the traces between are tracked; right-click removes a point");
+    html += "</table><p style='margin-top:12px;'><b>Keys</b></p><table>";
+    html += row("Backspace", "previous zoom");
+    html += row("Home or R", "full view");
+    html += row("Ctrl + / Ctrl -", "zoom in / out");
+    html += row("+ / -", "gain up / down 3 dB");
+    html += row("Ctrl O, Ctrl S", "open, save as SEG-Y");
+    html += row("Ctrl ,", "preferences");
+    html += row("F1", "this window");
+    html += "</table>";
+    QLabel* body = new QLabel(html);
+    body->setTextFormat(Qt::RichText);
+    layout->addWidget(body);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    buttons->addStretch();
+    QPushButton* close = new QPushButton("Close");
+    close->setDefault(true);
+    buttons->addWidget(close);
+    layout->addLayout(buttons);
+    connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
+    dialog.exec();
+}
+
+void MainWindow::switchTheme(UiTheme theme) {
+    if (theme == uiTheme()) return;
+    QSettings settings(QDir::homePath() + "/.segyread_settings", QSettings::IniFormat);
+    settings.setValue("uiTheme", theme == UiTheme::WindowsGrey ? "windowsGrey" : "dark");
+    settings.sync();
+    const QMessageBox::StandardButton answer = QMessageBox::question(
+        this, "Theme", "TraceLab restarts to change the theme. Computed datasets and horizons that you have not "
+                       "saved are lost.\n\nRestart now?",
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+    if (answer != QMessageBox::Yes) {
+        flashStatusMessage("The new theme applies the next time TraceLab starts");
+        return;
+    }
+    QStringList arguments;
+    if (app_->loaded && !app_->foreground->filePath.empty() && app_->foreground->attribute.empty()) {
+        arguments << QString::fromStdWString(app_->foreground->filePath.wstring());
+    }
+    QProcess::startDetached(QCoreApplication::applicationFilePath(), arguments);
+    qApp->quit();
+}
+
 void MainWindow::refreshWindowTitle() { setWindowTitle(QString("TraceLab") + datasetTitleSuffix(*app_)); }
 
 void MainWindow::setSeismicMode(segy::SeismicDisplayMode mode) {
@@ -7923,7 +8327,7 @@ void MainWindow::updateHoverInfo(const HoverInfo& info) {
         amplitudeValueLabel_->setText("--");
         return;
     }
-    traceValueLabel_->setText(QString::number(info.traceIdx));
+    traceValueLabel_->setText(QString::number(info.traceIdx + 1)); // 1-based, like the status line and CSV
     seqValueLabel_->setText(QString::number(info.seqNum));
     if (timeCaptionLabel_) timeCaptionLabel_->setText(info.frequencyAxis ? "Frequency" : info.depthAxis ? "Depth" : "Time");
     if (info.frequencyAxis) {
@@ -8430,7 +8834,7 @@ bool askProcessingValue(QWidget* parent, const QString& title, const QString& la
     layout->addLayout(grid);
     QLabel* hint = new QLabel(explanation);
     hint->setWordWrap(true);
-    hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+    hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
     layout->addWidget(hint);
     QHBoxLayout* buttons = new QHBoxLayout();
     buttons->addStretch();
@@ -9344,7 +9748,7 @@ protected:
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this);
-        painter.fillRect(rect(), QColor(0x1e, 0x1f, 0x22));
+        painter.fillRect(rect(), tc(QColor(0x1e, 0x1f, 0x22)));
         const QRect plot = plotRect();
         painter.fillRect(plot, Qt::white);
         if (samples_.size() < 2 || plot.height() <= 0) return;
@@ -9372,7 +9776,7 @@ protected:
         for (size_t i = 0; i < samples_.size(); ++i) line << QPointF(xFor(samples_[i]), yFor(i));
         painter.setPen(QPen(Qt::black, 1.0));
         painter.drawPolyline(line);
-        painter.setPen(QPen(QColor(0x9a, 0x9c, 0xa3), 1, Qt::DashLine));
+        painter.setPen(QPen(tc(QColor(0x9a, 0x9c, 0xa3)), 1, Qt::DashLine));
         painter.drawLine(QPointF(centre, plot.top()), QPointF(centre, plot.bottom()));
         if (marker_ >= 0 && marker_ < int(samples_.size())) {
             const double y = yFor(size_t(marker_));
@@ -9396,7 +9800,7 @@ private:
 TraceInspectorWindow::TraceInspectorWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
     setWindowTitle("Trace Inspector");
     resize(1100, 760);
-    setStyleSheet("background-color: #1e1f22;");
+    setStyleSheet(themed("background-color: #1e1f22;"));
     QVBoxLayout* layout = new QVBoxLayout(this);
     QHBoxLayout* top = new QHBoxLayout();
     top->setSpacing(10);
@@ -9432,7 +9836,7 @@ TraceInspectorWindow::TraceInspectorWindow(QWidget* parent) : QWidget(parent, Qt
     top->addStretch();
     layout->addLayout(top);
     summaryLabel_ = new QLabel();
-    summaryLabel_->setStyleSheet("color: #9a9ca3;");
+    summaryLabel_->setStyleSheet(themed("color: #9a9ca3;"));
     layout->addWidget(summaryLabel_);
 
     QSplitter* splitter = new QSplitter(Qt::Horizontal, this);
@@ -9523,7 +9927,7 @@ void TraceInspectorWindow::refresh() {
         for (int col = 0; col < 4; ++col) {
             QTableWidgetItem* item = new QTableWidgetItem(cells[col]);
             if (col == 1 || col == 2) item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            if (unused) item->setForeground(QColor(0x7a, 0x7c, 0x82));
+            if (unused) item->setForeground(tc(QColor(0x7a, 0x7c, 0x82)));
             if (col == 3) item->setToolTip(f.description);
             headerTable_->setItem(row, col, item);
         }
@@ -9565,13 +9969,13 @@ void TraceInspectorWindow::refresh() {
     samplesTable_->setColumnWidth(0, samplesTable_->fontMetrics().horizontalAdvance(QString::number(std::max(1, samples))) + 24);
     samplesTable_->resizeColumnToContents(1);
     static_cast<TraceWiggleWidget*>(wiggle_)->setSamples(values, intervalMs);
-    summaryLabel_->setText(QString("Trace %1 of %2  |  %3 samples, %4 us, data format %5  |  %6")
+    (void)standard; // shown in the Definition box already
+    summaryLabel_->setText(QString::fromUtf8("Trace %1 of %2   \xc2\xb7   %3 samples every %4 ms   \xc2\xb7   format %5")
                                .arg(trace_ + 1)
                                .arg(dataset_->traceCount)
                                .arg(samples)
-                               .arg(dataset_->binHeader.sampleIntervalUs)
-                               .arg(dataset_->binHeader.formatCode)
-                               .arg(segy::headerStandardName(standard)));
+                               .arg(dataset_->binHeader.sampleIntervalUs / 1000.0)
+                               .arg(dataset_->binHeader.formatCode));
 }
 
 void MainWindow::openTraceInspector() {
@@ -9679,7 +10083,7 @@ void MainWindow::openTraceHeaderRanges() {
             headerRangesDataset_ = ds;
             if (!headerRangesWidget_) {
                 headerRangesWidget_ = new QWidget(this, Qt::Window);
-                headerRangesWidget_->setStyleSheet("background-color: #1e1f22;");
+                headerRangesWidget_->setStyleSheet(themed("background-color: #1e1f22;"));
                 QVBoxLayout* layout = new QVBoxLayout(headerRangesWidget_);
                 QTableWidget* table = new QTableWidget(headerRangesWidget_);
                 table->setObjectName("rangesTable");
@@ -9688,8 +10092,8 @@ void MainWindow::openTraceHeaderRanges() {
                 table->horizontalHeaderItem(4)->setToolTip(
                     "Increment: keep every value min, min + inc, min + 2 inc, ... (1 = all)");
                 // The in-cell editor in the dark style (it was white on light grey).
-                table->setStyleSheet("QTableWidget QLineEdit { background: #2b2d30; color: #f0f2f5; "
-                                     "border: 1px solid #e8905a; selection-background-color: #4a3626; }");
+                table->setStyleSheet(themed("QTableWidget QLineEdit { background: #2b2d30; color: #f0f2f5; "
+                                     "border: 1px solid #e8905a; selection-background-color: #4a3626; }"));
                 table->verticalHeader()->hide();
                 table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed |
                                        QAbstractItemView::AnyKeyPressed);
@@ -9697,7 +10101,7 @@ void MainWindow::openTraceHeaderRanges() {
                 layout->addWidget(table);
                 QLabel* hint = new QLabel("Edit Min/Max/Inc of an ident (double-click) to select a subset; changed "
                                           "cells turn orange. Inc 2 keeps every second value from Min.");
-                hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+                hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
                 layout->addWidget(hint);
                 // Up to three sort keys, each ascending or descending.
                 QGridLayout* sortGrid = new QGridLayout();
@@ -9784,8 +10188,8 @@ void MainWindow::openTraceHeaderRanges() {
                 connect(table, &QTableWidget::itemChanged, this, [](QTableWidgetItem* item) {
                     if (item->column() < 2 || item->column() > 4) return;
                     const bool changed = item->text().trimmed() != QString::number(item->data(Qt::UserRole).toLongLong());
-                    item->setBackground(changed ? QColor(0x4a, 0x36, 0x26) : QColor(Qt::transparent));
-                    item->setForeground(changed ? QColor(0xe8, 0x90, 0x5a) : QColor(0xd4, 0xd4, 0xd8));
+                    item->setBackground(changed ? tc(QColor(0x4a, 0x36, 0x26)) : QColor(Qt::transparent));
+                    item->setForeground(changed ? tc(QColor(0xe8, 0x90, 0x5a)) : tc(QColor(0xd4, 0xd4, 0xd8)));
                 });
                 headerRangesWidget_->resize(820, 560);
             }
@@ -9818,7 +10222,7 @@ void MainWindow::openTraceHeaderRanges() {
                     if (col == 2) item->setData(Qt::UserRole, qlonglong(row.min));
                     if (col == 3) item->setData(Qt::UserRole, qlonglong(row.max));
                     if (col == 4) item->setData(Qt::UserRole, qlonglong(1));
-                    if (constant) item->setForeground(QColor(0x7a, 0x7c, 0x82));
+                    if (constant) item->setForeground(tc(QColor(0x7a, 0x7c, 0x82)));
                     table->setItem(r, col, item);
                 }
             }
@@ -9894,7 +10298,7 @@ void MainWindow::runSubsetSort(Panel* panel, std::shared_ptr<Dataset> dataset, s
 }
 
 namespace {
-const QColor kHorizonColors[] = {QColor(0xe8, 0x90, 0x5a), QColor(0x19, 0x9e, 0x70), QColor(0xd5, 0x51, 0x81),
+const QColor kHorizonColors[] = {tc(QColor(0xe8, 0x90, 0x5a)), QColor(0x19, 0x9e, 0x70), QColor(0xd5, 0x51, 0x81),
                                  QColor(0xc9, 0x85, 0x00), QColor(0x90, 0x85, 0xe9), QColor(0x39, 0x87, 0xe5)};
 
 segy::HorizonTraceFetch fetchFor(const std::shared_ptr<Dataset>& ds) {
@@ -10182,7 +10586,7 @@ void MainWindow::toggleFlatten(Panel* panel, bool on) {
     grid->addWidget(source, 0, 1, 1, 3);
     HeaderTimeControls header = addHeaderTimeControls(grid, 1, headerTimeByte_, headerTimeSize_, headerTimeMsPerUnit_);
     QLabel* summary = new QLabel();
-    summary->setStyleSheet("color: #9a9ca3;");
+    summary->setStyleSheet(themed("color: #9a9ca3;"));
     grid->addWidget(summary, 2, 0, 1, 4);
     QDoubleSpinBox* reference = new QDoubleSpinBox();
     reference->setRange(-1e7, 1e7);
@@ -10518,7 +10922,7 @@ void MainWindow::openTimeDepthConversion() {
     QLabel* note = new QLabel("The velocity model is matched on CDP and interpolated between CDPs; "
                               "its own sampling is interpolated linearly. Velocities in m/s.");
     note->setWordWrap(true);
-    note->setStyleSheet("color: #9a9ca3;");
+    note->setStyleSheet(themed("color: #9a9ca3;"));
     layout->addWidget(note);
     QLineEdit* nameEdit = new QLineEdit(QString::fromStdString(ds->name) + (toDepth ? "_depth" : "_time"));
     layout->addWidget(nameEdit);
@@ -10680,7 +11084,7 @@ void MainWindow::openHorizonManager() {
     if (!horizonManager_) {
         horizonManager_ = new QWidget(this, Qt::Window);
         horizonManager_->setWindowTitle("Horizon Manager");
-        horizonManager_->setStyleSheet("background-color: #1e1f22;");
+        horizonManager_->setStyleSheet(themed("background-color: #1e1f22;"));
         QVBoxLayout* layout = new QVBoxLayout(horizonManager_);
         QListWidget* list = new QListWidget();
         list->setObjectName("horizonList");
@@ -10753,7 +11157,7 @@ void MainWindow::openHorizonManager() {
         QLabel* hint = new QLabel("Pick Horizon tool: click points along an event; the traces in between are tracked. "
                                   "Right click removes the nearest point.");
         hint->setWordWrap(true);
-        hint->setStyleSheet("color: #9a9ca3; font-size: 11px;");
+        hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
         layout->addWidget(hint);
 
         connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -11191,6 +11595,15 @@ void MainWindow::openAttributeFile() {
 
 namespace {
 
+// Windows Grey: native controls; just what our own widgets need on top.
+QString windowsGreyStyleSheet() {
+    return QStringLiteral(R"(
+        QToolBar { spacing: 4px; padding: 4px; border-bottom: 1px solid #d0d0d0; }
+        QToolButton:checked { background: #cce4f7; border: 1px solid #cce4f7; border-radius: 4px; }
+        QStatusBar { border-top: 1px solid #d0d0d0; }
+    )");
+}
+
 // "Dark Pro" app-wide QSS, applied once in main() -- the seismic canvas
 // itself paints its own pixels directly and is unaffected by this.
 QString darkStyleSheet() {
@@ -11206,7 +11619,7 @@ QString darkStyleSheet() {
         QToolBar QLabel { color: #9a9ca3; }
         QToolButton { background: transparent; border-radius: 6px; padding: 6px 10px; color: #d4d4d8; border: 1px solid transparent; }
         QToolButton:hover { background: #3c3f41; }
-        QToolButton:checked { background: #4a3626; color: #e8905a; border: 1px solid #e8905a; }
+        QToolButton:checked { background: #4a3626; color: #e8905a; border: 1px solid #4a3626; }
         QStatusBar { background: #17181a; color: #c7c9cc; }
         QStatusBar::item { border: none; }
         QDockWidget { background: #2b2d30; color: #d4d4d8; }
@@ -11320,6 +11733,12 @@ int main(int argc, char** argv) {
     }
 #endif
     ProfilingApplication app(argc, argv);
+    {
+        // The theme is fixed for the session (View > Theme restarts the app).
+        QSettings settings(QDir::homePath() + "/.segyread_settings", QSettings::IniFormat);
+        segyqt::setUiTheme(settings.value("uiTheme").toString() == "windowsGrey" ? segyqt::UiTheme::WindowsGrey
+                                                                                   : segyqt::UiTheme::Dark);
+    }
     // Window/taskbar icon on both platforms -- compiled in via app_icon.qrc
     // (native/assets/icons/LEESMIJ.md), so this doesn't depend on the built
     // executable's location at runtime. The Windows exe's own icon
@@ -11330,14 +11749,37 @@ int main(int argc, char** argv) {
         // Disabled text is drawn embossed with the palette's Light colour on
         // Windows (a white shadow: "Selection" looked doubled and blurry on
         // the dark background). Make that shadow the background colour.
-        QPalette palette = app.palette();
-        palette.setColor(QPalette::Disabled, QPalette::Light, QColor(0x1e, 0x1f, 0x22));
-        palette.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x68, 0x69, 0x6e));
-        palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x68, 0x69, 0x6e));
-        app.setPalette(palette);
+        if (!segyqt::lightTheme()) {
+            QPalette palette = app.palette();
+            palette.setColor(QPalette::Disabled, QPalette::Light, QColor(0x1e, 0x1f, 0x22));
+            palette.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x68, 0x69, 0x6e));
+            palette.setColor(QPalette::Disabled, QPalette::Text, QColor(0x68, 0x69, 0x6e));
+            app.setPalette(palette);
+        }
     }
-    app.setStyleSheet(darkStyleSheet());
-    segyqt::installDarkTitleBars(app); // Windows: black title bars on every window, matching the theme
+    if (segyqt::lightTheme()) {
+        // Windows Grey: the native Windows controls, light palette, and only
+        // the few rules our own widgets need.
+        app.setStyle(QStringLiteral("windows11"));
+        // Windows 11 light surfaces, not the classic beige standard palette.
+        QPalette palette = app.style()->standardPalette();
+        palette.setColor(QPalette::Window, QColor(0xf0, 0xf0, 0xf0));
+        palette.setColor(QPalette::Button, QColor(0xfb, 0xfb, 0xfb));
+        palette.setColor(QPalette::Base, Qt::white);
+        palette.setColor(QPalette::AlternateBase, QColor(0xf7, 0xf7, 0xf7));
+        palette.setColor(QPalette::WindowText, QColor(0x1b, 0x1b, 0x1b));
+        palette.setColor(QPalette::Text, QColor(0x1b, 0x1b, 0x1b));
+        palette.setColor(QPalette::ButtonText, QColor(0x1b, 0x1b, 0x1b));
+        palette.setColor(QPalette::Highlight, QColor(0x00, 0x67, 0xc0));
+        palette.setColor(QPalette::HighlightedText, Qt::white);
+        palette.setColor(QPalette::ToolTipBase, Qt::white);
+        palette.setColor(QPalette::ToolTipText, QColor(0x1b, 0x1b, 0x1b));
+        app.setPalette(palette);
+        app.setStyleSheet(windowsGreyStyleSheet());
+    } else {
+        app.setStyleSheet(darkStyleSheet());
+        segyqt::installDarkTitleBars(app); // Windows: black title bars on every window, matching the theme
+    }
     segyqt::MainWindow window;
     if (segyqt::perfEnabled()) {
         // Which action started what follows in the log.

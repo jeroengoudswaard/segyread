@@ -1,4 +1,5 @@
 #include "viewer_qt_icons.h"
+#include "theme.h"
 
 #include "colormap.h"
 
@@ -14,7 +15,7 @@ namespace segyqt {
 
 namespace {
 
-const QColor kIconStrokeColor(0xc7, 0xc9, 0xcc);
+QColor iconStrokeColor() { return tc(QColor(0xc7, 0xc9, 0xcc)); }
 
 // Renders a small embedded SVG (real icons from Tabler Icons,
 // https://tabler.io/icons, MIT licensed -- see native/README.md) to a
@@ -25,14 +26,18 @@ const QColor kIconStrokeColor(0xc7, 0xc9, 0xcc);
 // real problem -- editing a raw path string here is directly WYSIWYG with
 // the source icon, unlike guessing Bezier control points from a preview.
 QIcon renderSvgIcon(QString svg) {
-    svg.replace(QStringLiteral("currentColor"), kIconStrokeColor.name());
+    svg.replace(QStringLiteral("currentColor"), iconStrokeColor().name());
     QSvgRenderer renderer(svg.toUtf8());
-    QPixmap pm(24, 24);
-    pm.fill(Qt::transparent);
-    QPainter p(&pm);
-    renderer.render(&p);
-    p.end();
-    return QIcon(pm);
+    QIcon icon;
+    for (int size : {24, 48, 72}) {
+        QPixmap pm(size, size);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        renderer.render(&p);
+        p.end();
+        icon.addPixmap(pm);
+    }
+    return icon;
 }
 
 } // namespace
@@ -119,6 +124,24 @@ QIcon iconAdjustments() {
 // named even though our panel is on the right (the source icon's own
 // panel is drawn on the left); the collapse-arrow meaning still reads
 // fine, and mirroring wasn't asked for.
+// Tabler Icons "arrows-maximize" (MIT): Full View.
+QIcon iconFullView() {
+    static const QString kSvg = QStringLiteral(R"(
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M16 4l4 0l0 4" />
+          <path d="M14 10l6 -6" />
+          <path d="M8 20l-4 0l0 -4" />
+          <path d="M4 20l6 -6" />
+          <path d="M16 20l4 0l0 -4" />
+          <path d="M14 14l6 6" />
+          <path d="M8 4l-4 0l0 4" />
+          <path d="M4 4l6 6" />
+        </svg>
+    )");
+    return renderSvgIcon(kSvg);
+}
+
 QIcon iconSidebarCollapse() {
     static const QString kSvg = QStringLiteral(R"(
         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
@@ -444,7 +467,7 @@ QIcon iconVariableDensityGlyph() {
         segy::divergingColormap(t, &b, &g, &r);
         gradient.setColorAt(double(i) / kStops, QColor(r, g, b));
     }
-    p.setPen(QPen(kIconStrokeColor, 1));
+    p.setPen(QPen(iconStrokeColor(), 1));
     p.setBrush(gradient);
     p.drawRoundedRect(swatch, 3, 3);
     p.end();

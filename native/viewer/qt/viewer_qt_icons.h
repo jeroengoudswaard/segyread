@@ -15,6 +15,7 @@ QIcon iconChartArea();
 QIcon iconChartBar();
 QIcon iconAdjustments();
 QIcon iconSidebarCollapse();
+QIcon iconFullView();
 QIcon iconLayoutColumns();
 QIcon iconLayoutRows();
 QIcon iconFileDescription();

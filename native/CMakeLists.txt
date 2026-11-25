@@ -98,6 +98,7 @@ set(SEGY_VIEWER_SOURCES
     viewer/qt/viewer_qt.cpp
     viewer/qt/viewer_qt_icons.h
     viewer/qt/viewer_qt_icons.cpp
+    viewer/qt/theme.cpp
     viewer/qt/dark_titlebar.h
     viewer/qt/dark_titlebar.cpp
     viewer/qt/app_icon.qrc # app window/taskbar icon, both platforms -- see app_icon.qrc

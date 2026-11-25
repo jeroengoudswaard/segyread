@@ -29,6 +29,7 @@
 #include "iirfilter.h"
 #include "chrome.h"
 #include "colormap.h"
+#include "theme.h"
 #include "loader.h"
 #include "renderer.h"
 #include "segy_mmap.h"
@@ -666,12 +667,16 @@ protected:
     void paintBox(QPainter& painter) const;
     void showAxisMenu(const QPoint& globalPos, const QString& xName, const QString& yName, int xDecimals,
                       int yDecimals);
+    // The app's zoom gestures (see native/README.md, "Zoom"): double-click
+    // goes back one zoom, the wheel zooms around the cursor.
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
 
     Range auto_;
     Range view_;
     bool manualRange_ = false;
     std::vector<Range> history_; // empty with manualRange_ = back to auto
-    bool boxMode_ = false;
+    bool boxMode_ = true; // dragging always draws a zoom box
     bool draggingBox_ = false;
     bool hasBox_ = false;
     QPointF boxA_, boxB_; // data coordinates
@@ -683,6 +688,8 @@ private:
     void applyAxisRanges(const Range& range);
     void applyUnzoom();
     void applyResetAxes();
+    void applyWheelRange(const Range& range, bool newGesture);
+    qint64 lastWheelMs_ = -1000000;
     std::function<void()> onZoomState_;
     std::vector<ZoomableChart*> group_;
 };
@@ -1511,6 +1518,12 @@ public:
     // time/frequency min/max) and Reset View. Both go on the zoom history,
     // so Mooz steps back.
     void showAxisRangeMenu(const QPoint& globalPos);
+    // View helpers for the View menu / toolbar (respect Lock View).
+    void showFullView();
+    void zoomByFactor(double factor); // around the centre; < 1 zooms in
+    void setPreviousZoomCallback(std::function<void()> callback) { onPreviousZoom_ = std::move(callback); }
+    // The cursor that goes with the current tool (pointer, pan, box, pick).
+    void unsetCursorForTool();
 
     // Linked crosshair: the other panel's cursor position (trace index and
     // time in ms), drawn as a dashed crosshair; valid = false hides it.
@@ -1530,6 +1543,14 @@ private:
     std::function<void()> onBoxCompleted_;
     std::function<void(double, double, bool)> onPick_;
     bool refuseIfViewLocked(); // flashes a status message when locked
+    // Zoom gestures (see native/README.md, "Zoom"): a left-drag rubber band
+    // in the pointer tool, middle-drag panning in any tool.
+    bool zoomBandActive_ = false;
+    QPoint zoomBandStart_, zoomBandEnd_;
+    bool middlePanning_ = false;
+    qint64 lastWheelMs_ = -1000000;
+    std::function<void()> onPreviousZoom_;
+    void finishZoomBand();
 public:
 
     // MainWindow owns the status bar (and, via the callback, the Del
@@ -1605,6 +1626,7 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void leaveEvent(QEvent* event) override;
 
@@ -1718,6 +1740,7 @@ private:
 
     QAction* zoomAction_ = nullptr;
     QAction* moozAction_ = nullptr;
+    QAction* fullViewAction_ = nullptr;
     QAction* panAction_ = nullptr;
     QAction* boxSelectAction_ = nullptr;
 
@@ -2084,6 +2107,11 @@ private:
     void toggleXf(Panel* panel, bool on);
     void refreshAfterDisplaySwap();
     void openPreferencesDialog();
+    // Help menu, and View > Theme (stored, then the app restarts).
+    void showAbout();
+    void reportBug();
+    void showMouseAndKeyboardHelp();
+    void switchTheme(UiTheme theme);
 
     void openCalculatorDialog();
     void openBandpassDialog();
