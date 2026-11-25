@@ -3263,6 +3263,55 @@ The core is `viewer/depth_conversion.h/.cpp` (Qt-free, tested):
   right. The depth axis reads "Depth (m)". Converting back to time gives
   the original section.
 
+### Performance pass on large files (6 GB, 603k traces)
+
+The test file was the PARAGON inline tiled 40 times: 603,280 traces of
+2501 samples, 5.9 GB, on a 16-thread machine with 16 GB of RAM. That is
+bigger than what stays in the file cache next to its scratch outputs.
+Every feature was run with the profiler on (below):
+
+| Operation | Before | After | What changed |
+|---|---|---|---|
+| Load + pyramid | 5.5 s | 4.2-5.7 s | unchanged (about 1 GB/s) |
+| x-f display, full view | 89 s, 4.9 GB scratch file | 0.36 s | at most 4096 evenly spaced traces (a screen has fewer columns); the stride is shown in the task label and the history |
+| Flatten, whole file | 33 s, ~5 GB of RAM | 7.9 s, streamed | chunked writer, see below |
+| Auto-pick seabed | 11.4 s | 0.9 s | first pass in parallel |
+| Trace Header Ranges | 12.5 s | 3.0 s | headers read in parallel into columns |
+| Flatten dialog on a header time | 18 s UI freeze | parallel, once per field | cached on the dataset |
+| Flatten off | 1.4 s UI freeze | 0.17 s | the 6 GB copy is unmapped on another thread |
+| Painting while a dataset loads | 1.9 s freeze | none | loading has its own thread pool |
+| Repaint, full view | 25-80 ms | 25-80 ms | horizons drawn without antialiasing when decimated |
+
+**Streaming writer.** Every computed dataset used to be built completely
+in memory (`std::vector<WriteTrace>` of all traces) before it was written.
+That means 6 GB of RAM for a 6 GB file, and a crash for a file larger than
+RAM. `segy::writeSegyFileChunked` (`segy_writer.h`) takes a fill function
+per chunk of 4096 traces instead. It keeps two chunks: one is filled, in
+parallel, while the other is written on a second thread. The Qt helper
+`streamTraces` wraps it. Calculator, Bandpass, Save SEG-Y, Integration/
+Differentiation/Scale, Subset/sort, Flatten, Write Horizon to Header and
+Time-Depth Conversion all use it. Calculator, Bandpass and Save were also
+serial before, and are now parallel. A test checks that the chunked writer
+produces the same bytes as the whole-file writer, for chunk sizes that do
+and do not divide the trace count.
+
+### Profiling (`SEGYREAD_PROFILE`)
+
+Set the environment variable `SEGYREAD_PROFILE` to a file path and the
+viewer appends a timing log to it:
+
+- each load (time, traces, MB) and its completion on the UI thread;
+- each background task (time in the background, and its completion);
+- each canvas paint of 20 ms or more, split into stages (raster render,
+  blit, ident rows, time axis + wiggle, overlay lines, selection boxes,
+  horizons), each stage from 5 ms;
+- every UI-thread stall: any event that takes 50 ms or more to handle,
+  with the event type and receiver class. A modal dialog counts as one
+  long event (the time it was open);
+- every triggered action, so the stall that follows can be attributed.
+
+It is off (no cost beyond a null check) when the variable is not set.
+
 ### Crosshair readout on spectrum plots (`DbCurveChart`)
 
 Spectrum and Signal/Noise share one dB-vs-frequency chart, `DbCurveChart`

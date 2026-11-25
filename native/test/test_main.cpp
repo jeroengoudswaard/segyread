@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <algorithm>
 #include <random>
@@ -2036,6 +2038,33 @@ void testWriteSegyFileRoundTrips() {
         }
     }
     file.close();
+
+    // Chunked writing gives the same bytes, for chunk sizes that do and do
+    // not divide the trace count (10 traces in chunks of 3, 5 and 64).
+    std::vector<segy::WriteTrace> many(10);
+    for (int t = 0; t < 10; ++t) {
+        many[size_t(t)].headerBytes.assign(segy::kTraceHeaderSize, uint8_t(t));
+        many[size_t(t)].samples.resize(8);
+        for (int s = 0; s < 8; ++s) many[size_t(t)].samples[size_t(s)] = float(t * 100 + s);
+    }
+    auto readAll = [](const std::filesystem::path& p) {
+        std::ifstream in(p, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    CHECK(segy::writeSegyFile(path, textHeader, binHeader, many, &error));
+    const std::string whole = readAll(path);
+    for (int64_t chunk : {3, 5, 64}) {
+        std::filesystem::path chunkedPath = std::filesystem::temp_directory_path() / "segyread_test_writer_chunked.sgy";
+        const bool chunkedOk = segy::writeSegyFileChunked(
+            chunkedPath, textHeader, binHeader, 10,
+            [&](int64_t begin, int64_t end, std::vector<segy::WriteTrace>& out) {
+                for (int64_t t = begin; t < end; ++t) out[size_t(t - begin)] = many[size_t(t)];
+            },
+            &error, chunk);
+        CHECK(chunkedOk);
+        CHECK(readAll(chunkedPath) == whole);
+        std::filesystem::remove(chunkedPath);
+    }
     std::filesystem::remove(path);
 }
 

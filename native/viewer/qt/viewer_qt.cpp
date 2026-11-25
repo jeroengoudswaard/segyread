@@ -83,10 +83,65 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <mutex>
 #include <thread>
 #include <vector>
+#include <QElapsedTimer>
 
 namespace segyqt {
+
+namespace {
+QFile* perfFile() {
+    static QFile* file = []() -> QFile* {
+        if (!qEnvironmentVariableIsSet("SEGYREAD_PROFILE")) return nullptr;
+        auto* f = new QFile(qEnvironmentVariable("SEGYREAD_PROFILE"));
+        if (!f->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+            delete f;
+            return nullptr;
+        }
+        return f;
+    }();
+    return file;
+}
+
+std::mutex& perfMutex() {
+    static std::mutex m;
+    return m;
+}
+
+qint64 perfClockMs() {
+    static QElapsedTimer clock = []() {
+        QElapsedTimer t;
+        t.start();
+        return t;
+    }();
+    return clock.elapsed();
+}
+
+// Logs `what` when the scope took at least `thresholdMs`.
+struct PerfScope {
+    QString what;
+    qint64 thresholdMs;
+    QElapsedTimer timer;
+    PerfScope(QString w, qint64 threshold) : what(std::move(w)), thresholdMs(threshold) {
+        if (perfEnabled()) timer.start();
+    }
+    ~PerfScope() {
+        if (timer.isValid() && timer.elapsed() >= thresholdMs) perfLog(QString("%1: %2 ms").arg(what).arg(timer.elapsed()));
+    }
+};
+} // namespace
+
+bool perfEnabled() { return perfFile() != nullptr; }
+
+void perfLog(const QString& line) {
+    QFile* f = perfFile();
+    if (!f) return;
+    std::lock_guard<std::mutex> lock(perfMutex());
+    f->write(QString("%1  %2\n").arg(perfClockMs() / 1000.0, 8, 'f', 3).arg(line).toUtf8());
+    f->flush();
+}
+
 namespace {
 
 // "Dark Pro" palette (see the approved UI mockup) -- kept as named
@@ -413,6 +468,26 @@ QString buildSegyTextHeader(const QStringList& inputBlocks, const std::vector<st
 // SEG-Y is what writes a dataset somewhere permanent). `outputName` becomes
 // the file's stem, sanitized to filesystem-safe characters since it's
 // user-editable text in both dialogs.
+// Streams `traceCount` output traces to `path` (segy::writeSegyFileChunked):
+// chunk by chunk, each chunk's traces made in parallel by `makeTrace(t, out)`
+// (any pool thread; `out` may hold the previous chunk's buffers, so assign,
+// don't append). Only two chunks are ever in memory, whatever the file size.
+// `progress` gets the number of traces done.
+bool streamTraces(const std::filesystem::path& path, const std::string& textHeader, const segy::BinaryHeader& header,
+                  int64_t traceCount, const std::function<void(int64_t, segy::WriteTrace&)>& makeTrace,
+                  std::atomic<int64_t>& progress, std::string* error) {
+    segy::ThreadPool pool;
+    return segy::writeSegyFileChunked(
+        path, textHeader, header, traceCount,
+        [&](int64_t begin, int64_t end, std::vector<segy::WriteTrace>& chunk) {
+            pool.parallelFor(size_t(end - begin), 8, [&](size_t b, size_t e) {
+                for (size_t i = b; i < e; ++i) makeTrace(begin + int64_t(i), chunk[i]);
+            });
+            progress = end;
+        },
+        error, 4096);
+}
+
 std::filesystem::path scratchSegyPath(const QString& outputName) {
     std::filesystem::path dir = std::filesystem::temp_directory_path() / "segyread_scratch";
     std::error_code ec;
@@ -5141,7 +5216,7 @@ HoverInfo SegyCanvas::currentHoverInfo() const {
     segy::decodeSamples(sampleBase, &value, 1, app_.foreground->binHeader.formatCode);
 
     info.valid = true;
-    info.traceIdx = traceIdx + (app_.xf.active ? app_.xf.traceOffset : 0);
+    info.traceIdx = app_.xf.active ? app_.xf.traceOffset + traceIdx * app_.xf.traceStride : traceIdx;
     info.seqNum = th.traceSequenceLine;
     info.timeMs = double(sampleIdx) * (app_.foreground->binHeader.sampleIntervalUs / 1000.0);
     info.amplitude = value;
@@ -5486,6 +5561,7 @@ void SegyCanvas::paintIdentOverlayLines(QPainter& painter, const segy::ChromeLay
 }
 
 void SegyCanvas::paintEvent(QPaintEvent*) {
+    PerfScope perf("paint canvas", 20);
     QPainter painter(this);
     int width = this->width();
     int height = this->height();
@@ -5510,6 +5586,14 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
     int insetHeight = height - topInset - bottomInset;
 
     if (app_.loaded && insetWidth > 0 && insetHeight > 0) {
+        // Profiling: time per paint stage (logged from 5 ms).
+        QElapsedTimer lapTimer;
+        if (perfEnabled()) lapTimer.start();
+        auto lap = [&lapTimer](const char* stage) {
+            if (!lapTimer.isValid()) return;
+            const qint64 ms = lapTimer.restart();
+            if (ms >= 5) perfLog(QString("  paint stage %1: %2 ms").arg(stage).arg(ms));
+        };
         if (int(app_.pixels.size()) != insetWidth * insetHeight) {
             app_.pixels.assign(size_t(insetWidth) * size_t(insetHeight), 0);
         }
@@ -5533,6 +5617,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         segy::ChromeLayout chrome = segy::renderFrameWithChrome(
             makeRenderContext(), app_.view, canvasDisplay, metrics, app_.pixels.data(), insetWidth, insetHeight);
         app_.lastRenderMs = chrome.lastRenderMs;
+        lap("render (raster)");
         bool plotGeometryChanged = lastPlotX_ != chrome.plotX || lastPlotWidth_ != chrome.plotWidth;
         lastPlotX_ = chrome.plotX;
         lastPlotWidth_ = chrome.plotWidth;
@@ -5571,7 +5656,9 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         // needed. Drawn right after the image blit, before the time-scale
         // labels, so it reads as "chrome" rather than sitting over the
         // axis text.
+        lap("blit");
         paintIdentText(painter, chrome, topInset, bottomInset, insetHeight);
+        lap("ident rows");
 
         if (app_.display.showTimeScale) {
             int leftNumbersX = kCanvasMargin + chrome.leftScaleX + chrome.titleColumnWidth + chrome.columnGap;
@@ -5712,7 +5799,9 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         // Idents' "Display on Seismic" overlay lines (see
         // native/README.md) -- drawn before selection boxes so the box
         // the user is actively dragging/editing stays the topmost element.
+        lap("time axis + wiggle");
         paintIdentOverlayLines(painter, chrome, topInset, insetHeight);
+        lap("ident overlay lines");
 
         // Selection boxes: derived fresh from their data-space corners every
         // frame (same reasoning as the density plot itself), so they stay
@@ -5750,6 +5839,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         }
         painter.restore();
 
+        lap("selection boxes");
         // Horizons of this dataset: a line through the picks (gaps where
         // there are none), anchors as squares, the active one thicker.
         if (!app_.foreground->horizons.empty() && !app_.display.frequencyAxis) {
@@ -5761,7 +5851,8 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             const int64_t step = std::max<int64_t>(1, (last - first + 1) / std::max(1, 2 * chrome.plotWidth));
             painter.save();
             painter.setClipRect(plot);
-            painter.setRenderHint(QPainter::Antialiasing, true);
+            // Smooth lines only when zoomed in; decimated lines draw faster without.
+            painter.setRenderHint(QPainter::Antialiasing, step == 1);
             for (int hi = 0; hi < int(app_.foreground->horizons.size()); ++hi) {
                 const Horizon& hz = app_.foreground->horizons[size_t(hi)];
                 const bool active = hi == app_.foreground->activeHorizon;
@@ -5799,6 +5890,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             painter.restore();
         }
 
+        lap("horizons");
         // Linked crosshair: where the cursor is on the other panel (same
         // trace index and time), black underlay + white dashes like the
         // chart crosshairs. Not on an x-f display (frequency, not time).
@@ -5901,14 +5993,15 @@ void SegyCanvas::showAxisRangeMenu(const QPoint& globalPos) {
     } else if (chosen == ranges) {
         // Traces as the hover readout numbers them (x-f: the seismic's).
         const double offset = app_.xf.active ? double(app_.xf.traceOffset) : 0.0;
-        double x0 = app_.view.traceStart + offset, x1 = app_.view.traceEnd + offset;
+        const double stride = app_.xf.active ? double(app_.xf.traceStride) : 1.0;
+        double x0 = app_.view.traceStart * stride + offset, x1 = app_.view.traceEnd * stride + offset;
         double y0 = app_.view.sampleStart * sampleMs, y1 = app_.view.sampleEnd * sampleMs;
         const QString yName = app_.display.frequencyAxis ? "Frequency (Hz)"
                               : app_.display.depthAxis   ? "Depth (m)"
                                                          : "Time (ms)";
         if (!editAxisRanges(this, "Axis Ranges", "Trace", yName, x0, x1, y0, y1, 0, 2)) return;
-        next.traceStart = x0 - offset;
-        next.traceEnd = x1 - offset;
+        next.traceStart = (x0 - offset) / stride;
+        next.traceEnd = (x1 - offset) / stride;
         next.sampleStart = sampleMs > 0.0 ? y0 / sampleMs : next.sampleStart;
         next.sampleEnd = sampleMs > 0.0 ? y1 / sampleMs : next.sampleEnd;
         segy::clampView(next, traceCount, samplesPerTrace);
@@ -6014,7 +6107,7 @@ void SegyCanvas::leaveEvent(QEvent*) {
     notifyHoverChanged(); // clears the dock's Trace Info section
 }
 
-void SegyCanvas::enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOffset) {
+void SegyCanvas::enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOffset, int64_t traceStride) {
     if (!app_.loaded || !xfDataset) return;
     XfState& xf = app_.xf;
     if (!xf.active) {
@@ -6027,6 +6120,7 @@ void SegyCanvas::enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOf
     }
     xf.active = true;
     xf.traceOffset = traceOffset;
+    xf.traceStride = std::max<int64_t>(1, traceStride);
     app_.foreground = std::move(xfDataset);
     segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
     // Variable density, -40 dB (green) .. 0 dB (red) by default: clip 20 dB
@@ -6158,7 +6252,13 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
         // synchronization was a real, confirmed bug in the removed shells
         // (see native/README.md); carrying that fix forward here.
         std::atomic<int64_t> lastPostMs{0};
-        segy::LoadResult result = segy::loadSegyFile(path, app_.pool, [this, &lastPostMs](int64_t done, int64_t total) {
+        QElapsedTimer loadTimer;
+        loadTimer.start();
+        // Its own pool: the panel's pool must stay free for painting (a
+        // flatten display loads while the original is still shown, and a
+        // shared pool froze the paint for 1.9 s on a 6 GB file).
+        segy::ThreadPool loadPool;
+        segy::LoadResult result = segy::loadSegyFile(path, loadPool, [this, &lastPostMs](int64_t done, int64_t total) {
             int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now().time_since_epoch())
                                  .count();
@@ -6177,10 +6277,16 @@ void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std
             }
         });
 
+        perfLog(QString("load %1: %2 ms (%3 traces, %4 MB)")
+                    .arg(QString::fromStdString(path.filename().string()))
+                    .arg(loadTimer.elapsed())
+                    .arg(result.traceCount)
+                    .arg(result.ok ? double(result.file.size()) / 1048576.0 : 0.0, 0, 'f', 0));
         QMetaObject::invokeMethod(
             this,
             [this, path, result = std::move(result), processingHistory = std::move(processingHistory),
              onLoaded = std::move(onLoaded)]() mutable {
+                PerfScope perf("load completion on the UI thread", 0);
                 app_.loading = false;
                 if (result.ok) {
                     auto dataset = std::make_shared<Dataset>();
@@ -7974,26 +8080,25 @@ void MainWindow::runCalculator(std::shared_ptr<Dataset> dsA, std::shared_ptr<Dat
         [this, dsA, dsB, traceCount, samplesPerTrace, subtract, outHeader, textHeader, outPath, writeOk,
          writeError]() {
             backgroundTaskTotal_ = traceCount;
-            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
-            std::vector<float> samplesA(static_cast<size_t>(samplesPerTrace));
-            std::vector<float> samplesB(static_cast<size_t>(samplesPerTrace));
-            for (int64_t t = 0; t < traceCount; ++t) {
-                const uint8_t* traceA = dsA->file.data() + segy::kHeaderTotalSize + size_t(t) * dsA->traceStrideBytes;
-                const uint8_t* traceB = dsB->file.data() + segy::kHeaderTotalSize + size_t(t) * dsB->traceStrideBytes;
-                segy::decodeSamples(traceA + segy::kTraceHeaderSize, samplesA.data(), size_t(samplesPerTrace),
-                                    dsA->binHeader.formatCode);
-                segy::decodeSamples(traceB + segy::kTraceHeaderSize, samplesB.data(), size_t(samplesPerTrace),
-                                    dsB->binHeader.formatCode);
-                segy::WriteTrace& out = traces[size_t(t)];
-                out.headerBytes.assign(traceA, traceA + segy::kTraceHeaderSize); // dataset A's own trace headers carry over
-                out.samples.resize(size_t(samplesPerTrace));
-                for (int s = 0; s < samplesPerTrace; ++s) {
-                    out.samples[size_t(s)] =
-                        subtract ? samplesA[size_t(s)] - samplesB[size_t(s)] : samplesA[size_t(s)] + samplesB[size_t(s)];
-                }
-                backgroundTaskDone_ = t + 1;
-            }
-            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+            *writeOk = streamTraces(
+                outPath, textHeader.toStdString(), outHeader, traceCount,
+                [&](int64_t t, segy::WriteTrace& out) {
+                    thread_local std::vector<float> samplesB;
+                    samplesB.resize(size_t(samplesPerTrace));
+                    const uint8_t* traceA = dsA->file.data() + segy::kHeaderTotalSize + size_t(t) * dsA->traceStrideBytes;
+                    const uint8_t* traceB = dsB->file.data() + segy::kHeaderTotalSize + size_t(t) * dsB->traceStrideBytes;
+                    out.headerBytes.assign(traceA, traceA + segy::kTraceHeaderSize); // dataset A's own trace headers carry over
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceA + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        dsA->binHeader.formatCode);
+                    segy::decodeSamples(traceB + segy::kTraceHeaderSize, samplesB.data(), size_t(samplesPerTrace),
+                                        dsB->binHeader.formatCode);
+                    for (int s = 0; s < samplesPerTrace; ++s) {
+                        out.samples[size_t(s)] = subtract ? out.samples[size_t(s)] - samplesB[size_t(s)]
+                                                          : out.samples[size_t(s)] + samplesB[size_t(s)];
+                    }
+                },
+                backgroundTaskDone_, writeError.get());
         },
         [this, writeOk, writeError, outPath, history]() {
             if (!*writeOk) {
@@ -8066,19 +8171,17 @@ void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams
         QString("Bandpass: %1").arg(sourceName),
         [this, ds, traceCount, samplesPerTrace, sos, padding, outHeader, textHeader, outPath, writeOk, writeError]() {
             backgroundTaskTotal_ = traceCount;
-            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
-            std::vector<float> samples(static_cast<size_t>(samplesPerTrace));
-            for (int64_t t = 0; t < traceCount; ++t) {
-                const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
-                segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples.data(), size_t(samplesPerTrace),
-                                    ds->binHeader.formatCode);
-                segy::sosFiltFilt(sos, samples, -1, padding);
-                segy::WriteTrace& out = traces[size_t(t)];
-                out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-                out.samples = samples;
-                backgroundTaskDone_ = t + 1;
-            }
-            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+            *writeOk = streamTraces(
+                outPath, textHeader.toStdString(), outHeader, traceCount,
+                [&](int64_t t, segy::WriteTrace& out) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                    segy::sosFiltFilt(sos, out.samples, -1, padding);
+                },
+                backgroundTaskDone_, writeError.get());
         },
         [this, writeOk, writeError, outPath, history, targetPanel]() {
             if (!*writeOk) {
@@ -8119,17 +8222,16 @@ void MainWindow::runSaveSegy(AppState& source, const QString& filePath) {
         QString("Save SEG-Y: %1").arg(QString::fromStdString(outPath.filename().string())),
         [this, ds, traceCount, samplesPerTrace, outHeader, textHeader, outPath, writeOk, writeError]() {
             backgroundTaskTotal_ = traceCount;
-            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
-            for (int64_t t = 0; t < traceCount; ++t) {
-                const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
-                segy::WriteTrace& out = traces[size_t(t)];
-                out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-                out.samples.resize(size_t(samplesPerTrace));
-                segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
-                                    ds->binHeader.formatCode);
-                backgroundTaskDone_ = t + 1;
-            }
-            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+            *writeOk = streamTraces(
+                outPath, textHeader.toStdString(), outHeader, traceCount,
+                [&](int64_t t, segy::WriteTrace& out) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                },
+                backgroundTaskDone_, writeError.get());
         },
         [this, writeOk, writeError, outPath]() {
             if (!*writeOk) {
@@ -8452,24 +8554,18 @@ void MainWindow::runTraceTransform(Panel* panel, const QString& title, const QSt
         [this, ds, traceCount, samplesPerTrace, intervalUs, transform, outHeader, textHeader, outPath, writeOk,
          writeError]() {
             backgroundTaskTotal_ = traceCount;
-            std::vector<segy::WriteTrace> traces(static_cast<size_t>(traceCount));
-            std::atomic<int64_t> done{0};
             // Traces are independent: in parallel (decoding from the mmap is thread-safe).
-            segy::ThreadPool pool;
-            pool.parallelFor(size_t(traceCount), 64, [&](size_t begin, size_t end) {
-                std::vector<float> samples(static_cast<size_t>(samplesPerTrace));
-                for (size_t t = begin; t < end; ++t) {
-                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
-                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples.data(), size_t(samplesPerTrace),
-                                        ds->binHeader.formatCode);
-                    transform(samples, intervalUs);
-                    segy::WriteTrace& out = traces[t];
+            *writeOk = streamTraces(
+                outPath, textHeader.toStdString(), outHeader, traceCount,
+                [&](int64_t t, segy::WriteTrace& out) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
                     out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-                    out.samples = samples;
-                    backgroundTaskDone_ = done.fetch_add(1) + 1;
-                }
-            });
-            *writeOk = segy::writeSegyFile(outPath, textHeader.toStdString(), outHeader, traces, writeError.get());
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                    transform(out.samples, intervalUs);
+                },
+                backgroundTaskDone_, writeError.get());
         },
         [this, panel, title, writeOk, writeError, outPath, history]() {
             if (!*writeOk) {
@@ -8612,16 +8708,23 @@ void MainWindow::toggleXf(Panel* panel, bool on) {
         return;
     }
     xfAction_->setEnabled(false); // until the computation lands
+    // A screen shows a few thousand columns at most: more traces than that
+    // only cost time and memory (603k traces took 89 s and a 4.9 GB scratch
+    // file). Every stride-th trace is used instead.
+    const int64_t kMaxXfTraces = 4096;
+    const int64_t stride = std::max<int64_t>(1, (t1 - t0 + kMaxXfTraces - 1) / kMaxXfTraces);
+    const int64_t xfCount = (t1 - t0 + stride - 1) / stride;
 
     const QString sourceName = QString::fromStdString(ds->filePath.stem().string());
     const QString outputName = sourceName + "_xF";
     const std::filesystem::path outPath = scratchSegyPath(outputName);
     std::vector<std::string> history = ds->processingHistory;
-    history.push_back(QString("X-F: AMPLITUDE SPECTRUM DB RE MAX, TRACES %1-%2, %3-%4 MS, COS2 TAPER 80% FLAT")
+    history.push_back(QString("X-F: AMPLITUDE SPECTRUM DB RE MAX, TRACES %1-%2 EVERY %7, %3-%4 MS, COS2 TAPER 80% FLAT")
                           .arg(t0)
                           .arg(t1 - 1)
                           .arg(s0 * intervalUs / 1000.0, 0, 'f', 0)
                           .arg(s1 * intervalUs / 1000.0, 0, 'f', 0)
+                          .arg(stride)
                           .toStdString());
     QStringList inputBlocks;
     inputBlocks << QString("FILE: %1  TRACES: %2-%3  GATE: %4-%5 MS  SAMPLE INTERVAL: %6 US")
@@ -8631,7 +8734,7 @@ void MainWindow::toggleXf(Panel* panel, bool on) {
                        .arg(s0 * intervalUs / 1000.0, 0, 'f', 0)
                        .arg(s1 * intervalUs / 1000.0, 0, 'f', 0)
                        .arg(intervalUs);
-    QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, t1 - t0, grid.bins, grid.binIntervalUs);
+    QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, xfCount, grid.bins, grid.binIntervalUs);
     segy::BinaryHeader outHeader = ds->binHeader;
     outHeader.samplesPerTrace = int16_t(grid.bins);
     outHeader.sampleIntervalUs = int16_t(grid.binIntervalUs);
@@ -8643,25 +8746,26 @@ void MainWindow::toggleXf(Panel* panel, bool on) {
     };
     auto outcome = std::make_shared<XfOutcome>();
     runBackgroundTask(
-        QString("x-f: %1 traces").arg(t1 - t0),
-        [this, ds, samplesPerTrace, t0, t1, s0, s1, grid, outHeader, textHeader, outPath, outcome]() {
-            const int64_t count = t1 - t0;
+        stride > 1 ? QString("x-f: %1 of %2 traces (every %3th)").arg(xfCount).arg(t1 - t0).arg(stride)
+                   : QString("x-f: %1 traces").arg(t1 - t0),
+        [this, ds, samplesPerTrace, t0, stride, xfCount, s0, s1, grid, outHeader, textHeader, outPath, outcome]() {
+            const int64_t count = xfCount;
             backgroundTaskTotal_ = count + 1;
             // Spectra in parallel over the traces (decoding from the mmap is
             // thread-safe), then the headers serially.
             std::vector<std::vector<float>> spectra = segy::computeXfAmplitudes(
-                [ds, samplesPerTrace](int64_t traceIdx, float* samples) {
+                [ds, samplesPerTrace, t0, stride](int64_t k, float* samples) {
                     const uint8_t* traceBase =
-                        ds->file.data() + segy::kHeaderTotalSize + size_t(traceIdx) * ds->traceStrideBytes;
+                        ds->file.data() + segy::kHeaderTotalSize + size_t(t0 + k * stride) * ds->traceStrideBytes;
                     segy::decodeSamples(traceBase + segy::kTraceHeaderSize, samples, size_t(samplesPerTrace),
                                         ds->binHeader.formatCode);
                 },
-                samplesPerTrace, t0, t1, s0, s1, grid, [this](int64_t done) { backgroundTaskDone_ = done; });
+                samplesPerTrace, 0, count, s0, s1, grid, [this](int64_t done) { backgroundTaskDone_ = done; });
             std::vector<segy::WriteTrace> traces(static_cast<size_t>(count));
             float maxAmp = 0.0f;
             for (int64_t i = 0; i < count; ++i) {
                 const uint8_t* traceBase =
-                    ds->file.data() + segy::kHeaderTotalSize + size_t(t0 + i) * ds->traceStrideBytes;
+                    ds->file.data() + segy::kHeaderTotalSize + size_t(t0 + i * stride) * ds->traceStrideBytes;
                 segy::WriteTrace& out = traces[size_t(i)];
                 out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
                 // Trace header: no delay, the x-f sample count and interval
@@ -8693,7 +8797,7 @@ void MainWindow::toggleXf(Panel* panel, bool on) {
             if (!outcome->ok) outcome->error = outcome->load.error;
             backgroundTaskDone_ = count + 1;
         },
-        [this, panel, outcome, outPath, history, t0]() {
+        [this, panel, outcome, outPath, history, t0, stride]() {
             xfAction_->setEnabled(true);
             if (!outcome->ok) {
                 QMessageBox::warning(this, "x-f display", QString::fromStdString(outcome->error));
@@ -8715,7 +8819,7 @@ void MainWindow::toggleXf(Panel* panel, bool on) {
             dataset->traceStrideBytes = outcome->load.traceStrideBytes;
             dataset->pyramid = std::move(outcome->load.pyramid);
             dataset->processingHistory = history;
-            panel->canvas->enterXfMode(dataset, t0);
+            panel->canvas->enterXfMode(dataset, t0, stride);
             refreshAfterDisplaySwap();
         });
 }
@@ -9538,13 +9642,28 @@ void MainWindow::openTraceHeaderRanges() {
         "Scanning trace headers",
         [this, ds, rows]() {
             backgroundTaskTotal_ = std::max<int64_t>(1, ds->traceCount);
+            // Reading the headers is the slow part (one page per trace on a
+            // file larger than the cache): in parallel, into columns; the
+            // statistics then run over memory.
+            const size_t rowCount = rows->size();
+            std::vector<int64_t> values(size_t(ds->traceCount) * rowCount);
+            {
+                segy::ThreadPool pool;
+                std::atomic<int64_t> done{0};
+                pool.parallelFor(size_t(ds->traceCount), 2048, [&](size_t begin, size_t end) {
+                    for (size_t t = begin; t < end; ++t) {
+                        const segy::TraceHeader th =
+                            segy::parseTraceHeader(ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes);
+                        for (size_t r = 0; r < rowCount; ++r) values[t * rowCount + r] = (*rows)[r].value(th);
+                    }
+                    backgroundTaskDone_ = done.fetch_add(int64_t(end - begin)) + int64_t(end - begin);
+                });
+            }
             std::vector<int64_t> previous(rows->size(), 0);
             for (int64_t t = 0; t < ds->traceCount; ++t) {
-                const segy::TraceHeader th =
-                    segy::parseTraceHeader(ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes);
-                for (size_t r = 0; r < rows->size(); ++r) {
+                for (size_t r = 0; r < rowCount; ++r) {
                     HeaderRangeRow& row = (*rows)[r];
-                    const int64_t v = row.value(th);
+                    const int64_t v = values[size_t(t) * rowCount + r];
                     row.min = std::min(row.min, v);
                     row.max = std::max(row.max, v);
                     if (t > 0 && v != previous[r]) {
@@ -9553,7 +9672,6 @@ void MainWindow::openTraceHeaderRanges() {
                     }
                     previous[r] = v;
                 }
-                if (t % 4096 == 0) backgroundTaskDone_ = t;
             }
             backgroundTaskDone_ = ds->traceCount;
         },
@@ -9744,20 +9862,6 @@ void MainWindow::runSubsetSort(Panel* panel, std::shared_ptr<Dataset> dataset, s
                 return;
             }
             backgroundTaskTotal_ = int64_t(order.size());
-            std::vector<segy::WriteTrace> traces(order.size());
-            std::atomic<int64_t> done{0};
-            pool.parallelFor(order.size(), 64, [&](size_t begin, size_t end) {
-                for (size_t i = begin; i < end; ++i) {
-                    const uint8_t* traceBase =
-                        dataset->file.data() + segy::kHeaderTotalSize + size_t(order[i]) * dataset->traceStrideBytes;
-                    segy::WriteTrace& out = traces[i];
-                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-                    out.samples.resize(size_t(samplesPerTrace));
-                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
-                                        dataset->binHeader.formatCode);
-                    backgroundTaskDone_ = done.fetch_add(1) + 1;
-                }
-            });
             QStringList inputBlocks;
             inputBlocks << QString("FILE: %1  TRACES: %2 OF %3  SAMPLES/TRACE: %4  SAMPLE INTERVAL: %5 US")
                                .arg(sourceName)
@@ -9767,7 +9871,17 @@ void MainWindow::runSubsetSort(Panel* panel, std::shared_ptr<Dataset> dataset, s
                                .arg(dataset->binHeader.sampleIntervalUs);
             const QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, int64_t(order.size()),
                                                            samplesPerTrace, dataset->binHeader.sampleIntervalUs);
-            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), dataset->binHeader, traces, &outcome->error);
+            outcome->ok = streamTraces(
+                outPath, textHeader.toStdString(), dataset->binHeader, int64_t(order.size()),
+                [&](int64_t i, segy::WriteTrace& out) {
+                    const uint8_t* traceBase =
+                        dataset->file.data() + segy::kHeaderTotalSize + size_t(order[size_t(i)]) * dataset->traceStrideBytes;
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        dataset->binHeader.formatCode);
+                },
+                backgroundTaskDone_, &outcome->error);
         },
         [this, panel, outcome, outPath, history]() {
             if (!outcome->ok) {
@@ -9970,13 +10084,24 @@ void MainWindow::importHorizon(Panel* panel) {
 
 namespace {
 // A time per trace from a trace-header integer (`msPerUnit` ms per count);
-// 0 counts as "no value" (NaN).
-std::vector<double> headerTimesMs(const Dataset& ds, int firstByte, int size, double msPerUnit) {
-    std::vector<double> ms(size_t(ds.traceCount), std::numeric_limits<double>::quiet_NaN());
-    for (int64_t t = 0; t < ds.traceCount; ++t) {
-        const uint8_t* header = ds.file.data() + segy::kHeaderTotalSize + size_t(t) * ds.traceStrideBytes;
-        const int64_t v = segy::readHeaderInt(header, firstByte, size, true);
-        if (v != 0) ms[size_t(t)] = double(v) * msPerUnit;
+// 0 counts as "no value" (NaN). The raw values are read once per field, in
+// parallel (on a 6 GB file the serial read was an 18 s freeze), and kept
+// on the dataset.
+std::vector<double> headerTimesMs(Dataset& ds, int firstByte, int size, double msPerUnit) {
+    std::vector<int32_t>& raw = ds.headerFieldCache[{firstByte, size}];
+    if (raw.size() != size_t(ds.traceCount)) {
+        raw.resize(size_t(ds.traceCount));
+        segy::ThreadPool pool;
+        pool.parallelFor(size_t(ds.traceCount), 1024, [&](size_t begin, size_t end) {
+            for (size_t t = begin; t < end; ++t) {
+                const uint8_t* header = ds.file.data() + segy::kHeaderTotalSize + t * ds.traceStrideBytes;
+                raw[t] = int32_t(segy::readHeaderInt(header, firstByte, size, true));
+            }
+        });
+    }
+    std::vector<double> ms(raw.size(), std::numeric_limits<double>::quiet_NaN());
+    for (size_t t = 0; t < raw.size(); ++t) {
+        if (raw[t] != 0) ms[t] = double(raw[t]) * msPerUnit;
     }
     return ms;
 }
@@ -10024,7 +10149,11 @@ void MainWindow::toggleFlatten(Panel* panel, bool on) {
         if (app.flatten.active && app.flatten.original) {
             const segy::ViewRange view = app.view;
             std::shared_ptr<Dataset> original = app.flatten.original;
+            std::shared_ptr<Dataset> flattened = app.foreground;
             panel->canvas->setForegroundDataset(original); // also clears app.flatten
+            // Unmapping a large file takes a while (1.4 s for 6 GB): drop the
+            // flattened copy on another thread, not the UI thread.
+            std::thread([flattened = std::move(flattened)]() mutable { flattened.reset(); }).detach();
             app.view = view; // same trace/sample space
             panel->canvas->update();
             refreshHorizonManager();
@@ -10157,22 +10286,7 @@ void MainWindow::runFlatten(Panel* panel, std::vector<double> sourceMs, double r
     runBackgroundTask(
         QString("Flatten: %1").arg(QString::fromStdString(ds->name)),
         [this, ds, filled, referenceMs, sampleMs, samplesPerTrace, outPath, history, outputName, outcome]() {
-            segy::ThreadPool pool;
             backgroundTaskTotal_ = ds->traceCount;
-            std::vector<segy::WriteTrace> traces(size_t(ds->traceCount));
-            std::atomic<int64_t> done{0};
-            pool.parallelFor(size_t(ds->traceCount), 64, [&](size_t begin, size_t end) {
-                for (size_t t = begin; t < end; ++t) {
-                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
-                    segy::WriteTrace& out = traces[t];
-                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-                    out.samples.resize(size_t(samplesPerTrace));
-                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
-                                        ds->binHeader.formatCode);
-                    segy::flattenTrace(out.samples, (*filled)[t] / sampleMs, referenceMs / sampleMs);
-                    backgroundTaskDone_ = done.fetch_add(1) + 1;
-                }
-            });
             QStringList inputBlocks;
             inputBlocks << QString("FILE: %1  TRACES: %2  SAMPLES/TRACE: %3  SAMPLE INTERVAL: %4 US")
                                .arg(QString::fromStdString(ds->name))
@@ -10181,7 +10295,17 @@ void MainWindow::runFlatten(Panel* panel, std::vector<double> sourceMs, double r
                                .arg(ds->binHeader.sampleIntervalUs);
             const QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, ds->traceCount,
                                                            samplesPerTrace, ds->binHeader.sampleIntervalUs);
-            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), ds->binHeader, traces, &outcome->error);
+            outcome->ok = streamTraces(
+                outPath, textHeader.toStdString(), ds->binHeader, ds->traceCount,
+                [&](int64_t t, segy::WriteTrace& out) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                    out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
+                    out.samples.resize(size_t(samplesPerTrace));
+                    segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                    segy::flattenTrace(out.samples, (*filled)[size_t(t)] / sampleMs, referenceMs / sampleMs);
+                },
+                backgroundTaskDone_, &outcome->error);
         },
         [this, panel, ds, filled, referenceMs, newDataset, outPath, history, outcome]() {
             if (!outcome->ok) {
@@ -10273,32 +10397,27 @@ void MainWindow::writeHorizonToHeader(Panel* panel) {
     runBackgroundTask(
         QString("Horizon to header: %1").arg(QString::fromStdString(ds->name)),
         [this, ds, times, firstByte, size, msPerUnit, outPath, history, outputName, outcome]() {
-            segy::ThreadPool pool;
             const int samplesPerTrace = ds->binHeader.samplesPerTrace;
             backgroundTaskTotal_ = ds->traceCount;
-            std::vector<segy::WriteTrace> traces(size_t(ds->traceCount));
-            std::atomic<int64_t> done{0};
             const int64_t limit = size == 2 ? 32767 : 2147483647;
-            pool.parallelFor(size_t(ds->traceCount), 64, [&](size_t begin, size_t end) {
-                for (size_t t = begin; t < end; ++t) {
-                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
-                    segy::WriteTrace& out = traces[t];
+            QStringList inputBlocks;
+            inputBlocks << QString("FILE: %1  TRACES: %2").arg(QString::fromStdString(ds->name)).arg(ds->traceCount);
+            const QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, ds->traceCount,
+                                                           samplesPerTrace, ds->binHeader.sampleIntervalUs);
+            outcome->ok = streamTraces(
+                outPath, textHeader.toStdString(), ds->binHeader, ds->traceCount,
+                [&](int64_t t, segy::WriteTrace& out) {
+                    const uint8_t* traceBase = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
                     out.headerBytes.assign(traceBase, traceBase + segy::kTraceHeaderSize);
-                    if (t < times->size() && std::isfinite((*times)[t])) {
-                        const int64_t v = std::clamp<int64_t>(std::llround((*times)[t] / msPerUnit), -limit, limit);
+                    if (size_t(t) < times->size() && std::isfinite((*times)[size_t(t)])) {
+                        const int64_t v = std::clamp<int64_t>(std::llround((*times)[size_t(t)] / msPerUnit), -limit, limit);
                         writeHeaderIntBigEndian(out.headerBytes, firstByte, size, v);
                     }
                     out.samples.resize(size_t(samplesPerTrace));
                     segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
                                         ds->binHeader.formatCode);
-                    backgroundTaskDone_ = done.fetch_add(1) + 1;
-                }
-            });
-            QStringList inputBlocks;
-            inputBlocks << QString("FILE: %1  TRACES: %2").arg(QString::fromStdString(ds->name)).arg(ds->traceCount);
-            const QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, ds->traceCount,
-                                                           samplesPerTrace, ds->binHeader.sampleIntervalUs);
-            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), ds->binHeader, traces, &outcome->error);
+                },
+                backgroundTaskDone_, &outcome->error);
         },
         [this, panel, outPath, history, outcome]() {
             if (!outcome->ok) {
@@ -10507,36 +10626,8 @@ void MainWindow::openTimeDepthConversion() {
             }
             const int samplesPerTrace = ds->binHeader.samplesPerTrace;
             backgroundTaskTotal_ = ds->traceCount;
-            std::vector<segy::WriteTrace> traces(size_t(ds->traceCount));
-            std::atomic<int64_t> done{0};
             std::mutex errorMutex;
-            segy::ThreadPool pool;
-            pool.parallelFor(size_t(ds->traceCount), 32, [&](size_t begin, size_t end) {
-                std::vector<float> v(static_cast<size_t>(vCount)), input(static_cast<size_t>(samplesPerTrace));
-                for (size_t t = begin; t < end; ++t) {
-                    const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + t * ds->traceStrideBytes;
-                    segy::interpolateVelocity(cdps, velocities, segy::parseTraceHeader(base).cdp, vCount, v.data());
-                    std::string error;
-                    const segy::TimeDepthMap map =
-                        segy::buildTimeDepthMap(v.data(), vCount, velocityStep, velocityInDepth, type, &error);
-                    segy::WriteTrace& out = traces[t];
-                    out.headerBytes.assign(base, base + segy::kTraceHeaderSize);
-                    writeHeaderIntBigEndian(out.headerBytes, 115, 2, outputCount);
-                    writeHeaderIntBigEndian(out.headerBytes, 117, 2, outputIntervalHeader);
-                    out.samples.assign(size_t(outputCount), 0.0f);
-                    if (map.time.empty()) {
-                        std::lock_guard<std::mutex> lock(errorMutex);
-                        outcome->error = error;
-                    } else {
-                        segy::decodeSamples(base + segy::kTraceHeaderSize, input.data(), size_t(samplesPerTrace),
-                                            ds->binHeader.formatCode);
-                        segy::convertTrace(input.data(), samplesPerTrace, inputUnit, map, toDepth, out.samples.data(),
-                                           outputCount, outputStep);
-                    }
-                    backgroundTaskDone_ = done.fetch_add(1) + 1;
-                }
-            });
-            if (!outcome->error.empty()) return;
+            std::string mapError;
             segy::BinaryHeader binHeader = ds->binHeader;
             binHeader.samplesPerTrace = int16_t(outputCount);
             binHeader.sampleIntervalUs = outputIntervalHeader;
@@ -10545,7 +10636,36 @@ void MainWindow::openTimeDepthConversion() {
                                .arg(QString::fromStdString(ds->name), QString::fromStdString(velocity->name));
             const QString textHeader =
                 buildSegyTextHeader(inputBlocks, history, outputName, ds->traceCount, outputCount, outputIntervalHeader);
-            outcome->ok = segy::writeSegyFile(outPath, textHeader.toStdString(), binHeader, traces, &outcome->error);
+            outcome->ok = streamTraces(
+                outPath, textHeader.toStdString(), binHeader, ds->traceCount,
+                [&](int64_t t, segy::WriteTrace& out) {
+                    thread_local std::vector<float> v, input;
+                    v.resize(size_t(vCount));
+                    input.resize(size_t(samplesPerTrace));
+                    const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                    segy::interpolateVelocity(cdps, velocities, segy::parseTraceHeader(base).cdp, vCount, v.data());
+                    std::string error;
+                    const segy::TimeDepthMap map =
+                        segy::buildTimeDepthMap(v.data(), vCount, velocityStep, velocityInDepth, type, &error);
+                    out.headerBytes.assign(base, base + segy::kTraceHeaderSize);
+                    writeHeaderIntBigEndian(out.headerBytes, 115, 2, outputCount);
+                    writeHeaderIntBigEndian(out.headerBytes, 117, 2, outputIntervalHeader);
+                    out.samples.assign(size_t(outputCount), 0.0f);
+                    if (map.time.empty()) {
+                        std::lock_guard<std::mutex> lock(errorMutex);
+                        mapError = error;
+                        return;
+                    }
+                    segy::decodeSamples(base + segy::kTraceHeaderSize, input.data(), size_t(samplesPerTrace),
+                                        ds->binHeader.formatCode);
+                    segy::convertTrace(input.data(), samplesPerTrace, inputUnit, map, toDepth, out.samples.data(),
+                                       outputCount, outputStep);
+                },
+                backgroundTaskDone_, &outcome->error);
+            if (!mapError.empty()) {
+                outcome->ok = false;
+                outcome->error = mapError;
+            }
         },
         [this, panel, outPath, history, outcome]() {
             if (!outcome->ok) {
@@ -10961,11 +11081,15 @@ void MainWindow::runBackgroundTask(const QString& label, std::function<void()> b
     updateBackgroundTaskStatusBar();
     backgroundTaskTimer_->start();
 
-    std::thread([this, backgroundWork = std::move(backgroundWork), uiCompletion = std::move(uiCompletion)]() mutable {
+    std::thread([this, label, backgroundWork = std::move(backgroundWork), uiCompletion = std::move(uiCompletion)]() mutable {
+        QElapsedTimer workTimer;
+        workTimer.start();
         backgroundWork();
+        perfLog(QString("task \"%1\": %2 ms in the background").arg(label).arg(workTimer.elapsed()));
         QMetaObject::invokeMethod(
             this,
-            [this, uiCompletion = std::move(uiCompletion)]() mutable {
+            [this, label, uiCompletion = std::move(uiCompletion)]() mutable {
+                PerfScope perf(QString("task \"%1\" completion on the UI thread").arg(label), 0);
                 backgroundTaskTimer_->stop();
                 backgroundTaskRunning_ = false;
                 for (Panel* p : {&panelA_, &panelB_}) p->canvas->setStatusOverrideActive(false);
@@ -11133,6 +11257,27 @@ QString darkStyleSheet() {
 
 } // namespace
 
+namespace {
+// Times every event dispatch when profiling is on (SEGYREAD_PROFILE): a
+// dispatch of 50 ms or more is a UI stall, logged with the receiver.
+class ProfilingApplication : public QApplication {
+public:
+    using QApplication::QApplication;
+    bool notify(QObject* receiver, QEvent* event) override {
+        if (!segyqt::perfEnabled()) return QApplication::notify(receiver, event);
+        const int type = int(event->type());
+        const QString receiverClass = QString::fromLatin1(receiver->metaObject()->className());
+        QElapsedTimer timer;
+        timer.start();
+        const bool result = QApplication::notify(receiver, event);
+        if (timer.elapsed() >= 50) {
+            segyqt::perfLog(QString("UI stall: %1 ms in event %2 for %3").arg(timer.elapsed()).arg(type).arg(receiverClass));
+        }
+        return result;
+    }
+};
+} // namespace
+
 int main(int argc, char** argv) {
     // WSLg defaults Qt to its native-Wayland platform plugin (WAYLAND_DISPLAY
     // is set), and that path has confirmed bugs for this app under WSLg
@@ -11174,7 +11319,7 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    QApplication app(argc, argv);
+    ProfilingApplication app(argc, argv);
     // Window/taskbar icon on both platforms -- compiled in via app_icon.qrc
     // (native/assets/icons/LEESMIJ.md), so this doesn't depend on the built
     // executable's location at runtime. The Windows exe's own icon
@@ -11194,6 +11339,13 @@ int main(int argc, char** argv) {
     app.setStyleSheet(darkStyleSheet());
     segyqt::installDarkTitleBars(app); // Windows: black title bars on every window, matching the theme
     segyqt::MainWindow window;
+    if (segyqt::perfEnabled()) {
+        // Which action started what follows in the log.
+        for (QAction* action : window.findChildren<QAction*>()) {
+            QObject::connect(action, &QAction::triggered, action,
+                             [action]() { segyqt::perfLog("action: " + action->text().remove('&')); });
+        }
+    }
     window.show();
     if (argc > 1) window.openInitialFile(std::filesystem::path(argv[1]));
     return app.exec();

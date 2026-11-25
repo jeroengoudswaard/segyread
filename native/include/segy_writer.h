@@ -5,6 +5,7 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,5 +36,18 @@ struct WriteTrace {
 // kTraceHeaderSize/binHeader.samplesPerTrace -- callers own that.
 bool writeSegyFile(const std::filesystem::path& path, const std::string& textHeaderAscii, BinaryHeader binHeader,
                     const std::vector<WriteTrace>& traces, std::string* error);
+
+// Fills chunk[0 .. end-begin) with the output traces [begin, end). The
+// chunk is already sized; its vectors keep their capacity between calls.
+using TraceChunkFill = std::function<void(int64_t begin, int64_t end, std::vector<WriteTrace>& chunk)>;
+
+// The same file as writeSegyFile, streamed: `traceCount` traces produced
+// by `fill` in consecutive chunks of at most `chunkTraces`, so only two
+// chunks are ever in memory (one being filled while the previous one is
+// written on a second thread). This is what keeps processing a file larger
+// than RAM possible.
+bool writeSegyFileChunked(const std::filesystem::path& path, const std::string& textHeaderAscii, BinaryHeader binHeader,
+                          int64_t traceCount, const TraceChunkFill& fill, std::string* error,
+                          int64_t chunkTraces = 2048);
 
 } // namespace segy

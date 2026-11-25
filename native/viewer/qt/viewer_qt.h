@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -72,6 +73,12 @@ class QVBoxLayout;
 class QToolBar;
 
 namespace segyqt {
+
+// Opt-in profiling (see native/README.md, "Profiling"): with the
+// environment variable SEGYREAD_PROFILE set to a file path, loads,
+// background tasks, slow paints and UI-thread stalls are appended to it.
+bool perfEnabled();
+void perfLog(const QString& line); // thread-safe; a no-op when disabled
 
 // Left-click behavior on the canvas depends on which toolbar tool is
 // active: Arrow only hovers/reads (no drag), Pan drag-pans, BoxSelect
@@ -265,6 +272,9 @@ struct Dataset {
     // Data Domain or by Time-Depth Conversion; derived datasets inherit it
     // through the "DOMAIN: ..." line of their processing history.
     bool depth = false;
+    // Raw trace-header integers already read, by (first byte, size): a
+    // cache for Flatten on a header time (UI thread only).
+    std::map<std::pair<int, int>, std::vector<int32_t>> headerFieldCache;
 };
 
 // Same fields as the removed shells' AppState -- one shared struct instead
@@ -282,6 +292,7 @@ struct XfState {
     int activeBoxIndex = -1;
     std::vector<segy::ViewRange> zoomHistory;
     int64_t traceOffset = 0; // x-f trace 0 = this seismic trace
+    int64_t traceStride = 1; // x-f trace k = seismic trace traceOffset + k * traceStride
     // The x-f color scale, remembered across toggles within a session
     // (default green -40 dB .. red 0 dB; the user may change it in x-f).
     segy::ColorScale colorScale = segy::ColorScale::RedYellowGreen;
@@ -1493,7 +1504,7 @@ public:
     // settings; exitXfMode() restores everything as it was. Choosing a
     // different Foreground while in x-f leaves x-f (display restored, the
     // parked dataset dropped).
-    void enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOffset);
+    void enterXfMode(std::shared_ptr<Dataset> xfDataset, int64_t traceOffset, int64_t traceStride = 1);
     void exitXfMode();
 
     // Right-click on an axis (outside the plot): Axis Ranges... (trace and

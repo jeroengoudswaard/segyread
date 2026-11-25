@@ -1,4 +1,5 @@
 #include "horizons.h"
+#include "threadpool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -80,13 +81,21 @@ std::vector<double> autoPickSeabed(const HorizonTraceFetch& fetch, int64_t trace
         return kNaN;
     };
     // (Nearly) empty traces get no pick: their peak is noise, not a seabed.
+    // The first pass is per trace and independent: in parallel (`fetch`
+    // must be thread-safe; decoding from an mmap is).
     std::vector<float> peaks(static_cast<size_t>(n), 0.0f);
-    for (int64_t t = 0; t < n; ++t) {
-        fetch(traceStart + t, trace.data());
-        for (int i = std::max(0, firstSample); i < samplesPerTrace; ++i) {
-            peaks[size_t(t)] = std::max(peaks[size_t(t)], std::fabs(trace[size_t(i)]));
-        }
-        picks[size_t(t)] = firstBreak(trace, 0, samplesPerTrace);
+    {
+        ThreadPool pool;
+        pool.parallelFor(size_t(n), 256, [&](size_t begin, size_t end) {
+            std::vector<float> local(static_cast<size_t>(samplesPerTrace));
+            for (size_t t = begin; t < end; ++t) {
+                fetch(traceStart + int64_t(t), local.data());
+                for (int i = std::max(0, firstSample); i < samplesPerTrace; ++i) {
+                    peaks[t] = std::max(peaks[t], std::fabs(local[size_t(i)]));
+                }
+                picks[t] = firstBreak(local, 0, samplesPerTrace);
+            }
+        });
     }
     std::vector<float> sortedPeaks = peaks;
     std::nth_element(sortedPeaks.begin(), sortedPeaks.begin() + std::ptrdiff_t(sortedPeaks.size() / 2), sortedPeaks.end());
