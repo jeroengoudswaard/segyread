@@ -456,29 +456,93 @@ double nearestSidePeakLag(const std::vector<float>& correlation, int minLag, dou
     return std::fabs(left) < std::fabs(right) ? left : right;
 }
 
-std::vector<float> fractionalShift(const std::vector<float>& x, double shift) {
-    const size_t n = x.size();
-    if (n == 0 || shift == 0.0) return x;
-    // Zero-padded to twice the length so the circular wrap-around of the
-    // phase ramp only touches the padding, not the samples we return.
-    const size_t len = nextPowerOfTwo(2 * n);
-    std::vector<std::complex<float>> buf(len, std::complex<float>(0.0f, 0.0f));
-    for (size_t i = 0; i < n; ++i) buf[i] = std::complex<float>(x[i], 0.0f);
-    fft(buf);
-    const double twoPi = 2.0 * std::acos(-1.0);
-    for (size_t m = 0; m < len; ++m) {
-        if (m == len / 2) {
-            buf[m] *= float(std::cos(0.5 * twoPi * shift)); // Nyquist bin stays real
-            continue;
+namespace {
+
+// Radix-2 complex FFT in double precision for SIGCOR, which ports a
+// double-precision MATLAB reference (the shared float FFT would put a
+// noise floor about 140 dB under the peak). Forward: X[k] = sum x[t]
+// e^{-2 pi i k t / N}, as MATLAB's fft; inverse divides by N.
+class DoubleFft {
+public:
+    explicit DoubleFft(size_t n) : n_(n), twiddle_(n / 2) {
+        const double twoPi = 2.0 * std::acos(-1.0);
+        for (size_t k = 0; k < n / 2; ++k) {
+            twiddle_[k] = std::polar(1.0, -twoPi * double(k) / double(n));
         }
-        double freq = m < len / 2 ? double(m) : double(m) - double(len); // signed bin
-        double phase = twoPi * freq * shift / double(len);
-        buf[m] *= std::complex<float>(float(std::cos(phase)), float(std::sin(phase)));
     }
-    ifft(buf);
-    std::vector<float> out(n);
-    for (size_t i = 0; i < n; ++i) out[i] = buf[i].real();
-    return out;
+    void forward(std::vector<std::complex<double>>& a) const { run(a, false); }
+    void inverse(std::vector<std::complex<double>>& a) const {
+        run(a, true);
+        const double inv = 1.0 / double(n_);
+        for (auto& v : a) v *= inv;
+    }
+
+private:
+    void run(std::vector<std::complex<double>>& a, bool inverse) const {
+        for (size_t i = 1, j = 0; i < n_; ++i) {
+            size_t bit = n_ >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) std::swap(a[i], a[j]);
+        }
+        for (size_t len = 2; len <= n_; len <<= 1) {
+            const size_t halfLen = len / 2, step = n_ / len;
+            for (size_t i = 0; i < n_; i += len) {
+                for (size_t k = 0; k < halfLen; ++k) {
+                    std::complex<double> w = twiddle_[k * step];
+                    if (inverse) w = std::conj(w);
+                    const std::complex<double> u = a[i + k], v = a[i + k + halfLen] * w;
+                    a[i + k] = u + v;
+                    a[i + k + halfLen] = u - v;
+                }
+            }
+        }
+    }
+    size_t n_;
+    std::vector<std::complex<double>> twiddle_;
+};
+
+// Modified Bessel function of the first kind, order 0 (power series).
+double besselI0(double x) {
+    const double q = 0.25 * x * x;
+    double sum = 1.0, term = 1.0;
+    for (int k = 1; k < 1000; ++k) {
+        term *= q / (double(k) * double(k));
+        sum += term;
+        if (term < sum * 1e-17) break;
+    }
+    return sum;
+}
+
+// MATLAB eps(x) for x >= 1: the spacing of doubles at x.
+double epsAt(double x) { return std::nextafter(x, std::numeric_limits<double>::infinity()) - x; }
+
+} // namespace
+
+std::vector<double> kaiserWindow(int n, double beta) {
+    if (n <= 0) return {};
+    if (n == 1) return {1.0};
+    std::vector<double> w(static_cast<size_t>(n));
+    const double norm = besselI0(beta);
+    for (int k = 0; k < n; ++k) {
+        const double q = 2.0 * double(k) / double(n - 1) - 1.0;
+        w[size_t(k)] = besselI0(beta * std::sqrt(std::max(0.0, 1.0 - q * q))) / norm;
+    }
+    return w;
+}
+
+std::vector<int> sigcorSkipDraws(int64_t count, int nskip, int iransk, uint32_t seed) {
+    std::vector<int> draws(size_t(std::max<int64_t>(0, count - 1)), nskip);
+    if (iransk <= 0) return draws;
+    std::mt19937 rng(seed);
+    const int lo = nskip - iransk, span = 2 * iransk + 1;
+    for (int& skip : draws) {
+        // 53-bit uniform double in [0, 1) from two 32-bit outputs (genrand_res53).
+        const double a = double(rng() >> 5), b = double(rng() >> 6);
+        const double u = (a * 67108864.0 + b) / 9007199254740992.0;
+        skip = lo + std::min(span - 1, int(u * span));
+    }
+    return draws;
 }
 
 SigcorResult computeSigcor(const SigcorTraceFetch& fetch, int samplesPerTrace, int64_t traceStart, int64_t traceEnd,
@@ -486,230 +550,276 @@ SigcorResult computeSigcor(const SigcorTraceFetch& fetch, int samplesPerTrace, i
                            const std::function<void(int, int)>& progress) {
     SigcorResult res;
     traceStart = std::max<int64_t>(0, traceStart);
+    traceEnd = std::max(traceStart, traceEnd);
     gateStart = std::clamp(gateStart, 0, std::max(0, samplesPerTrace));
     gateEnd = std::clamp(gateEnd, gateStart, std::max(0, samplesPerTrace));
-    const int n = gateEnd - gateStart;
+    const int n = gateEnd - gateStart; // MATLAB nGate
     res.gateSamples = n;
-    if (n < 8 || sampleIntervalUs <= 0.0 || !fetch) return res;
-
-    const int nskip = std::max(1, params.nskip);
-    const int iransk = std::max(0, params.iransk);
-    const int64_t lastStart = traceEnd - 1 - nskip;
-    if (lastStart < traceStart) return res;
-    const int64_t startCount = lastStart - traceStart + 1;
-    const int pairCount = int(std::min<int64_t>(startCount, std::max(1, params.maxPairs)));
-
+    if (sampleIntervalUs <= 0.0 || !fetch) {
+        res.error = "The dataset has no sample interval.";
+        return res;
+    }
+    if (params.nskip < 0 || params.iransk < 0) {
+        res.error = "Skipped traces and random variation must not be negative.";
+        return res;
+    }
+    if (params.iransk > params.nskip) {
+        res.error = "The random variation (IRANSK) must not exceed the skipped traces (NSKIP).";
+        return res;
+    }
     const double dtMs = sampleIntervalUs / 1000.0;
-    // SHMAX of 0 or 1 sample: no shift estimate at all, the user has aligned
-    // the data (same rule as SIGCOR).
-    const int maxShift = std::max(0, int(std::lround(params.shmaxMs / dtMs)));
-    const bool estimateShift = maxShift > 1;
+    const int sh = int(std::lround(params.shmaxMs / dtMs)); // MATLAB round(SHMax/dt)
+    res.shmaxSamples = sh;
+    if (sh < 1) {
+        res.error = "Max shift must cover at least one sample.";
+        return res;
+    }
+    if (2 * sh + 3 > n) {
+        res.error = "The time gate is too short for the max shift: it needs at least " + std::to_string(2 * sh + 3) +
+                    " samples (2 x max shift + 3).";
+        return res;
+    }
     const bool autcor = params.option == SigcorOption::Autcor;
-
-    std::mt19937 rng(params.seed);
-    std::uniform_int_distribution<int> extraDistance(0, iransk);
-    const std::vector<float> window = cosineSquaredWindow(n, params.flatPercent);
-
-    // SPECTR: periodograms on the gate's own power-of-two length. AUTCOR:
-    // correlations up to lag n - 1, so the final transform needs >= 2n - 1.
+    // SPECTR: MATLAB's default NFFT = 2^nextpow2(nGate). AUTCOR: lags up to
+    // n - 1 need a transform of at least 2n - 1.
     const size_t fftLen = autcor ? nextPowerOfTwo(size_t(2 * n)) : nextPowerOfTwo(size_t(n));
-    const size_t half = fftLen / 2;
-    std::vector<double> sumTrace(autcor ? size_t(n) : half + 1, 0.0);
-    std::vector<double> sumSignal(sumTrace.size(), 0.0);
+    const size_t half = fftLen / 2; // nFreq = half + 1
+    res.fftLength = int(fftLen);
 
-    std::vector<float> traceA(static_cast<size_t>(samplesPerTrace)), traceB(static_cast<size_t>(samplesPerTrace));
-    std::vector<double> a(static_cast<size_t>(n)), b(static_cast<size_t>(n));
-    std::vector<double> lagValues;
-    constexpr int kPad = 16; // context around the gate for the fractional shift
-    std::vector<std::complex<float>> specA(fftLen), specB(fftLen);
-
-    for (int p = 0; p < pairCount; ++p) {
-        const int64_t i = traceStart + (pairCount == startCount
-                                            ? int64_t(p)
-                                            : int64_t((double(p) + 0.5) * double(startCount) / double(pairCount)));
-        int64_t j = i + nskip + (iransk > 0 ? extraDistance(rng) : 0);
-        if (j > traceEnd - 1) j = i + nskip;
-        ++res.pairsTotal;
-        if (progress) progress(p + 1, pairCount);
-        fetch(i, traceA.data());
-        fetch(j, traceB.data());
-
-        double meanA = 0.0;
-        for (int t = 0; t < n; ++t) meanA += (a[size_t(t)] = traceA[size_t(gateStart + t)]);
-        meanA /= n;
-        if (params.removeDc) {
-            for (double& v : a) v -= meanA;
+    // Streaming pair selection: one draw per current trace 2..nTraces, an
+    // earlier partner only when the history reaches back far enough.
+    const int64_t nTraces = traceEnd - traceStart;
+    const std::vector<int> draws = sigcorSkipDraws(nTraces, params.nskip, params.iransk, params.seed);
+    std::vector<SigcorPair> candidates;
+    candidates.reserve(draws.size());
+    for (int64_t c = 1; c < nTraces; ++c) {
+        const int skip = draws[size_t(c - 1)];
+        const int64_t earlier = c - (skip + 1);
+        if (earlier < 0) continue;
+        SigcorPair pair;
+        pair.earlierTrace = traceStart + earlier;
+        pair.currentTrace = traceStart + c;
+        pair.actualSkip = skip;
+        candidates.push_back(pair);
+    }
+    res.pairsCandidate = int(candidates.size());
+    const size_t maxPairs = size_t(std::max(1, params.maxPairs));
+    if (candidates.size() > maxPairs) {
+        // An even subset (bounded work on huge views), in trace order.
+        for (size_t k = 0; k < maxPairs; ++k) {
+            res.pairs.push_back(candidates[size_t((double(k) + 0.5) * double(candidates.size()) / double(maxPairs))]);
         }
-        double energyA = 0.0;
-        for (double v : a) energyA += v * v;
-        if (energyA <= 0.0) {
-            ++res.pairsDead;
-            continue;
-        }
+    } else {
+        res.pairs = std::move(candidates);
+    }
+    res.pairsTotal = int(res.pairs.size());
+    if (res.pairs.empty()) return res;
 
-        // Integer shift: maximum of the crosscorrelation of gate A with the
-        // second trace over lags -SHMAX..+SHMAX. The second gate is gate A
-        // extended by SHMAX on both sides; where the trace ends first (a
-        // gate reaching the top or bottom of the trace), gate A is trimmed
-        // by SHMAX there for this estimate only, so the full lag range
-        // always fits. The spectra still use the whole gate.
-        int bestLag = 0;
-        double delta = 0.0;
-        if (estimateShift) {
-            const int lagMin = -maxShift, lagMax = maxShift;
-            const int corrStart = std::max(gateStart, maxShift) - gateStart;              // offset into a
-            const int corrEnd = std::min(gateEnd, samplesPerTrace - maxShift) - gateStart; // exclusive
-            if (corrEnd - corrStart < 8) {
-                ++res.pairsAtShiftLimit;
-                continue;
-            }
-            // DC of trace B over the whole searched window.
-            double meanB = 0.0;
-            if (params.removeDc) {
-                for (int t = gateStart + corrStart + lagMin; t < gateStart + corrEnd + lagMax; ++t) {
-                    meanB += traceB[size_t(t)];
+    const std::vector<double> taper = kaiserWindow(n, params.kaiserBeta);
+    const DoubleFft transform(fftLen);
+    const size_t bins = autcor ? size_t(n) : half + 1; // accumulated per block: lags or frequencies
+    // Fixed-size blocks, summed in order afterwards: the result does not
+    // depend on the thread count.
+    constexpr size_t kBlock = 32;
+    const size_t blockCount = (res.pairs.size() + kBlock - 1) / kBlock;
+    std::vector<std::vector<double>> blockTrace(blockCount), blockSignal(blockCount), blockNoise(blockCount);
+    std::atomic<int> done{0};
+    const int total = res.pairsTotal;
+
+    analysisPool().parallelFor(blockCount, 1, [&](size_t blockBegin, size_t blockEnd) {
+        std::vector<float> traceA(static_cast<size_t>(samplesPerTrace)), traceB(static_cast<size_t>(samplesPerTrace));
+        std::vector<double> lagValue(size_t(2 * sh + 1));
+        std::vector<double> xs(static_cast<size_t>(n)), ys(static_cast<size_t>(n));
+        std::vector<std::complex<double>> specX(fftLen), specY(fftLen);
+        for (size_t block = blockBegin; block < blockEnd; ++block) {
+            std::vector<double>& sumT = blockTrace[block];
+            std::vector<double>& sumS = blockSignal[block];
+            std::vector<double>& sumN = blockNoise[block];
+            sumT.assign(bins, 0.0);
+            sumS.assign(bins, 0.0);
+            sumN.assign(autcor ? 0 : bins, 0.0);
+            const size_t pairEnd = std::min(res.pairs.size(), (block + 1) * kBlock);
+            for (size_t pi = block * kBlock; pi < pairEnd; ++pi) {
+                SigcorPair& pair = res.pairs[pi];
+                if (progress) progress(++done, total);
+                fetch(pair.earlierTrace, traceA.data());
+                fetch(pair.currentTrace, traceB.data());
+                const float* x = traceA.data() + gateStart; // MATLAB xRaw
+                const float* y = traceB.data() + gateStart; // MATLAB yRaw
+
+                // findCorrelationPeak: normalised correlation of the
+                // overlapping raw gates at every integer lag. Positive lag
+                // compares x(1:end-lag) with y(1+lag:end).
+                int bestIndex = -1;
+                double best = 0.0;
+                for (int lag = -sh; lag <= sh; ++lag) {
+                    const int xFirst = lag >= 0 ? 0 : -lag;
+                    const int yFirst = lag >= 0 ? lag : 0;
+                    const int count = n - std::abs(lag);
+                    double sxy = 0.0, sxx = 0.0, syy = 0.0;
+                    for (int t = 0; t < count; ++t) {
+                        const double xv = x[xFirst + t], yv = y[yFirst + t];
+                        sxy += xv * yv;
+                        sxx += xv * xv;
+                        syy += yv * yv;
+                    }
+                    const double denom = std::sqrt(sxx * syy);
+                    const double c = denom > 0.0 ? sxy / denom : std::numeric_limits<double>::quiet_NaN();
+                    lagValue[size_t(lag + sh)] = c;
+                    if (!std::isnan(c) && (bestIndex < 0 || c > best)) { // MATLAB max: first maximum, NaN omitted
+                        best = c;
+                        bestIndex = lag + sh;
+                    }
                 }
-                meanB /= double(corrEnd - corrStart + lagMax - lagMin);
-            }
-            lagValues.assign(size_t(lagMax - lagMin + 1), 0.0);
-            double bestValue = -std::numeric_limits<double>::infinity();
-            for (int k = lagMin; k <= lagMax; ++k) {
-                double sum = 0.0, energyB = 0.0;
-                for (int t = corrStart; t < corrEnd; ++t) {
-                    double v = double(traceB[size_t(gateStart + t + k)]) - meanB;
-                    sum += a[size_t(t)] * v;
-                    energyB += v * v;
+                if (bestIndex < 0) {
+                    pair.correlation = std::numeric_limits<double>::quiet_NaN();
+                    pair.status = SigcorPairStatus::Dead;
+                    continue;
                 }
-                double value = sum;
-                if (params.tcross == SigcorCrossCorrelator::Normalized) {
-                    value = energyB > 0.0 ? sum / std::sqrt(energyB) : 0.0;
+                pair.discreteLag = bestIndex - sh;
+                pair.parabolicLag = pair.discreteLag;
+                pair.correlation = best;
+                if (bestIndex == 0 || bestIndex == 2 * sh) {
+                    pair.status = SigcorPairStatus::AtShiftLimit;
+                    continue;
                 }
-                lagValues[size_t(k - lagMin)] = value;
-                if (value > bestValue) {
-                    bestValue = value;
-                    bestLag = k;
+                const double cm = lagValue[size_t(bestIndex - 1)], c0 = best, cp = lagValue[size_t(bestIndex + 1)];
+                const double curvature = cm - 2.0 * c0 + cp;
+                if (std::isfinite(curvature) && std::fabs(curvature) > epsAt(std::max(1.0, std::fabs(c0)))) {
+                    const double delta = 0.5 * (cm - cp) / curvature;
+                    if (std::fabs(delta) <= 1.0) pair.parabolicLag = pair.discreteLag + delta;
                 }
-            }
-            if (bestLag == lagMin || bestLag == lagMax) {
-                ++res.pairsAtShiftLimit;
-                continue;
-            }
-            // Parabolic interpolation through the maximum and its neighbours.
-            double ym = lagValues[size_t(bestLag - 1 - lagMin)];
-            double y0 = lagValues[size_t(bestLag - lagMin)];
-            double yp = lagValues[size_t(bestLag + 1 - lagMin)];
-            double curvature = ym - 2.0 * y0 + yp;
-            if (curvature < 0.0) delta = std::clamp(0.5 * (ym - yp) / curvature, -0.5, 0.5);
-        }
+                if (!std::isfinite(best) || best < params.ccmin) {
+                    pair.status = SigcorPairStatus::LowCorrelation;
+                    continue;
+                }
 
-        // Gate B aligned to gate A: integer part by indexing, fraction by a
-        // band-limited phase shift over the gate plus some context.
-        std::vector<float> segment(size_t(n + 2 * kPad), 0.0f);
-        for (int t = 0; t < n + 2 * kPad; ++t) {
-            int src = gateStart + bestLag - kPad + t;
-            if (src >= 0 && src < samplesPerTrace) segment[size_t(t)] = traceB[size_t(src)];
+                // NIPOL = 1: apply the nearest whole-sample shift (MATLAB
+                // round: halves away from zero). The overlap stays at x's
+                // own positions in a zero-filled gate, y moved onto it.
+                const int lag = int(std::round(pair.parabolicLag));
+                pair.appliedLag = lag;
+                const int count = n - std::abs(lag);
+                const int xFirst = lag >= 0 ? 0 : -lag;
+                const int yFirst = lag >= 0 ? lag : 0;
+                double meanX = 0.0, meanY = 0.0;
+                if (params.removeDc) {
+                    for (int t = 0; t < count; ++t) {
+                        meanX += x[xFirst + t];
+                        meanY += y[yFirst + t];
+                    }
+                    meanX /= count;
+                    meanY /= count;
+                }
+                double energyX = 0.0, energyY = 0.0;
+                for (int t = 0; t < count; ++t) {
+                    xs[size_t(t)] = double(x[xFirst + t]) - meanX;
+                    ys[size_t(t)] = double(y[yFirst + t]) - meanY;
+                    energyX += xs[size_t(t)] * xs[size_t(t)];
+                    energyY += ys[size_t(t)] * ys[size_t(t)];
+                }
+                double scaleX = 1.0, scaleY = 1.0;
+                if (params.normalise) { // rmsNormalise: unit RMS, an all-zero overlap stays zero
+                    const double rmsX = std::sqrt(energyX / count), rmsY = std::sqrt(energyY / count);
+                    scaleX = rmsX > 0.0 ? 1.0 / rmsX : 0.0;
+                    scaleY = rmsY > 0.0 ? 1.0 / rmsY : 0.0;
+                }
+                std::fill(specX.begin(), specX.end(), std::complex<double>(0.0, 0.0));
+                std::fill(specY.begin(), specY.end(), std::complex<double>(0.0, 0.0));
+                for (int t = 0; t < count; ++t) {
+                    const int pos = xFirst + t; // MATLAB idx
+                    specX[size_t(pos)] = xs[size_t(t)] * scaleX * taper[size_t(pos)];
+                    specY[size_t(pos)] = ys[size_t(t)] * scaleY * taper[size_t(pos)];
+                }
+                transform.forward(specX);
+                transform.forward(specY);
+                if (!autcor) {
+                    for (size_t m = 0; m <= half; ++m) {
+                        const std::complex<double> X = specX[m], Y = specY[m];
+                        sumT[m] += 0.5 * (std::norm(X) + std::norm(Y));
+                        sumS[m] += (X * std::conj(Y)).real();
+                        sumN[m] += 0.5 * std::norm(X - Y); // the non-negative form of T - S
+                    }
+                } else {
+                    // Time domain: trace autocorrelation (r_xx + r_yy) / 2 in
+                    // the real part, the symmetrised crosscorrelation (the
+                    // signal autocorrelation) in the imaginary part of one
+                    // inverse transform -- both are real and even.
+                    for (size_t m = 0; m < fftLen; ++m) {
+                        const std::complex<double> X = specX[m], Y = specY[m];
+                        specX[m] = {0.5 * (std::norm(X) + std::norm(Y)), (X * std::conj(Y)).real()};
+                    }
+                    transform.inverse(specX);
+                    for (int k = 0; k < n; ++k) {
+                        sumT[size_t(k)] += specX[size_t(k)].real();
+                        sumS[size_t(k)] += specX[size_t(k)].imag();
+                    }
+                }
+                pair.status = SigcorPairStatus::Accepted;
+            }
         }
-        if (delta != 0.0) segment = fractionalShift(segment, delta);
-        double meanBGate = 0.0;
-        for (int t = 0; t < n; ++t) meanBGate += (b[size_t(t)] = segment[size_t(kPad + t)]);
-        meanBGate /= n;
-        if (params.removeDc) {
-            for (double& v : b) v -= meanBGate;
-        }
-        double energyB = 0.0, cross = 0.0;
-        for (int t = 0; t < n; ++t) {
-            energyB += b[size_t(t)] * b[size_t(t)];
-            cross += a[size_t(t)] * b[size_t(t)];
-        }
-        if (energyB <= 0.0) {
-            ++res.pairsDead;
-            continue;
-        }
-        const double rho = cross / std::sqrt(energyA * energyB);
-        if (rho < params.ccmin) {
-            ++res.pairsLowCorrelation;
-            continue;
-        }
+    });
 
-        // Equalize energy (unit RMS per gate), then taper.
-        const double scaleA = params.normalise ? 1.0 / std::sqrt(energyA / n) : 1.0;
-        const double scaleB = params.normalise ? 1.0 / std::sqrt(energyB / n) : 1.0;
-        std::fill(specA.begin(), specA.end(), std::complex<float>(0.0f, 0.0f));
-        std::fill(specB.begin(), specB.end(), std::complex<float>(0.0f, 0.0f));
-        for (int t = 0; t < n; ++t) {
-            specA[size_t(t)] = float(a[size_t(t)] * scaleA * window[size_t(t)]);
-            specB[size_t(t)] = float(b[size_t(t)] * scaleB * window[size_t(t)]);
+    std::vector<double> sumT(bins, 0.0), sumS(bins, 0.0), sumN(autcor ? 0 : bins, 0.0);
+    for (size_t b = 0; b < blockCount; ++b) {
+        for (size_t m = 0; m < bins; ++m) {
+            sumT[m] += blockTrace[b][m];
+            sumS[m] += blockSignal[b][m];
+            if (!autcor) sumN[m] += blockNoise[b][m];
         }
-        fft(specA);
-        fft(specB);
-        if (!autcor) {
-            for (size_t m = 0; m <= half; ++m) {
-                std::complex<double> A(specA[m]), B(specB[m]);
-                sumTrace[m] += 0.5 * (std::norm(A) + std::norm(B));
-                sumSignal[m] += (A * std::conj(B)).real();
-            }
-        } else {
-            // Time domain: trace autocorrelation (r_aa + r_bb) / 2 in the
-            // real part, symmetrized crosscorrelation (c_ab(k) + c_ab(-k)) / 2
-            // (the signal autocorrelation) in the imaginary part of one
-            // inverse transform -- both are real and even.
-            for (size_t m = 0; m < fftLen; ++m) {
-                std::complex<double> A(specA[m]), B(specB[m]);
-                double tracePart = 0.5 * (std::norm(A) + std::norm(B));
-                double signalPart = (std::conj(A) * B).real();
-                specA[m] = std::complex<float>(float(tracePart), float(signalPart));
-            }
-            ifft(specA);
-            for (int k = 0; k < n; ++k) {
-                sumTrace[size_t(k)] += specA[size_t(k)].real();
-                sumSignal[size_t(k)] += specA[size_t(k)].imag();
-            }
+    }
+    std::vector<double> lags;
+    for (const SigcorPair& pair : res.pairs) {
+        switch (pair.status) {
+        case SigcorPairStatus::Accepted:
+            ++res.pairsUsed;
+            lags.push_back(pair.parabolicLag * dtMs);
+            break;
+        case SigcorPairStatus::AtShiftLimit: ++res.pairsAtShiftLimit; break;
+        case SigcorPairStatus::LowCorrelation: ++res.pairsLowCorrelation; break;
+        case SigcorPairStatus::Dead: ++res.pairsDead; break;
         }
-        res.pairTrace.push_back(i);
-        res.pairShiftMs.push_back(float((double(bestLag) + delta) * dtMs));
-        res.pairCorrelation.push_back(float(rho));
-        ++res.pairsUsed;
     }
     if (res.pairsUsed == 0) return res;
 
     const double invUsed = 1.0 / double(res.pairsUsed);
     res.tracePower.assign(half + 1, 0.0);
     res.signalPower.assign(half + 1, 0.0);
+    res.noisePower.assign(half + 1, 0.0);
     if (!autcor) {
         for (size_t m = 0; m <= half; ++m) {
-            res.tracePower[m] = sumTrace[m] * invUsed;
-            res.signalPower[m] = sumSignal[m] * invUsed;
+            res.tracePower[m] = sumT[m] * invUsed;
+            res.signalPower[m] = sumS[m] * invUsed;
+            res.noisePower[m] = sumN[m] * invUsed;
         }
     } else {
         // Averaged correlations -> power spectra: transform the even
         // sequences r[-(n-1)..n-1] (trace in real, signal in imaginary).
-        std::vector<std::complex<float>> corr(fftLen, std::complex<float>(0.0f, 0.0f));
+        std::vector<std::complex<double>> corr(fftLen, std::complex<double>(0.0, 0.0));
         for (int k = 0; k < n; ++k) {
-            std::complex<float> v(float(sumTrace[size_t(k)] * invUsed), float(sumSignal[size_t(k)] * invUsed));
+            const std::complex<double> v(sumT[size_t(k)] * invUsed, sumS[size_t(k)] * invUsed);
             corr[size_t(k)] = v;
             if (k > 0) corr[fftLen - size_t(k)] = v;
         }
-        fft(corr);
-        // FFT of (t + i s) with t, s real and even = T + i S, T and S real.
+        transform.forward(corr);
         for (size_t m = 0; m <= half; ++m) {
             res.tracePower[m] = corr[m].real();
             res.signalPower[m] = corr[m].imag();
+            // T - S is the mean of |X - Y|^2 / 2 here too; only roundoff
+            // can take it below zero.
+            res.noisePower[m] = std::max(0.0, res.tracePower[m] - res.signalPower[m]);
         }
     }
-    res.noisePower.resize(half + 1);
     res.frequencyHz.resize(half + 1);
     const double dtSeconds = sampleIntervalUs / 1e6;
-    for (size_t m = 0; m <= half; ++m) {
-        res.noisePower[m] = res.tracePower[m] - res.signalPower[m];
-        res.frequencyHz[m] = float(double(m) / (double(fftLen) * dtSeconds));
-    }
+    for (size_t m = 0; m <= half; ++m) res.frequencyHz[m] = float(double(m) / (double(fftLen) * dtSeconds));
 
     double sum = 0.0;
-    for (float s : res.pairShiftMs) sum += s;
-    res.shiftMeanMs = sum / res.pairsUsed;
+    for (double s : lags) sum += s;
+    res.shiftMeanMs = sum / double(lags.size());
     double var = 0.0;
-    for (float s : res.pairShiftMs) var += (s - res.shiftMeanMs) * (s - res.shiftMeanMs);
-    res.shiftSigmaMs = res.pairsUsed > 1 ? std::sqrt(var / (res.pairsUsed - 1)) : 0.0;
+    for (double s : lags) var += (s - res.shiftMeanMs) * (s - res.shiftMeanMs);
+    res.shiftSigmaMs = lags.size() > 1 ? std::sqrt(var / double(lags.size() - 1)) : 0.0;
     return res;
 }
 

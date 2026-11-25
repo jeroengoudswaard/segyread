@@ -1452,7 +1452,7 @@ SigcorSynthetic makeSigcorSynthetic(int traces, int samples, double dtSeconds, d
 }
 
 void testSigcorHelpers() {
-    section("Signal/Noise: cosine-squared window and fractional shift");
+    section("Signal/Noise: cosine-squared window, Kaiser window, IRANSK draws");
     std::vector<float> w = segy::cosineSquaredWindow(100, 5.0);
     CHECK(w.size() == 100);
     CHECK_NEAR(w[49], 1.0, 1e-6);
@@ -1465,18 +1465,252 @@ void testSigcorHelpers() {
     std::vector<float> flat = segy::cosineSquaredWindow(10, 100.0);
     CHECK(std::all_of(flat.begin(), flat.end(), [](float v) { return v == 1.0f; }));
 
-    // A slow sine shifted by 0.3 samples: out[i] = sin(2 pi f (i + 0.3)) away from the ends.
+    // Kaiser, beta 5: ends 1 / I0(5) = 1 / 27.239871823604442, centre 1.
+    std::vector<double> k = segy::kaiserWindow(101, 5.0);
+    CHECK(k.size() == 101);
+    CHECK_NEAR(k[0], 1.0 / 27.239871823604442, 1e-12);
+    CHECK_NEAR(k[100], k[0], 1e-15);
+    CHECK_NEAR(k[50], 1.0, 1e-15);
+    bool kaiserSymmetric = true;
+    for (int i = 0; i < 101; ++i) kaiserSymmetric = kaiserSymmetric && std::fabs(k[size_t(i)] - k[size_t(100 - i)]) < 1e-15;
+    CHECK(kaiserSymmetric);
+    CHECK(segy::kaiserWindow(1, 5.0) == std::vector<double>{1.0});
+    std::vector<double> rect = segy::kaiserWindow(8, 0.0);
+    CHECK(std::all_of(rect.begin(), rect.end(), [](double v) { return v == 1.0; }));
+
+    // NSKIP 3, IRANSK 2: skips 1..5, uniform and symmetric about 3; seeded.
+    std::vector<int> draws = segy::sigcorSkipDraws(20001, 3, 2, 12345);
+    CHECK(draws.size() == 20000);
+    int hist[7] = {0, 0, 0, 0, 0, 0, 0};
+    bool inRange = true;
+    for (int s : draws) {
+        inRange = inRange && s >= 1 && s <= 5;
+        if (s >= 0 && s <= 6) ++hist[s];
+    }
+    CHECK(inRange);
+    for (int s = 1; s <= 5; ++s) CHECK(hist[s] > 3700 && hist[s] < 4300);
+    CHECK(segy::sigcorSkipDraws(20001, 3, 2, 12345) == draws);
+    CHECK(segy::sigcorSkipDraws(20001, 3, 2, 7) != draws);
+    std::vector<int> fixed = segy::sigcorSkipDraws(10, 4, 0, 12345);
+    CHECK(fixed.size() == 9 && std::all_of(fixed.begin(), fixed.end(), [](int s) { return s == 4; }));
+    CHECK(segy::sigcorSkipDraws(1, 3, 2, 1).empty());
+}
+
+// A line-by-line transliteration of the MATLAB reference
+// sigcor_spectr_stndrd.m (SPECTR, NIPol = 1), with a plain O(N^2) DFT, to
+// check computeSigcor against. The IRANSK draws come from
+// segy::sigcorSkipDraws (checked on their own above).
+struct SigcorReference {
+    std::vector<double> trace, signal, noise;
+    std::vector<segy::SigcorPair> pairs;
+    int accepted = 0;
+};
+
+SigcorReference sigcorReference(const std::vector<std::vector<float>>& traces, int gate0, int gate1 /*inclusive*/,
+                                double dt, const segy::SigcorParams& p) {
+    SigcorReference ref;
+    const int nTraces = int(traces.size());
+    const int nGate = gate1 - gate0 + 1;
+    const int shMax = int(std::lround(p.shmaxMs / 1000.0 / dt));
+    int nfft = 1;
+    while (nfft < nGate) nfft *= 2;
+    const int nFreq = nfft / 2 + 1;
     const double pi = 3.14159265358979323846;
-    std::vector<float> x(200);
-    for (int i = 0; i < 200; ++i) x[size_t(i)] = float(std::sin(2.0 * pi * 0.03 * i));
-    std::vector<float> y = segy::fractionalShift(x, 0.3);
-    double maxErr = 0.0;
-    for (int i = 40; i < 160; ++i) maxErr = std::max(maxErr, std::fabs(y[size_t(i)] - std::sin(2.0 * pi * 0.03 * (i + 0.3))));
-    CHECK(maxErr < 0.02);
+    std::vector<double> taper(static_cast<size_t>(nGate));
+    auto i0 = [](double x) {
+        double sum = 1.0, term = 1.0;
+        for (int m = 1; m < 200; ++m) {
+            term *= (x * x / 4.0) / (double(m) * m);
+            sum += term;
+        }
+        return sum;
+    };
+    for (int t = 0; t < nGate; ++t) {
+        double q = nGate == 1 ? 0.0 : 2.0 * t / (nGate - 1) - 1.0;
+        taper[size_t(t)] = i0(p.kaiserBeta * std::sqrt(std::max(0.0, 1.0 - q * q))) / i0(p.kaiserBeta);
+    }
+    ref.trace.assign(size_t(nFreq), 0.0);
+    ref.signal.assign(size_t(nFreq), 0.0);
+    ref.noise.assign(size_t(nFreq), 0.0);
+    auto overlap = [](const std::vector<double>& x, const std::vector<double>& y, int lag, std::vector<double>& xo,
+                      std::vector<double>& yo) {
+        const int n = int(x.size());
+        xo.clear();
+        yo.clear();
+        if (lag >= 0) {
+            for (int t = 0; t < n - lag; ++t) xo.push_back(x[size_t(t)]), yo.push_back(y[size_t(t + lag)]);
+        } else {
+            for (int t = -lag; t < n; ++t) xo.push_back(x[size_t(t)]);
+            for (int t = 0; t < n + lag; ++t) yo.push_back(y[size_t(t)]);
+        }
+    };
+    const std::vector<int> draws = segy::sigcorSkipDraws(nTraces, p.nskip, p.iransk, p.seed);
+    for (int current = 1; current < nTraces; ++current) {
+        const int skip = draws[size_t(current - 1)];
+        const int earlier = current - (skip + 1);
+        if (earlier < 0) continue;
+        segy::SigcorPair pair;
+        pair.earlierTrace = earlier;
+        pair.currentTrace = current;
+        pair.actualSkip = skip;
+        std::vector<double> xRaw(static_cast<size_t>(nGate)), yRaw(static_cast<size_t>(nGate)), xo, yo;
+        for (int t = 0; t < nGate; ++t) {
+            xRaw[size_t(t)] = traces[size_t(earlier)][size_t(gate0 + t)];
+            yRaw[size_t(t)] = traces[size_t(current)][size_t(gate0 + t)];
+        }
+        // findCorrelationPeak
+        std::vector<double> c(size_t(2 * shMax + 1), std::nan(""));
+        for (int lag = -shMax; lag <= shMax; ++lag) {
+            overlap(xRaw, yRaw, lag, xo, yo);
+            double sxy = 0, sxx = 0, syy = 0;
+            for (size_t t = 0; t < xo.size(); ++t) sxy += xo[t] * yo[t], sxx += xo[t] * xo[t], syy += yo[t] * yo[t];
+            double denom = std::sqrt(sxx * syy);
+            if (denom > 0) c[size_t(lag + shMax)] = sxy / denom;
+        }
+        int idx = -1;
+        for (int i = 0; i < int(c.size()); ++i) {
+            if (!std::isnan(c[size_t(i)]) && (idx < 0 || c[size_t(i)] > c[size_t(idx)])) idx = i;
+        }
+        if (idx < 0) {
+            pair.status = segy::SigcorPairStatus::Dead;
+            ref.pairs.push_back(pair);
+            continue;
+        }
+        pair.discreteLag = idx - shMax;
+        pair.correlation = c[size_t(idx)];
+        pair.parabolicLag = pair.discreteLag;
+        const bool isEdge = idx == 0 || idx == int(c.size()) - 1;
+        if (!isEdge) {
+            double cm = c[size_t(idx - 1)], c0 = c[size_t(idx)], cp = c[size_t(idx + 1)];
+            double denom = cm - 2 * c0 + cp;
+            double m = std::max(1.0, std::fabs(c0));
+            if (std::isfinite(denom) && std::fabs(denom) > std::nextafter(m, 2.0 * m) - m) {
+                double delta = 0.5 * (cm - cp) / denom;
+                if (std::fabs(delta) <= 1) pair.parabolicLag = pair.discreteLag + delta;
+            }
+        }
+        if (isEdge) {
+            pair.status = segy::SigcorPairStatus::AtShiftLimit;
+            ref.pairs.push_back(pair);
+            continue;
+        }
+        if (pair.correlation < p.ccmin) {
+            pair.status = segy::SigcorPairStatus::LowCorrelation;
+            ref.pairs.push_back(pair);
+            continue;
+        }
+        const int lagApplied = int(std::round(pair.parabolicLag));
+        pair.appliedLag = lagApplied;
+        overlap(xRaw, yRaw, lagApplied, xo, yo);
+        auto prepare = [&](std::vector<double>& v) {
+            if (p.removeDc) {
+                double mean = 0;
+                for (double s : v) mean += s;
+                mean /= double(v.size());
+                for (double& s : v) s -= mean;
+            }
+            if (p.normalise) {
+                double ms = 0;
+                for (double s : v) ms += s * s;
+                double r = std::sqrt(ms / double(v.size()));
+                for (double& s : v) s = r > 0 ? s / r : 0.0;
+            }
+        };
+        prepare(xo);
+        prepare(yo);
+        std::vector<double> xFull(size_t(nGate), 0.0), yFull(size_t(nGate), 0.0);
+        const int first = lagApplied >= 0 ? 0 : -lagApplied;
+        for (size_t t = 0; t < xo.size(); ++t) {
+            xFull[first + t] = xo[t] * taper[first + t];
+            yFull[first + t] = yo[t] * taper[first + t];
+        }
+        for (int f = 0; f < nFreq; ++f) {
+            std::complex<double> X(0, 0), Y(0, 0);
+            for (int t = 0; t < nGate; ++t) {
+                std::complex<double> e = std::polar(1.0, -2.0 * pi * double(f) * double(t) / double(nfft));
+                X += xFull[size_t(t)] * e;
+                Y += yFull[size_t(t)] * e;
+            }
+            ref.trace[size_t(f)] += 0.5 * (std::norm(X) + std::norm(Y));
+            ref.signal[size_t(f)] += (X * std::conj(Y)).real();
+            ref.noise[size_t(f)] += 0.5 * std::norm(X - Y);
+        }
+        pair.status = segy::SigcorPairStatus::Accepted;
+        ref.pairs.push_back(pair);
+        ++ref.accepted;
+    }
+    for (int f = 0; f < nFreq && ref.accepted > 0; ++f) {
+        ref.trace[size_t(f)] /= ref.accepted;
+        ref.signal[size_t(f)] /= ref.accepted;
+        ref.noise[size_t(f)] /= ref.accepted;
+    }
+    return ref;
+}
+
+void testSigcorAgainstReference() {
+    section("Signal/Noise: computeSigcor == the MATLAB reference sigcor_spectr_stndrd (transliterated)");
+    const double dt = 0.002;
+    const int traces = 48, samples = 400;
+    auto check = [&](const SigcorSynthetic& syn, const segy::SigcorParams& p, int gate0, int gate1,
+                     const char* what) -> SigcorReference {
+        segy::SigcorResult r = segy::computeSigcor(
+            [&syn](int64_t idx, float* out) { std::copy(syn.data[size_t(idx)].begin(), syn.data[size_t(idx)].end(), out); },
+            samples, 0, traces, gate0, gate1 + 1, dt * 1e6, p);
+        SigcorReference ref = sigcorReference(syn.data, gate0, gate1, dt, p);
+        CHECK(r.error.empty());
+        CHECK(r.pairs.size() == ref.pairs.size());
+        CHECK(r.pairsUsed == ref.accepted);
+        bool samePairs = r.pairs.size() == ref.pairs.size();
+        for (size_t i = 0; samePairs && i < r.pairs.size(); ++i) {
+            const segy::SigcorPair &a = r.pairs[i], &b = ref.pairs[i];
+            samePairs = a.earlierTrace == b.earlierTrace && a.currentTrace == b.currentTrace &&
+                        a.actualSkip == b.actualSkip && a.status == b.status && a.discreteLag == b.discreteLag &&
+                        a.appliedLag == b.appliedLag && std::fabs(a.parabolicLag - b.parabolicLag) < 1e-9 &&
+                        (std::isnan(b.correlation) || std::fabs(a.correlation - b.correlation) < 1e-12);
+        }
+        CHECK(samePairs);
+        if (ref.accepted == 0 || r.tracePower.size() != ref.trace.size()) {
+            CHECK(ref.accepted == 0 && r.tracePower.empty());
+            return ref;
+        }
+        const double peak = *std::max_element(ref.trace.begin(), ref.trace.end());
+        double maxErr = 0.0;
+        for (size_t m = 0; m < ref.trace.size(); ++m) {
+            maxErr = std::max(maxErr, std::fabs(r.tracePower[m] - ref.trace[m]));
+            maxErr = std::max(maxErr, std::fabs(r.signalPower[m] - ref.signal[m]));
+            maxErr = std::max(maxErr, std::fabs(r.noisePower[m] - ref.noise[m]));
+        }
+        if (maxErr / peak >= 1e-10) std::printf("  %s: max relative difference %.3g\n", what, maxErr / peak);
+        CHECK(maxErr / peak < 1e-10);
+        return ref;
+    };
+    auto countStatus = [](const SigcorReference& ref, segy::SigcorPairStatus status) {
+        return std::count_if(ref.pairs.begin(), ref.pairs.end(),
+                             [status](const segy::SigcorPair& q) { return q.status == status; });
+    };
+    segy::SigcorParams p; // the reference defaults: NSKIP 3, IRANSK 2, CCMIN 0.65, SHMAX 20 ms, beta 5
+    SigcorSynthetic noisy = makeSigcorSynthetic(traces, samples, dt, 30.0, 0.4, 1.0, 0.75, 41);
+    SigcorReference ref = check(noisy, p, 100, 299, "defaults");
+    CHECK(ref.accepted > 10 && countStatus(ref, segy::SigcorPairStatus::LowCorrelation) > 10); // both paths covered
+    p.removeDc = false;
+    p.normalise = false;
+    p.ccmin = 0.3;
+    check(noisy, p, 100, 299, "no DC removal, no normalisation");
+    p = segy::SigcorParams{};
+    p.nskip = 0;
+    p.iransk = 0;
+    p.shmaxMs = 6.0; // 3 samples
+    SigcorSynthetic dipping = makeSigcorSynthetic(traces, samples, dt, 30.0, 2.5, 1.0, 0.3, 42);
+    ref = check(dipping, p, 50, 177, "adjacent traces, lags near the limit");
+    CHECK(ref.accepted > 10 && countStatus(ref, segy::SigcorPairStatus::AtShiftLimit) > 10);
+    p = segy::SigcorParams{};
+    SigcorSynthetic steep = makeSigcorSynthetic(traces, samples, dt, 30.0, 4.0, 1.0, 0.0, 43);
+    ref = check(steep, p, 100, 299, "steep dip (mostly at SHMAX)");
+    CHECK(countStatus(ref, segy::SigcorPairStatus::AtShiftLimit) > 5);
 }
 
 void testSigcorEstimates() {
-    section("Signal/Noise: SIGCOR shifts, signal/noise split, SPECTR == AUTCOR");
+    section("Signal/Noise: SIGCOR pairs, shifts, signal/noise split, SPECTR == AUTCOR, rejections");
     const double dt = 0.002; // 2 ms, Nyquist 250 Hz
     const int traces = 120, samples = 600;
     auto fetchFrom = [](const SigcorSynthetic& syn) {
@@ -1485,50 +1719,60 @@ void testSigcorEstimates() {
         };
     };
 
-    // 1. Noise-free, dip 0.4 samples/trace, fixed distance 3: every shift is
-    //    1.2 samples = 2.4 ms, sigma ~0, and signal ~= trace.
+    // 1. Noise-free, dip 0.4 samples/trace, NSKIP 2 without variation (pair
+    //    distance 3): every lag is 1.2 samples = 2.4 ms, signal ~= trace.
     SigcorSynthetic clean = makeSigcorSynthetic(traces, samples, dt, 30.0, 0.4, 1.0, 0.0, 11);
     segy::SigcorParams p;
-    p.nskip = 3;
+    p.nskip = 2;
     p.iransk = 0;
-    p.shmaxMs = 30.0;
-    p.ccmin = 0.3;
     segy::SigcorResult r = segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 450, dt * 1e6, p);
+    CHECK(r.error.empty());
     CHECK(r.pairsTotal == traces - 3);
+    CHECK(r.pairs.front().earlierTrace == 0 && r.pairs.front().currentTrace == 3);
+    CHECK(r.pairs.back().currentTrace == traces - 1);
     CHECK(r.pairsUsed == r.pairsTotal);
-    CHECK_NEAR(r.shiftMeanMs, 2.4, 0.05);
-    CHECK(r.shiftSigmaMs < 0.05);
+    CHECK_NEAR(r.shiftMeanMs, 2.4, 0.15);
+    CHECK(r.shiftSigmaMs < 0.15);
+    CHECK(std::all_of(r.pairs.begin(), r.pairs.end(), [](const segy::SigcorPair& q) { return q.appliedLag == 1; }));
+    CHECK(r.fftLength == 512);
     size_t peak = 0;
     for (size_t m = 0; m < r.tracePower.size(); ++m) if (r.tracePower[m] > r.tracePower[peak]) peak = m;
     CHECK(r.frequencyHz[peak] > 15.0f && r.frequencyHz[peak] < 45.0f);
-    CHECK_NEAR(r.signalPower[peak] / r.tracePower[peak], 1.0, 0.02);
+    CHECK(r.signalPower[peak] / r.tracePower[peak] > 0.9);
 
-    // Gate = the whole trace (the default "visible data" case): no room
-    // beyond it for the second gate, so the shift estimate trims gate A by
-    // SHMAX at both ends instead of rejecting every pair.
-    r = segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 0, samples, dt * 1e6, p);
-    CHECK(r.pairsAtShiftLimit == 0);
-    CHECK(r.pairsUsed == r.pairsTotal);
-    CHECK_NEAR(r.shiftMeanMs, 2.4, 0.05);
-
-    // IRANSK = 2 spreads the pair distance over 3..5 traces: shifts 2.4..4.0 ms, sigma > 0.
+    // IRANSK 2 around NSKIP 3: distances 2..6, lags 0.8..2.4 samples.
+    p.nskip = 3;
     p.iransk = 2;
     r = segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 450, dt * 1e6, p);
+    int minDistance = 99, maxDistance = 0;
+    for (const segy::SigcorPair& q : r.pairs) {
+        minDistance = std::min<int>(minDistance, int(q.currentTrace - q.earlierTrace));
+        maxDistance = std::max<int>(maxDistance, int(q.currentTrace - q.earlierTrace));
+        CHECK(q.currentTrace - q.earlierTrace == q.actualSkip + 1);
+    }
+    CHECK(minDistance == 2 && maxDistance == 6);
     CHECK_NEAR(r.shiftMeanMs, 3.2, 0.3);
-    CHECK(r.shiftSigmaMs > 0.4 && r.shiftSigmaMs < 0.9); // uniform over {2.4, 3.2, 4.0}: 0.65
+    CHECK(r.shiftSigmaMs > 0.8 && r.shiftSigmaMs < 1.5); // uniform over {1.6 .. 4.8} ms: 1.13
 
-    // 2. Signal + white noise, no energy normalisation: above the Ricker's
-    //    band the signal estimate is ~0 and the noise estimate matches the
-    //    known white-noise power sigma^2 * sum(w^2).
+    // 2. Signal + white noise, dip of exactly 1 sample per trace (an exact
+    //    whole-sample alignment), no DC removal or normalisation: above the
+    //    Ricker's band signal ~ 0 and noise = sigma^2 * sum of w^2 over the
+    //    overlap (half of the two traces' noise difference, squared).
     const double sigma = 0.3;
-    SigcorSynthetic noisy = makeSigcorSynthetic(traces, samples, dt, 30.0, 0.4, 1.0, sigma, 12);
+    SigcorSynthetic noisy = makeSigcorSynthetic(traces, samples, dt, 30.0, 1.0, 1.0, sigma, 12);
+    p.nskip = 2;
     p.iransk = 0;
+    p.removeDc = false;
     p.normalise = false;
+    p.ccmin = 0.3;
     r = segy::computeSigcor(fetchFrom(noisy), samples, 0, traces, 150, 450, dt * 1e6, p);
     CHECK(r.pairsUsed > traces / 2);
-    std::vector<float> w = segy::cosineSquaredWindow(300, p.flatPercent);
+    CHECK(std::all_of(r.pairs.begin(), r.pairs.end(), [](const segy::SigcorPair& q) {
+        return q.status != segy::SigcorPairStatus::Accepted || q.appliedLag == 3;
+    }));
+    std::vector<double> w = segy::kaiserWindow(300, p.kaiserBeta);
     double windowPower = 0.0;
-    for (float v : w) windowPower += double(v) * v;
+    for (int t = 0; t < 297; ++t) windowPower += w[size_t(t)] * w[size_t(t)];
     double noiseHigh = 0.0, signalHigh = 0.0;
     int count = 0;
     for (size_t m = 0; m < r.frequencyHz.size(); ++m) {
@@ -1541,40 +1785,73 @@ void testSigcorEstimates() {
     signalHigh /= count;
     CHECK_NEAR(noiseHigh / (sigma * sigma * windowPower), 1.0, 0.15);
     CHECK(std::fabs(signalHigh) < 0.1 * noiseHigh);
-    // In the signal band, signal dominates.
     size_t at30 = size_t(std::lround(30.0 / r.frequencyHz[1]));
     CHECK(r.signalPower[at30] > 5.0 * r.noisePower[at30]);
+    // Noise = |X - Y|^2 / 2: never negative, and equal to trace - signal.
+    bool consistent = true;
+    for (size_t m = 0; m < r.noisePower.size(); ++m) {
+        consistent = consistent && r.noisePower[m] >= 0.0 &&
+                     std::fabs(r.noisePower[m] - (r.tracePower[m] - r.signalPower[m])) <= 1e-9 * r.tracePower[peak];
+    }
+    CHECK(consistent);
 
     // 3. AUTCOR (time-domain averaging) gives the same spectra as SPECTR on
     //    a twice-as-fine grid: n = 300 -> SPECTR 512, AUTCOR 1024 points.
-    p.normalise = true;
+    p = segy::SigcorParams{};
+    p.ccmin = 0.3;
     segy::SigcorResult spectr = segy::computeSigcor(fetchFrom(noisy), samples, 0, traces, 150, 450, dt * 1e6, p);
     p.option = segy::SigcorOption::Autcor;
     segy::SigcorResult autcor = segy::computeSigcor(fetchFrom(noisy), samples, 0, traces, 150, 450, dt * 1e6, p);
     CHECK(autcor.tracePower.size() == 2 * spectr.tracePower.size() - 1);
-    CHECK(autcor.pairsUsed == spectr.pairsUsed);
+    CHECK(autcor.pairsUsed == spectr.pairsUsed && spectr.pairsUsed > 0);
     double maxRel = 0.0;
     double tracePeak = *std::max_element(spectr.tracePower.begin(), spectr.tracePower.end());
     for (size_t m = 0; m < spectr.tracePower.size(); ++m) {
         maxRel = std::max(maxRel, std::fabs(autcor.tracePower[2 * m] - spectr.tracePower[m]) / tracePeak);
         maxRel = std::max(maxRel, std::fabs(autcor.signalPower[2 * m] - spectr.signalPower[m]) / tracePeak);
+        maxRel = std::max(maxRel, std::fabs(autcor.noisePower[2 * m] - spectr.noisePower[m]) / tracePeak);
     }
-    CHECK(maxRel < 1e-4);
+    CHECK(maxRel < 1e-9);
     CHECK_NEAR(autcor.frequencyHz[2], spectr.frequencyHz[1], 1e-4);
 
-    // 4. Pure noise: correlation coefficients are small, CCMIN 0.3 rejects
-    //    nearly every pair. Steep dip beyond SHMAX: maxima at the limit.
+    // 4. Pure noise: CCMIN 0.65 rejects (nearly) every pair. Steep dip
+    //    beyond SHMAX: maxima at the limit.
+    p = segy::SigcorParams{};
     SigcorSynthetic noiseOnly = makeSigcorSynthetic(traces, samples, dt, 30.0, 0.0, 0.0, 1.0, 13);
-    p.option = segy::SigcorOption::Spectr;
     r = segy::computeSigcor(fetchFrom(noiseOnly), samples, 0, traces, 150, 450, dt * 1e6, p);
     CHECK(r.pairsLowCorrelation + r.pairsAtShiftLimit > r.pairsTotal * 9 / 10);
     SigcorSynthetic steep = makeSigcorSynthetic(traces, samples, dt, 30.0, 4.0, 1.0, 0.0, 14);
-    p.shmaxMs = 10.0; // 5 samples, true shift 12
+    p.shmaxMs = 10.0; // 5 samples, true lags 8..24
     r = segy::computeSigcor(fetchFrom(steep), samples, 0, traces, 150, 450, dt * 1e6, p);
     CHECK(r.pairsAtShiftLimit > r.pairsTotal / 2);
-    // Too few traces for one pair: empty result, no crash.
-    r = segy::computeSigcor(fetchFrom(clean), samples, 0, 3, 150, 450, dt * 1e6, p);
-    CHECK(r.pairsTotal == 0 && r.tracePower.empty());
+    // Dead traces: no finite correlation.
+    SigcorSynthetic dead = makeSigcorSynthetic(10, samples, dt, 30.0, 0.0, 0.0, 0.0, 15);
+    r = segy::computeSigcor(fetchFrom(dead), samples, 0, 10, 150, 450, dt * 1e6, segy::SigcorParams{});
+    CHECK(r.pairsTotal > 0 && r.pairsDead == r.pairsTotal && r.tracePower.empty() && r.error.empty());
+
+    // 5. Bad parameters: an error, nothing computed. Too few traces: no pairs.
+    p = segy::SigcorParams{};
+    p.iransk = 4; // > NSKIP 3
+    CHECK(!segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 450, dt * 1e6, p).error.empty());
+    p = segy::SigcorParams{};
+    p.shmaxMs = 0.9; // < half a sample
+    CHECK(!segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 450, dt * 1e6, p).error.empty());
+    p = segy::SigcorParams{}; // SHMAX 10 samples: the gate needs 23
+    CHECK(!segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 172, dt * 1e6, p).error.empty());
+    CHECK(segy::computeSigcor(fetchFrom(clean), samples, 0, traces, 150, 173, dt * 1e6, p).error.empty());
+    p.iransk = 0;
+    r = segy::computeSigcor(fetchFrom(clean), samples, 0, 4, 150, 450, dt * 1e6, p); // distance 4 needs 5 traces
+    CHECK(r.error.empty() && r.pairsTotal == 0 && r.tracePower.empty());
+
+    // 6. maxPairs: an even subset of the candidate pairs, in trace order;
+    //    the trace offset carries through to the pair indices.
+    p = segy::SigcorParams{};
+    p.maxPairs = 10;
+    r = segy::computeSigcor(fetchFrom(clean), samples, 20, traces, 150, 450, dt * 1e6, p);
+    CHECK(r.pairsTotal == 10 && r.pairsCandidate > 90);
+    bool ordered = true;
+    for (size_t i = 1; i < r.pairs.size(); ++i) ordered = ordered && r.pairs[i].currentTrace > r.pairs[i - 1].currentTrace;
+    CHECK(ordered && r.pairs.front().earlierTrace >= 20);
 }
 
 void testXfSpectrum() {
@@ -2231,6 +2508,7 @@ int main() {
     testWriteSegyFileRoundTrips();
     testNormalizedAutocorrelation();
     testSigcorHelpers();
+    testSigcorAgainstReference();
     testSigcorEstimates();
     testXfSpectrum();
     testFk();

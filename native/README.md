@@ -2632,55 +2632,95 @@ lag 0 in the middle.
 The time-tick formatter shared with the octave plots now prints "0", not
 "0.0000", for a zero tick.
 
-### Signal/Noise (Analysis > Signal/Noise, after SIPMAP SIGCOR)
+### Signal/Noise (Analysis > Signal/Noise, SIGCOR SPECTR/STNDRD)
 
 Estimates the signal and noise power spectra of a section the way Shell
 SIPMAP's SIGCOR does. The data is the active panel's selection box, or its
 visible data when there is no box. The box sets both the traces and the
 time gate.
 
-- **Pairs:** trace *i* is paired with trace *i + NSKIP + r*, where *r* is
-  uniform in 0..IRANSK (seeded, so a recompute gives the same answer).
-  Above `maxPairs` (2000) start traces are strided evenly.
-- **Time alignment:** gate A on trace *i* is crosscorrelated with trace
-  *j* over lags −SHMAX..+SHMAX. TCROSS=BASIC takes the plain sum;
-  NORMALIZED divides each lag by the RMS of the overlapping part of
-  trace *j*. A maximum at ±SHMAX rejects the pair (counted "at SHMAX").
-  SHMAX of 0 or 1 sample means no shift estimate (the data is taken as
-  already aligned), as in SIGCOR. Parabolic interpolation through the peak
-  gives a fractional shift, applied as a band-limited phase ramp. This
-  replaces SIGCOR's NIPOL interpolation and is exact for band-limited data.
-- **Gates at the trace ends:** SIGCOR extends the second gate by SHMAX on
-  both sides. When the gate already reaches the top or bottom of the
-  trace (the default whole-visible-trace case), gate A is trimmed by
-  SHMAX at that end *for the shift estimate only*. The spectra still use
-  the whole gate. Before this fix every pair of a full-trace gate was
-  rejected.
-- **Acceptance:** the correlation coefficient of the aligned gates must
-  reach CCMIN, otherwise the pair is counted "below CCMIN". The trace,
-  signal and noise means are all taken over the accepted pairs only, so
-  noise = trace − signal stays consistent.
-- **Per pair:** remove DC, equalize energy (Normalise: unit RMS per gate),
-  then apply a cosine-squared window (`cosineSquaredWindow`, the flat part
-  in %, sin² ramps). This gives:
-  - SPECTR: trace = (|A|² + |B|²)/2 and signal = Re(A·B\*), the cospectrum,
-    averaged in the frequency domain on the gate's next power of two.
-  - AUTCOR: the averaged trace autocorrelation (r_aa + r_bb)/2 and the
-    symmetrized crosscorrelation (c_ab(k) + c_ab(−k))/2 (the signal
-    autocorrelation), averaged in the time domain over lags 0..n−1 and
-    transformed once at the end, on twice the frequency density. Without
-    a lag window this gives the same spectra as SPECTR (tested to 1e-4).
-  - noise = trace − signal.
+**Reference.** `segy::computeSigcor` is a C++ port of the user's
+gold-standard MATLAB `sigcor_spectr_stndrd.m` (November 2026), which
+replaced the earlier "after SIGCOR" implementation. The MATLAB states its
+own scope: the documented algorithm and conventions, not bit-for-bit
+identity with the old SIPMAP executable. The comments in `analysis.cpp`
+name the MATLAB step each part ports. The test suite carries a
+line-by-line transliteration of the MATLAB (`sigcorReference`, with a
+plain DFT) and checks pairs, lags, statuses and spectra against it.
+
+- **Pairs (streaming model):** every current trace *c* (the 2nd onwards)
+  draws a skip uniformly from NSKIP−IRANSK..NSKIP+IRANSK and is paired
+  with the earlier trace *c − (skip + 1)*, if there is one. NSKIP counts
+  the traces *between* the pair: NSKIP 3, IRANSK 2 gives skips 1..5 and
+  pair distances 2..6. IRANSK must not exceed NSKIP. Each current trace
+  gives at most one pair.
+- **Random numbers:** `sigcorSkipDraws`, one draw per current trace (also
+  when there is no partner, as in the MATLAB). MT19937 seeded with 12345,
+  a 53-bit uniform double *u* (genrand_res53), skip = lo + ⌊u·(hi−lo+1)⌋.
+  This is the same generator and seed as the MATLAB's
+  `RandStream('mt19937ar','Seed',12345)`, but whether the draws equal
+  MATLAB's `randi` exactly has not been verified. For a like-for-like
+  comparison, set Random variation to 0.
+- **Huge views:** more than `maxPairs` (20 000) candidate pairs computes
+  an even subset of them, in trace order (the details table then shows
+  "Available" and "Computed"). A whole PARAGON line (15 079 pairs) is
+  below the limit, so it is computed completely.
+- **Shift estimate:** on the raw gates (before DC removal, normalization
+  and taper), the normalized correlation of the *overlapping parts* of
+  the two gates at every integer lag −SHMAX..+SHMAX (SHMAX in ms, rounded
+  to whole samples, at least 1). Positive lag means the event is later on
+  the current trace. The first maximum wins and NaN lags are skipped,
+  like MATLAB's `max(…,'omitnan')`. No finite lag at all (an all-zero
+  gate) counts as a dead pair.
+- **Rejections, in this order:** a maximum at ±SHMAX ("at max shift":
+  the true maximum may lie beyond the search), then a correlation peak
+  below CCMIN ("below min correlation").
+- **NIPOL = 1:** a parabola through the peak and its neighbours refines
+  the lag (used if |δ| ≤ 1). The *applied* shift is that lag rounded to a
+  whole sample (MATLAB `round`, halves away from zero). There is no
+  fractional shift. The SINC8 path of NIPOL > 1 is deliberately not
+  approximated. The Δt statistics show the parabolic lags.
+- **Per accepted pair:** take the overlap of the two gates at the applied
+  lag, then remove DC and scale to unit RMS (each optional). Put both back
+  at the first trace's own sample positions in a zero-filled gate of the
+  full length (both traces share the same valid-data mask). Apply a
+  Kaiser-Bessel taper (β 5, `kaiserWindow`, I0 by power series). Then
+  FFT, in double precision with a local radix-2 FFT, so no float noise
+  floor. NFFT = next power of two ≥ the gate. Per pair:
+  - trace T = (|X|² + |Y|²)/2
+  - signal S = Re(X·Y\*), the cospectrum, which can be negative at single
+    frequencies
+  - noise N = |X − Y|²/2, the non-negative form of T − S. It is
+    accumulated on its own, so it is never negative. Earlier versions
+    claimed noise "can dip below zero"; that was never true for this
+    formula.
+
+  T, S and N are averaged in linear power over the accepted pairs; dB
+  values come only after averaging.
+- **AUTCOR (not part of the reference):** the same pairs, alignment and
+  taper, but the trace autocorrelation and the symmetrized
+  crosscorrelation are averaged in the time domain and transformed once.
+  This gives the same spectra as SPECTR on a twice as fine frequency grid
+  (tested to 1e-9). Noise is T − S, clipped at 0 for roundoff.
+- **Errors, nothing computed:** IRANSK > NSKIP; SHMAX under one sample; a
+  gate shorter than 2·SHMAX + 3 samples. The window shows the message.
+- **Parallel and deterministic:** pairs are processed in fixed blocks of
+  32 on the analysis pool, and the block sums are added in order. The
+  result does not depend on the thread count. 15 079 pairs × 2501
+  samples: 1.7 s on 4 threads in the Linux container, including
+  synthetic trace generation.
 - **Window:** kept deliberately calm, at the user's request.
-  - **Top row:** only the two parameters you tune per look, Trace
-    distance and Min correlation.
+  - **Top row:** only the two parameters you tune per look, Skipped
+    traces and Min correlation.
   - **Two equal-size buttons** on the right:
     - the time-shift statistics, typeset like the LaTeX
       $\Delta t = \bar{t} \pm \sigma$ ms (mean and 1σ of the accepted
-      pairs' shifts). Clicking it opens a details table: time shift
-      (mean, 1σ, min, max, mean correlation), trace pairs (used, below
-      min correlation, at max shift, dead), data (source, traces, time
-      gate) and every parameter;
+      pairs' parabolic lags). Clicking it opens a details table: time
+      shift (mean, 1σ, min, max, applied in whole samples, mean
+      correlation), trace pairs (available/computed when subset, used,
+      below min correlation, at max shift, dead), data (source, traces,
+      time gate) and every parameter, including SHMAX in samples and the
+      FFT length;
     - **Recompute**. It turns the accent orange when recomputing would
       change something: the active panel's selection box, view or dataset
       differs from the last computation, or a parameter changed (window
@@ -2691,40 +2731,57 @@ time gate.
   - **Curve toggles** (Trace, Signal, Noise, S/N): a row centred under
     the chart only (not the readout panel beside it), like a legend. Signal and Noise are on by
     default. All curves share one dB axis (Trace/Signal/Noise relative to
-    the trace peak, S/N as 10·log10 S/N). A bin with a value ≤ 0 (noise
-    can dip below zero) leaves a gap.
+    the trace peak, S/N as 10·log10 S/N where both S and N are > 0). A
+    bin with a value ≤ 0 (a negative cospectrum) leaves a gap.
 - **Colors:** the dark-surface steps of the dataviz reference palette,
   validated for lightness, chroma, CVD separation and contrast:
   signal blue `#3987e5`, noise orange `#d95926`, S/N aqua `#199e70`
   (also dashed), and trace neutral `#c3c2b7`.
-- **Parameters:** Trace distance and Min correlation are in the window.
+- **Parameters:** Skipped traces and Min correlation are in the window.
   Everything else is in Edit > Preferences > Signal/Noise, under plain
   names, with the SIGCOR card name in each tooltip:
 
-  | Name in the app | SIGCOR |
-  |---|---|
-  | Method: Spectrum / Autocorrelation | OPTION SPECTR / AUTCOR |
-  | Trace distance | NSKIP |
-  | Random extra | IRANSK |
-  | Max shift | SHMAX |
-  | Min correlation | CCMIN |
-  | Shift pick: Plain / Normalized | TCROSS BASIC / NORMALIZED |
-  | Taper flat part | SGGATE cosine window |
-  | Equalize energy, Remove DC | IGNORM |
+  | Name in the app | SIGCOR | Default |
+  |---|---|---|
+  | Method: Spectrum / Autocorrelation | OPTION SPECTR / AUTCOR | Spectrum |
+  | Skipped traces | NSKIP (traces between the pair) | 3 |
+  | Random variation (±) | IRANSK (symmetric) | 2 |
+  | Max shift | SHMAX | 20 ms |
+  | Min correlation | CCMIN | 0.65 |
+  | Taper beta | Kaiser-Bessel β | 5 |
+  | Equalize energy, Remove DC | IGNORM (after alignment) | on, on |
 
-  They are persisted under `signalNoise/*` in `~/.segyread_settings` on
-  every compute. The defaults are the user's own SIPMAP deck: Spectrum,
-  distance 3, random extra 2, plain shift pick, max shift 30 ms, min
-  correlation 0.3, 5% flat, and Equalize energy and Remove DC on.
+  The defaults are the MATLAB reference's. They are persisted under
+  `sigcor/*` in `~/.segyread_settings` on every compute. The older
+  `signalNoise/*` keys (NSKIP as pair distance, one-sided IRANSK, 30 ms,
+  CCMIN 0.3, cosine taper, TCROSS) are not carried over, because their
+  meaning changed; the first save removes them. Removed with the old
+  implementation: Shift pick (TCROSS: the reference always uses the
+  normalized correlation), the cosine-squared taper, the fractional
+  (phase-ramp) shift, and gate extension beyond the box for the shift
+  search.
 - **Left out of SIGCOR:** horizon-following gates, RANDTB, MEM/AR
-  estimation, the TCROSS optimum filter, substacks, and card/trace output.
-- **Tests:** window shape, fractional shift of a sine, exact shifts and
-  σ ≈ 0 on noise-free dipping data, IRANSK spreading σ, a full-trace gate,
-  the noise level matching σ²·Σw² above the signal band, SPECTR = AUTCOR,
-  pure noise rejected by CCMIN, steep dip rejected at SHMAX, and too few
-  traces.
-- **Verified by screenshot** on the PARAGON 12.5 m inline: 2000/2000 pairs,
-  1σ 0.78 ms, S/N about 12–15 dB across 10–90 Hz.
+  estimation, the TCROSS optimum filter, NIPOL > 1 (SINC8), substacks,
+  and card/trace output.
+- **Tests:**
+  - the Kaiser window (ends 1/I0(5), symmetric, β 0 is flat);
+  - the IRANSK draws (range 1..5, uniform, seeded);
+  - computeSigcor against the transliterated MATLAB on four synthetics:
+    defaults with a mix of accepted and below-CCMIN pairs, no DC/RMS,
+    adjacent traces with lags near the limit, and a steep dip. Pairs,
+    statuses, lags and correlations are exact, and spectra agree within
+    1e-10 of the peak;
+  - pair distances 2..6, lags and σ on a noise-free dip;
+  - the white-noise level σ²·Σw² over the overlap;
+  - noise ≥ 0 and noise = T − S;
+  - SPECTR = AUTCOR;
+  - pure noise rejected by CCMIN, steep dip at SHMAX, dead traces;
+  - each parameter error, too few traces, and the maxPairs subset.
+- **Not yet verified on Windows / by screenshot** after the reference
+  port: the MSVC build, the window and Preferences layout, and the
+  PARAGON numbers. The old implementation's screenshot (2000 pairs, 1σ
+  0.78 ms, S/N 12–15 dB over 10–90 Hz) used other parameters and is no
+  longer representative.
 
 ### x-f display (toolbar toggle, View > x-f Display)
 

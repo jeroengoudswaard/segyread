@@ -120,7 +120,11 @@ the MSVC runtime DLLs (`vcruntime140.dll`, `vcruntime140_1.dll`,
 | Auto-pick seabed | 0.9 s |
 | Trace Header Ranges | 3.0 s (cold headers) |
 | f-k, full view | 1.8 s |
-| Signal/Noise | 1.1 s |
+| Signal/Noise | 1.1 s (old implementation, 2000 pairs; the SIGCOR reference port of 2026-11-25 is not yet re-measured: up to 20 000 pairs, parallel) |
+
+Signal/Noise follows the user's MATLAB reference `sigcor_spectr_stndrd.m`
+(see the README section); keep `testSigcorAgainstReference` passing when
+changing it.
 
 Not yet measured through the GUI on the 6 GB file: Bandpass (its dialog is
 non-modal, the hook couldn't accept it), Calculator, Time-Depth.

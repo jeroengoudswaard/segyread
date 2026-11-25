@@ -28,7 +28,7 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 13. **Autocorrelation** — Show the autocorrelation of the data in a popup window. The user parameter is the filter length L; the display runs from -L to +L, with the peak at t=0 in the middle. *Status: done — Analysis > Autocorrelation (autocorrelogram per trace plus average curve).*
 
-14. **Signal/Noise** — Estimate signal and noise spectra of a section after SIPMAP SIGCOR (SPECTR and AUTCOR), with toggles for trace/signal/noise/S-N and the 1-sigma of the time shifts. *Status: done — Analysis > Signal/Noise; parameters in Preferences.*
+14. **Signal/Noise** — Estimate signal and noise spectra of a section after SIPMAP SIGCOR (SPECTR and AUTCOR), with toggles for trace/signal/noise/S-N and the 1-sigma of the time shifts. *Status: done — Analysis > Signal/Noise; parameters in Preferences.* *Update (2026-11-25): rewritten as a port of the user's gold-standard MATLAB `sigcor_spectr_stndrd.m` (SPECTR/STNDRD): NSKIP = traces between the pair, symmetric IRANSK, streaming pair selection, normalized correlation on the gate overlap, rejection at SHMAX, NIPOL=1 whole-sample alignment, Kaiser β 5, noise = ½|X−Y|²; defaults NSKIP 3, IRANSK 2, SHMAX 20 ms, CCMIN 0.65. Checked against a transliteration of the MATLAB in segytest. Open: confirm against MATLAB output on real data (RNG equality with `randi` unverified).*
 
 15. **Spectrum crosshair** — Crosshair with a value readout panel on the spectrum plots. *Status: done — Spectrum and Signal/Noise.*
 

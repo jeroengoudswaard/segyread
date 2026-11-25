@@ -904,8 +904,7 @@ private:
     QComboBox* snMethodCombo_ = nullptr;
     QSpinBox* snRandomSpin_ = nullptr;
     QDoubleSpinBox* snMaxShiftSpin_ = nullptr;
-    QComboBox* snShiftPickCombo_ = nullptr;
-    QDoubleSpinBox* snFlatSpin_ = nullptr;
+    QDoubleSpinBox* snBetaSpin_ = nullptr;
     QCheckBox* snEqualizeCheck_ = nullptr;
     QCheckBox* snRemoveDcCheck_ = nullptr;
     std::function<void(const Preferences&)> onApplied_;
@@ -1276,7 +1275,7 @@ private:
 // active panel's selection box, or its visible data without one. Trace,
 // signal, noise (dB relative to the trace spectrum's peak) and S/N (dB)
 // can each be switched on/off; signal and noise are on by default. Only
-// Trace distance and Min correlation are in the window; the other
+// Skipped traces and Min correlation are in the window; the other
 // parameters are in Edit > Preferences > Signal/Noise. The time-shift
 // statistics are a button (Delta t = mean +/- 1 sigma) above Recompute that
 // opens a details table; Recompute turns orange when the data or the
@@ -1307,7 +1306,7 @@ class SignalNoiseWindow : public QWidget {
 public:
     explicit SignalNoiseWindow(QWidget* parent = nullptr);
     void setResult(const SignalNoiseDisplay& display);
-    // Trace distance and Min correlation live in the window; the rest of
+    // Skipped traces and Min correlation live in the window; the rest of
     // `params` is left alone (it comes from Preferences).
     void setWindowParams(const segy::SigcorParams& params);
     void applyWindowParams(segy::SigcorParams& params) const;

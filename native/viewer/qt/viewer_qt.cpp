@@ -3543,15 +3543,16 @@ SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Wind
         return label;
     };
     distanceSpin_ = new QSpinBox();
-    distanceSpin_->setRange(1, 200);
+    distanceSpin_->setRange(0, 200);
     distanceSpin_->setSuffix(" traces");
-    distanceSpin_->setToolTip("Distance between the two traces of a pair. (SIGCOR NSKIP)");
+    distanceSpin_->setToolTip("Skipped traces: traces between the two traces of a pair, so the pair distance is "
+                              "this + 1 (0 = adjacent traces). (SIGCOR NSKIP)");
     minCorrelationSpin_ = new QDoubleSpinBox();
-    minCorrelationSpin_->setRange(-1.0, 1.0);
+    minCorrelationSpin_->setRange(0.0, 1.0);
     minCorrelationSpin_->setDecimals(2);
     minCorrelationSpin_->setSingleStep(0.05);
-    minCorrelationSpin_->setToolTip("Pairs whose aligned gates correlate less than this are left out. (SIGCOR CCMIN)");
-    params->addWidget(caption("Trace distance"));
+    minCorrelationSpin_->setToolTip("Pairs whose normalized correlation peak is below this are left out. (SIGCOR CCMIN)");
+    params->addWidget(caption("Skipped traces"));
     params->addWidget(distanceSpin_);
     params->addSpacing(16);
     params->addWidget(caption("Min correlation"));
@@ -4662,7 +4663,7 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     layout->addWidget(buttonsGroup);
 
     // Signal/Noise settings that don't need to be at hand in its window
-    // (Trace distance and Min correlation are there). SIGCOR card names in
+    // (Skipped traces and Min correlation are there). SIGCOR card names in
     // the tooltips.
     initialSignalNoise_ = initial.signalNoise;
     QGroupBox* snGroup = new QGroupBox("Signal/Noise");
@@ -4685,48 +4686,45 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     snMethodCombo_->addItem("Autocorrelation", int(segy::SigcorOption::Autcor));
     snMethodCombo_->setCurrentIndex(sn.option == segy::SigcorOption::Autcor ? 1 : 0);
     addSnField(0, 0, "Method", snMethodCombo_,
-               "Spectrum: average the power spectra of the gates. Autocorrelation: average the auto- and "
-               "crosscorrelations, transform once at the end. (SIGCOR OPTION SPECTR/AUTCOR)");
-    snShiftPickCombo_ = new QComboBox();
-    snShiftPickCombo_->addItem("Plain", int(segy::SigcorCrossCorrelator::Basic));
-    snShiftPickCombo_->addItem("Normalized", int(segy::SigcorCrossCorrelator::Normalized));
-    snShiftPickCombo_->setCurrentIndex(sn.tcross == segy::SigcorCrossCorrelator::Normalized ? 1 : 0);
-    addSnField(0, 1, "Shift pick", snShiftPickCombo_,
-               "Cross-correlation used to find the shift: plain, or normalized by the RMS of the overlapping part "
-               "of the other trace (better for short gates). (SIGCOR TCROSS BASIC/NORMALIZED)");
+               "Spectrum: average the power spectra of the gates (the reference SPECTR). Autocorrelation: average "
+               "the auto- and crosscorrelations, transform once at the end; the same spectra on a twice as fine "
+               "frequency grid. (SIGCOR OPTION SPECTR/AUTCOR)");
+    snBetaSpin_ = new QDoubleSpinBox();
+    snBetaSpin_->setRange(0.0, 50.0);
+    snBetaSpin_->setDecimals(1);
+    snBetaSpin_->setSingleStep(0.5);
+    snBetaSpin_->setValue(sn.kaiserBeta);
+    addSnField(0, 1, "Taper beta", snBetaSpin_,
+               "Kaiser-Bessel taper over the gate: 0 is no taper, larger values taper harder. (SIGCOR taper, "
+               "beta 5)");
     snRandomSpin_ = new QSpinBox();
     snRandomSpin_->setRange(0, 200);
-    snRandomSpin_->setPrefix("+0..");
+    snRandomSpin_->setPrefix("\xc2\xb1");
     snRandomSpin_->setSuffix(" traces");
     snRandomSpin_->setValue(sn.iransk);
-    addSnField(1, 0, "Random extra", snRandomSpin_,
-               "A random 0..N traces added to the trace distance per pair, against a constant dip. (SIGCOR IRANSK)");
+    addSnField(1, 0, "Random variation", snRandomSpin_,
+               "Per pair, the skipped traces vary randomly by up to this many either way, against a constant "
+               "dip. At most Skipped traces. (SIGCOR IRANSK)");
     snMaxShiftSpin_ = new QDoubleSpinBox();
-    snMaxShiftSpin_->setRange(0.0, 1000.0);
+    snMaxShiftSpin_->setRange(0.1, 1000.0);
     snMaxShiftSpin_->setDecimals(1);
     snMaxShiftSpin_->setSuffix(" ms");
     snMaxShiftSpin_->setValue(sn.shmaxMs);
     addSnField(1, 1, "Max shift", snMaxShiftSpin_,
-               "Largest time shift searched between the two traces. A best match at the limit rejects the pair; "
-               "0 or 1 sample means the data is taken as already aligned. (SIGCOR SHMAX)");
-    snFlatSpin_ = new QDoubleSpinBox();
-    snFlatSpin_->setRange(0.0, 100.0);
-    snFlatSpin_->setDecimals(0);
-    snFlatSpin_->setSuffix(" %");
-    snFlatSpin_->setValue(sn.flatPercent);
-    addSnField(2, 0, "Taper flat part", snFlatSpin_,
-               "Cosine-squared taper: the share of the gate left untapered. (SIGCOR SGGATE cosine window)");
+               "Largest time shift searched between the two traces, rounded to whole samples (at least one). A "
+               "best match at the limit rejects the pair. The gate must be at least 2 x this + 3 samples long. "
+               "(SIGCOR SHMAX)");
     QHBoxLayout* snChecks = new QHBoxLayout();
     snEqualizeCheck_ = new QCheckBox("Equalize energy");
     snEqualizeCheck_->setChecked(sn.normalise);
-    snEqualizeCheck_->setToolTip("Scale both gates of a pair to the same energy. (SIGCOR IGNORM)");
+    snEqualizeCheck_->setToolTip("After alignment, scale both gates of a pair to unit RMS. (SIGCOR IGNORM)");
     snRemoveDcCheck_ = new QCheckBox("Remove DC");
     snRemoveDcCheck_->setChecked(sn.removeDc);
-    snRemoveDcCheck_->setToolTip("Remove each gate's mean before tapering. (SIGCOR IGNORM)");
+    snRemoveDcCheck_->setToolTip("After alignment, remove each gate's mean. (SIGCOR IGNORM)");
     snChecks->addWidget(snEqualizeCheck_);
     snChecks->addWidget(snRemoveDcCheck_);
     snChecks->addStretch();
-    snGrid->addLayout(snChecks, 2, 2, 1, 2);
+    snGrid->addLayout(snChecks, 2, 0, 1, 4);
     layout->addWidget(snGroup);
 
     QHBoxLayout* scaleRow = new QHBoxLayout();
@@ -4797,12 +4795,11 @@ Preferences PreferencesDialog::currentPreferences() const {
         if (!entry.second->isChecked()) prefs.hiddenToolbarItems.append(entry.first);
     }
     segy::SigcorParams& sn = prefs.signalNoise;
-    sn = initialSignalNoise_; // Trace distance/Min correlation: MainWindow keeps the window's
+    sn = initialSignalNoise_; // Skipped traces/Min correlation: MainWindow keeps the window's
     sn.option = segy::SigcorOption(snMethodCombo_->currentData().toInt());
-    sn.tcross = segy::SigcorCrossCorrelator(snShiftPickCombo_->currentData().toInt());
     sn.iransk = snRandomSpin_->value();
     sn.shmaxMs = snMaxShiftSpin_->value();
-    sn.flatPercent = snFlatSpin_->value();
+    sn.kaiserBeta = snBetaSpin_->value();
     sn.normalise = snEqualizeCheck_->isChecked();
     sn.removeDc = snRemoveDcCheck_->isChecked();
     return prefs;
@@ -7610,18 +7607,18 @@ void MainWindow::loadPreferences() {
     prefs_.hiddenToolbarItems.removeAll(QString()); // an empty list can read back as {""}
     segy::SigcorParams& sn = prefs_.signalNoise;
     const segy::SigcorParams defaults;
-    sn.option = settings.value("signalNoise/option", "SPECTR").toString() == "AUTCOR" ? segy::SigcorOption::Autcor
-                                                                                       : segy::SigcorOption::Spectr;
-    sn.tcross = settings.value("signalNoise/tcross", "BASIC").toString() == "NORMALIZED"
-                    ? segy::SigcorCrossCorrelator::Normalized
-                    : segy::SigcorCrossCorrelator::Basic;
-    sn.nskip = std::max(1, settings.value("signalNoise/nskip", defaults.nskip).toInt());
-    sn.iransk = std::max(0, settings.value("signalNoise/iransk", defaults.iransk).toInt());
-    sn.shmaxMs = settings.value("signalNoise/shmaxMs", defaults.shmaxMs).toDouble();
-    sn.ccmin = settings.value("signalNoise/ccmin", defaults.ccmin).toDouble();
-    sn.flatPercent = settings.value("signalNoise/flatPercent", defaults.flatPercent).toDouble();
-    sn.normalise = settings.value("signalNoise/normalise", defaults.normalise).toBool();
-    sn.removeDc = settings.value("signalNoise/removeDc", defaults.removeDc).toBool();
+    // sigcor/*: the SPECTR/STNDRD reference conventions. The older
+    // signalNoise/* keys (NSKIP as pair distance, one-sided IRANSK, cosine
+    // taper) are not carried over; savePreferences removes them.
+    sn.option = settings.value("sigcor/option", "SPECTR").toString() == "AUTCOR" ? segy::SigcorOption::Autcor
+                                                                                  : segy::SigcorOption::Spectr;
+    sn.nskip = std::max(0, settings.value("sigcor/nskip", defaults.nskip).toInt());
+    sn.iransk = std::clamp(settings.value("sigcor/iransk", defaults.iransk).toInt(), 0, sn.nskip);
+    sn.shmaxMs = settings.value("sigcor/shmaxMs", defaults.shmaxMs).toDouble();
+    sn.ccmin = settings.value("sigcor/ccmin", defaults.ccmin).toDouble();
+    sn.kaiserBeta = settings.value("sigcor/kaiserBeta", defaults.kaiserBeta).toDouble();
+    sn.normalise = settings.value("sigcor/normalise", defaults.normalise).toBool();
+    sn.removeDc = settings.value("sigcor/removeDc", defaults.removeDc).toBool();
 }
 
 void MainWindow::savePreferences() {
@@ -7632,16 +7629,15 @@ void MainWindow::savePreferences() {
     settings.setValue("datasetLabelPosition", int(datasetLabelPosition_));
     settings.setValue("toolbarHiddenItems", prefs_.hiddenToolbarItems);
     const segy::SigcorParams& sn = prefs_.signalNoise;
-    settings.setValue("signalNoise/option", sn.option == segy::SigcorOption::Autcor ? "AUTCOR" : "SPECTR");
-    settings.setValue("signalNoise/tcross",
-                      sn.tcross == segy::SigcorCrossCorrelator::Normalized ? "NORMALIZED" : "BASIC");
-    settings.setValue("signalNoise/nskip", sn.nskip);
-    settings.setValue("signalNoise/iransk", sn.iransk);
-    settings.setValue("signalNoise/shmaxMs", sn.shmaxMs);
-    settings.setValue("signalNoise/ccmin", sn.ccmin);
-    settings.setValue("signalNoise/flatPercent", sn.flatPercent);
-    settings.setValue("signalNoise/normalise", sn.normalise);
-    settings.setValue("signalNoise/removeDc", sn.removeDc);
+    settings.remove("signalNoise"); // the pre-reference keys, see loadPreferences
+    settings.setValue("sigcor/option", sn.option == segy::SigcorOption::Autcor ? "AUTCOR" : "SPECTR");
+    settings.setValue("sigcor/nskip", sn.nskip);
+    settings.setValue("sigcor/iransk", sn.iransk);
+    settings.setValue("sigcor/shmaxMs", sn.shmaxMs);
+    settings.setValue("sigcor/ccmin", sn.ccmin);
+    settings.setValue("sigcor/kaiserBeta", sn.kaiserBeta);
+    settings.setValue("sigcor/normalise", sn.normalise);
+    settings.setValue("sigcor/removeDc", sn.removeDc);
 }
 
 void MainWindow::applyDatasetLabelPosition(DatasetLabelPosition position) {
@@ -9377,7 +9373,7 @@ void MainWindow::openPreferencesDialog() {
         for (const ToolbarItem& item : toolbarItems_) items.push_back({item.id, item.label, categoryFor(item.id)});
         preferencesDialog_ = new PreferencesDialog(prefs_, items, this);
         preferencesDialog_->setAppliedCallback([this](const Preferences& newPrefs) {
-            // Trace distance and Min correlation are edited in the Signal/Noise window, not here.
+            // Skipped traces and Min correlation are edited in the Signal/Noise window, not here.
             const int nskip = prefs_.signalNoise.nskip;
             const double ccmin = prefs_.signalNoise.ccmin;
             prefs_ = newPrefs;
@@ -9544,7 +9540,7 @@ void MainWindow::toggleXf(Panel* panel, bool on) {
 
 bool sameSigcorParams(const segy::SigcorParams& a, const segy::SigcorParams& b) {
     return a.option == b.option && a.nskip == b.nskip && a.iransk == b.iransk && a.shmaxMs == b.shmaxMs &&
-           a.ccmin == b.ccmin && a.tcross == b.tcross && a.flatPercent == b.flatPercent &&
+           a.ccmin == b.ccmin && a.kaiserBeta == b.kaiserBeta &&
            a.normalise == b.normalise && a.removeDc == b.removeDc;
 }
 
@@ -9659,18 +9655,28 @@ void MainWindow::computeAndShowSignalNoise(Panel* sourcePanel) {
             SignalNoiseDisplay display;
             auto ms = [](double v) { return QString("%1 ms").arg(v, 0, 'f', 2); };
             auto& d = display.details;
+            const double dtMs = intervalUs / 1000.0;
             if (r.pairsUsed > 0) {
-                const auto [minIt, maxIt] = std::minmax_element(r.pairShiftMs.begin(), r.pairShiftMs.end());
-                double correlationSum = 0.0;
-                for (float cc : r.pairCorrelation) correlationSum += cc;
+                double minMs = std::numeric_limits<double>::infinity(), maxMs = -minMs, correlationSum = 0.0;
+                for (const segy::SigcorPair& pair : r.pairs) {
+                    if (pair.status != segy::SigcorPairStatus::Accepted) continue;
+                    minMs = std::min(minMs, pair.parabolicLag * dtMs);
+                    maxMs = std::max(maxMs, pair.parabolicLag * dtMs);
+                    correlationSum += pair.correlation;
+                }
                 d.push_back({"Time shift", ""});
                 d.push_back({QString("Mean (%1t)").arg(QChar(0x0394)), ms(r.shiftMeanMs)});
                 d.push_back({QString("1%1").arg(QChar(0x03C3)), ms(r.shiftSigmaMs)});
-                d.push_back({"Minimum", ms(*minIt)});
-                d.push_back({"Maximum", ms(*maxIt)});
+                d.push_back({"Minimum", ms(minMs)});
+                d.push_back({"Maximum", ms(maxMs)});
+                d.push_back({"Applied", "whole samples"});
                 d.push_back({"Mean correlation", QString::number(correlationSum / r.pairsUsed, 'f', 3)});
             }
             d.push_back({"Trace pairs", ""});
+            if (r.pairsCandidate > r.pairsTotal) {
+                d.push_back({"Available", QString::number(r.pairsCandidate)});
+                d.push_back({"Computed", QString("%1 (an even subset)").arg(r.pairsTotal)});
+            }
             d.push_back({"Used", QString("%1 of %2").arg(r.pairsUsed).arg(r.pairsTotal)});
             d.push_back({"Below min correlation", QString::number(r.pairsLowCorrelation)});
             d.push_back({"At max shift", QString::number(r.pairsAtShiftLimit)});
@@ -9684,19 +9690,27 @@ void MainWindow::computeAndShowSignalNoise(Panel* sourcePanel) {
                                           .arg(src.s1 * intervalUs / 1000.0, 0, 'f', 0)});
             d.push_back({"Parameters", ""});
             d.push_back({"Method", params.option == segy::SigcorOption::Autcor ? "Autocorrelation" : "Spectrum"});
-            d.push_back({"Trace distance", QString("%1 traces").arg(params.nskip)});
-            d.push_back({"Random extra", QString("+0..%1 traces").arg(params.iransk)});
-            d.push_back({"Max shift", QString("%1 ms").arg(params.shmaxMs, 0, 'f', 1)});
+            d.push_back({"Skipped traces", QString("%1 \xc2\xb1 %2 (pair distance %3 %4 %5)")
+                                               .arg(params.nskip)
+                                               .arg(params.iransk)
+                                               .arg(params.nskip - params.iransk + 1)
+                                               .arg(QChar(0x2013))
+                                               .arg(params.nskip + params.iransk + 1)});
+            d.push_back({"Max shift", QString("%1 ms (%2 samples)").arg(params.shmaxMs, 0, 'f', 1).arg(r.shmaxSamples)});
             d.push_back({"Min correlation", QString::number(params.ccmin, 'f', 2)});
-            d.push_back({"Shift pick", params.tcross == segy::SigcorCrossCorrelator::Normalized ? "Normalized" : "Plain"});
-            d.push_back({"Taper flat part", QString("%1 %").arg(params.flatPercent, 0, 'f', 0)});
+            d.push_back({"Taper", QString("Kaiser, beta %1").arg(params.kaiserBeta, 0, 'f', 1)});
+            d.push_back({"FFT length", QString::number(r.fftLength)});
             d.push_back({"Equalize energy", params.normalise ? "Yes" : "No"});
             d.push_back({"Remove DC", params.removeDc ? "Yes" : "No"});
 
-            if (r.pairsTotal == 0) {
+            if (!r.error.empty()) {
+                display.emptyReason = QString::fromStdString(r.error);
+            } else if (r.pairsTotal == 0) {
                 display.emptyReason =
-                    QString("Not enough data: need more traces than the trace distance (%1) and at least 8 samples.")
-                        .arg(params.nskip);
+                    QString("Not enough data: a pair needs at least %1 traces (skipped traces + 2).")
+                        .arg(params.nskip - params.iransk + 2);
+            } else if (r.pairsDead == r.pairsTotal) {
+                display.emptyReason = "Every trace pair is dead (all-zero gates).";
             } else if (r.pairsUsed == 0) {
                 display.emptyReason =
                     "No trace pair passed Min correlation and Max shift -- try a lower Min correlation, or a "

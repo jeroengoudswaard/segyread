@@ -5,6 +5,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "renderer.h"
@@ -70,66 +71,101 @@ std::vector<float> normalizedCrossCorrelation(const float* a, const float* b, in
 double nearestSidePeakLag(const std::vector<float>& correlation, int minLag, double threshold);
 
 // ---------------------------------------------------------------------------
-// Signal/noise estimation after Shell SIPMAP's SIGCOR (see native/README.md,
-// "Signal/Noise"). Pairs of traces a lateral distance NSKIP (+ a random
-// 0..IRANSK extra) apart are time-aligned by crosscorrelation within +/-SHMAX;
-// the signal power spectrum is the mean cospectrum (real part of the cross
-// spectrum) of the aligned gates, the trace spectrum the mean of their power
-// spectra, and noise = trace - signal.
+// Signal/noise estimation, SIGCOR SPECTR/STNDRD (see native/README.md,
+// "Signal/Noise"). A C++ port of the user's gold-standard MATLAB reference
+// sigcor_spectr_stndrd.m; every step below names its MATLAB counterpart.
+//
+// Pairs (streaming model): every current trace c draws actualSkip uniformly
+// from NSKIP-IRANSK .. NSKIP+IRANSK and is paired with the earlier trace
+// c - (actualSkip + 1). NSKIP is the number of traces BETWEEN the pair.
+// Per pair, on the raw gates: normalised correlation at integer lags
+// -SHMAX..+SHMAX over the overlapping parts; a maximum at either end of
+// the range rejects the pair, a coefficient below CCMIN too. A parabola
+// through the peak refines the lag, which is then rounded to a whole
+// sample (NIPOL=1). On the overlap at that lag: remove DC, unit RMS, put
+// back into a zero-filled gate, Kaiser taper, FFT. Per pair
+//     T = (|X|^2 + |Y|^2) / 2,  S = Re(X conj(Y)),  N = |X - Y|^2 / 2,
+// averaged over the accepted pairs.
 
 enum class SigcorOption {
-    Spectr, // periodograms of the tapered gates, averaged in the frequency domain
+    Spectr, // periodograms of the tapered gates, averaged in the frequency domain (the reference)
     Autcor, // auto/crosscorrelations averaged in the time domain, transformed once at the end
-};
-
-enum class SigcorCrossCorrelator {
-    Basic,      // unnormalized crosscorrelation picks the shift
-    Normalized, // each lag weighted by the RMS of the overlapping gate parts
 };
 
 struct SigcorParams {
     SigcorOption option = SigcorOption::Spectr;
-    int nskip = 3;  // lateral distance (traces) between the two traces of a pair, >= 1
-    int iransk = 2; // random extra distance, uniform 0..iransk
-    double shmaxMs = 30.0;
-    double ccmin = 0.3; // pairs with a lower correlation coefficient add no signal estimate
-    SigcorCrossCorrelator tcross = SigcorCrossCorrelator::Basic;
-    double flatPercent = 5.0; // cosine-squared taper: flat part, % of the gate
-    bool normalise = true;    // equalize the energy of the two gates
-    bool removeDc = true;     // remove each gate's mean before tapering
-    uint32_t seed = 1;        // IRANSK's random distances are reproducible
-    int maxPairs = 2000;      // start traces are strided down to this many
+    int nskip = 3;          // NSKIP: traces BETWEEN the two traces of a pair (pair distance = skip + 1), >= 0
+    int iransk = 2;         // IRANSK: symmetric random variation, skip in nskip-iransk..nskip+iransk; <= nskip
+    double shmaxMs = 20.0;  // SHMAX: largest lag searched; rounded to whole samples, >= 1 sample
+    double ccmin = 0.65;    // CCMIN: pairs with a lower normalised correlation are rejected
+    double kaiserBeta = 5.0; // Kaiser-Bessel taper parameter
+    bool removeDc = true;   // remove the mean of the aligned overlap
+    bool normalise = true;  // scale the aligned overlap to unit RMS
+    uint32_t seed = 12345;  // MT19937 seed of the IRANSK draws
+    int maxPairs = 20000;   // more candidate pairs than this: an even subset of them is computed
+};
+
+enum class SigcorPairStatus : uint8_t {
+    Accepted,
+    AtShiftLimit,   // correlation maximum at -SHMAX or +SHMAX
+    LowCorrelation, // below CCMIN
+    Dead,           // no finite correlation at any lag (an all-zero gate)
+};
+
+struct SigcorPair {
+    int64_t earlierTrace = 0;
+    int64_t currentTrace = 0;
+    int actualSkip = 0;          // pair distance = actualSkip + 1
+    int discreteLag = 0;         // samples; positive = the event is later on the current trace
+    double parabolicLag = 0.0;   // samples, refined by the parabola (= discreteLag at the limit)
+    int appliedLag = 0;          // round(parabolicLag), accepted pairs only
+    double correlation = 0.0;    // normalised correlation at discreteLag (NaN for Dead)
+    SigcorPairStatus status = SigcorPairStatus::Dead;
 };
 
 struct SigcorResult {
+    std::string error; // set when the parameters or the gate are invalid (nothing computed)
     std::vector<float> frequencyHz;
-    // Mean power spectra (linear, not normalized), over the accepted pairs.
+    // Mean power spectra (linear, not normalised) over the accepted pairs.
     std::vector<double> tracePower;
-    std::vector<double> signalPower;
-    std::vector<double> noisePower; // trace - signal, may dip below zero at single bins
-    // Per accepted pair: first trace index, shift (ms, positive = later on the
-    // later trace) and correlation coefficient of the aligned gates.
-    std::vector<int64_t> pairTrace;
-    std::vector<float> pairShiftMs;
-    std::vector<float> pairCorrelation;
-    int pairsTotal = 0;
+    std::vector<double> signalPower; // the cospectrum: can be negative at single frequencies
+    std::vector<double> noisePower;  // mean of |X - Y|^2 / 2, never negative
+    std::vector<SigcorPair> pairs;   // every pair considered, in trace order
+    int pairsCandidate = 0;          // pairs the streaming selection produced (before maxPairs)
+    int pairsTotal = 0;              // pairs considered (= pairs.size())
     int pairsUsed = 0;
-    int pairsLowCorrelation = 0; // below CCMIN
-    int pairsAtShiftLimit = 0;   // crosscorrelation maximum at +/-SHMAX
-    int pairsDead = 0;           // an all-zero gate
+    int pairsLowCorrelation = 0;
+    int pairsAtShiftLimit = 0;
+    int pairsDead = 0;
+    int shmaxSamples = 0;
+    int fftLength = 0;
+    // Mean and 1 sigma of the accepted pairs' parabolic lags, in ms.
     double shiftMeanMs = 0.0;
-    double shiftSigmaMs = 0.0; // 1 sigma of pairShiftMs
+    double shiftSigmaMs = 0.0;
     int gateSamples = 0;
 };
 
 // Fills `out` with all `samplesPerTrace` samples of trace `traceIndex`.
+// Must be safe to call from several threads at once.
 using SigcorTraceFetch = std::function<void(int64_t traceIndex, float* out)>;
 
 // Gate = samples [gateStart, gateEnd) of every trace in [traceStart,
-// traceEnd). `progress(done, total)` is optional, called once per pair.
+// traceEnd). `progress(done, total)` is optional and may be called from
+// worker threads.
 SigcorResult computeSigcor(const SigcorTraceFetch& fetch, int samplesPerTrace, int64_t traceStart, int64_t traceEnd,
                            int gateStart, int gateEnd, double sampleIntervalUs, const SigcorParams& params,
                            const std::function<void(int, int)>& progress = nullptr);
+
+// The IRANSK draws: actualSkip for current traces 2..count (MATLAB's
+// currentTrace = 2:nTraces), one draw each, uniform over
+// nskip-iransk..nskip+iransk from an MT19937 seeded with `seed` (53-bit
+// uniform double u, skip = lo + floor(u * (hi - lo + 1))). Without
+// variation every entry is nskip. Entry k belongs to current trace k + 1
+// (0-based), so the vector has count - 1 entries.
+std::vector<int> sigcorSkipDraws(int64_t count, int nskip, int iransk, uint32_t seed);
+
+// Kaiser-Bessel window, w[k] = I0(beta sqrt(1 - q^2)) / I0(beta), q = 2k/(n-1) - 1.
+std::vector<double> kaiserWindow(int n, double beta);
 
 // Cosine-squared taper: 1 over the central `flatPercent` of n samples,
 // sin^2 ramps to 0 over the rest on either side.
@@ -217,9 +253,5 @@ FkResult computeFk(const SigcorTraceFetch& fetch, int samplesPerTrace, const std
 // the arbitrary integration constant (the result's mean). Zero-padded to twice the length (no wrap-around). Time
 // in seconds: full differentiation scales by 2 pi f.
 void traceDerivative(std::vector<float>& trace, double sampleIntervalUs, double slopeDbPerOctave);
-
-// Shifts x by a fraction of a sample: out[i] = x(i + shift), band-limited
-// (phase ramp in the frequency domain). |shift| <= 1 is the intended use.
-std::vector<float> fractionalShift(const std::vector<float>& x, double shift);
 
 } // namespace segy
