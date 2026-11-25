@@ -2103,6 +2103,119 @@ void testDepthConversion() {
     CHECK_NEAR(v[1], 2000.0, 1e-3);
 }
 
+// One-sided data (velocities, instantaneous frequency) spans the whole
+// colour scale; bipolar data keeps zero in the middle.
+// Trapezoid weights and a filtered tone; Butterworth with its own slope per side.
+void testBandpassShapes() {
+    const double kPi = 3.14159265358979323846;
+    const segy::OrmsbyParams o{5.0, 10.0, 50.0, 70.0};
+    CHECK_NEAR(segy::ormsbyWeight(2.0, o), 0.0, 1e-12);
+    CHECK_NEAR(segy::ormsbyWeight(7.5, o), 0.5, 1e-12);
+    CHECK_NEAR(segy::ormsbyWeight(30.0, o), 1.0, 1e-12);
+    CHECK_NEAR(segy::ormsbyWeight(60.0, o), 0.5, 1e-12);
+    CHECK_NEAR(segy::ormsbyWeight(80.0, o), 0.0, 1e-12);
+    // Amplitude of a filtered tone (2 ms, 4000 samples) in the trace's middle.
+    auto toneGain = [&](double f, auto&& filter) {
+        std::vector<float> x(4000);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = float(std::sin(2.0 * kPi * f * double(i) * 0.002));
+        filter(x);
+        double sum = 0.0; // RMS x sqrt(2): the sampled peak misses the true one at 10 samples/cycle
+        for (size_t i = 1000; i < 3000; ++i) sum += double(x[i]) * x[i];
+        return std::sqrt(2.0 * sum / 2000.0);
+    };
+    auto ormsby = [&](std::vector<float>& x) { segy::ormsbyFilter(x, 2000.0, o); };
+    CHECK_NEAR(toneGain(30.0, ormsby), 1.0, 0.02);
+    CHECK_NEAR(toneGain(60.0, ormsby), 0.5, 0.03);
+    CHECK(toneGain(100.0, ormsby) < 0.02);
+    // Low cut order 2 at 10 Hz, high cut order 6 at 50 Hz (fs 500): after
+    // filtfilt the gain is |H|^2, so 0.5 at each corner, 1/(1 + 2^4) an
+    // octave below the low corner and 1/(1 + 2^12) an octave above the high one.
+    segy::ButterworthBandParams b{10.0, 50.0, 4};
+    b.lowOrder = 2;
+    b.highOrder = 6;
+    const std::vector<segy::Biquad> sos = segy::designButterworthBand(b, 500.0);
+    CHECK(sos.size() == 4); // 1 highpass + 3 lowpass sections
+    auto butter = [&](std::vector<float>& x) { segy::sosFiltFilt(sos, x); };
+    CHECK_NEAR(toneGain(10.0, butter), 0.5, 0.02);
+    CHECK_NEAR(toneGain(5.0, butter), 1.0 / 17.0, 0.01);
+    CHECK_NEAR(toneGain(50.0, butter), 0.5, 0.02);
+    CHECK(toneGain(100.0, butter) < 0.002);
+}
+
+// Sparse reflectivity convolved with a 25 Hz ricker rotated by +40 degrees:
+// the scan should find the rotation back, -40 (both measures, and agreement).
+void testPhaseScan() {
+    const double kPi = 3.14159265358979323846;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    std::vector<float> wavelet(101);
+    for (int i = 0; i < 101; ++i) {
+        const double a = kPi * 25.0 * (i - 50) * 0.004;
+        wavelet[size_t(i)] = float((1.0 - 2.0 * a * a) * std::exp(-a * a));
+    }
+    segy::phaseRotate(wavelet, 40.0);
+    segy::PhaseScanSums sums;
+    for (int t = 0; t < 40; ++t) {
+        std::vector<double> refl(800, 0.0);
+        for (double& r : refl) if (uni(rng) < 0.03) r = uni(rng) < 0.5 ? -(0.3 + uni(rng)) : 0.3 + uni(rng);
+        std::vector<float> trace(800, 0.0f);
+        for (int i = 0; i < 800; ++i) {
+            if (refl[size_t(i)] == 0.0) continue;
+            for (int k = 0; k < 101; ++k) {
+                const int j = i + k - 50;
+                if (j >= 0 && j < 800) trace[size_t(j)] += float(refl[size_t(i)] * wavelet[size_t(k)]);
+            }
+        }
+        for (float& v : trace) v *= float(1 + t); // loudness varies along the line
+        segy::addPhaseScanTrace(sums, trace);
+    }
+    const segy::PhaseScanResult r = segy::finishPhaseScan(sums);
+    CHECK(r.valid);
+    CHECK_NEAR(r.kurtosisAngle, -40.0, 6.0);
+    CHECK_NEAR(r.entropyAngle, -40.0, 6.0);
+    CHECK_NEAR(r.agreementAngle, -40.0, 6.0);
+    CHECK(r.spreadDeg < 10.0);
+    std::printf("   phase scan of a +40 degree wavelet: kurtosis %.1f, entropy %.1f, agreement %.1f\n",
+                r.kurtosisAngle, r.entropyAngle, r.agreementAngle);
+    // The analytic kurtosis equals the directly computed one at an angle.
+    segy::PhaseScanSums one;
+    std::vector<float> x(256);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = float(std::sin(0.3 * double(i)) + (i == 100 ? 4.0 : 0.0));
+    segy::addPhaseScanTrace(one, x);
+    const segy::PhaseScanResult rr = segy::finishPhaseScan(one);
+    std::vector<float> rot = x;
+    segy::phaseRotate(rot, rr.anglesDeg[120]);
+    double s2 = 0.0, s4 = 0.0;
+    for (float v : rot) { s2 += double(v) * v; s4 += double(v) * v * v * v; }
+    CHECK_NEAR(rr.kurtosis[120], double(rot.size()) * s4 / (s2 * s2), 1e-3 * rr.kurtosis[120]);
+}
+
+void testEffectiveClip() {
+    segy::ManualClip none;
+    segy::ManualClip v = segy::effectiveClip(none, 1500.0f, 4500.0f, nullptr);
+    CHECK(v.enabled);
+    CHECK_NEAR(v.center, 3000.0f, 1e-3);
+    CHECK_NEAR(v.posMagnitude, 1500.0f, 1e-3);
+    CHECK_NEAR(v.negMagnitude, 1500.0f, 1e-3);
+    segy::ManualClip neg = segy::effectiveClip(none, -40.0f, 0.0f, nullptr);
+    CHECK_NEAR(neg.center, -20.0f, 1e-4);
+    CHECK(!segy::effectiveClip(none, -3.0f, 5.0f, nullptr).enabled); // bipolar: default clip
+    segy::AmplitudeProcessing agc;
+    agc.agcEnabled = true;
+    CHECK(!segy::effectiveClip(none, 0.0f, 125.0f, &agc).enabled);     // AGC output is bipolar
+    segy::ManualClip manual{true, 2.0f, 3.0f, 0.0f};
+    CHECK_NEAR(segy::effectiveClip(manual, 1500.0f, 4500.0f, nullptr).posMagnitude, 2.0f, 1e-6);
+    // Range <-> clip round trips, both kinds.
+    for (auto range : {std::pair<float, float>{-3.0f, 5.0f}, {0.0f, 125.0f}, {1500.0f, 4500.0f}, {-40.0f, -10.0f}}) {
+        segy::ManualClip c = segy::clipFromRange(range.first, range.second);
+        float lo = 0.0f, hi = 0.0f;
+        segy::clipToRange(c, &lo, &hi);
+        CHECK_NEAR(lo, range.first, 1e-3);
+        CHECK_NEAR(hi, range.second, 1e-3);
+    }
+    CHECK(segy::clipFromRange(-3.0f, 5.0f).center == 0.0f);
+}
+
 void testProcessing() {
     const double kPi = 3.14159265358979323846;
     auto ricker = [kPi](double t, double f) {
@@ -2212,8 +2325,9 @@ void testProcessing() {
         for (const auto& tr : panel) for (float v : tr) e += double(v) * v;
         return e;
     };
-    segy::FkFilterParams fk;
-    fk.velocity = 1500.0;
+    segy::FkFilterParams fk; // reject 0..1500 m/s
+    fk.minVelocity = 0.0;
+    fk.maxVelocity = 1500.0;
     fk.traceSpacing = 10.0;
     auto flat = panelWith(0.0), dipping = panelWith(1.0 / 1000.0);
     const double flatBefore = energy(flat), dipBefore = energy(dipping);
@@ -2222,7 +2336,21 @@ void testProcessing() {
     CHECK(energy(flat) / flatBefore > 0.95);
     CHECK(energy(dipping) / dipBefore < 0.05);
     CHECK_NEAR(segy::fkFilterWeight(30.0, 0.0, fk), 1.0, 1e-12);
-    CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 1000.0, fk), 0.0, 1e-12); // 1000 m/s, below the taper
+    CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 1000.0, fk), 0.0, 1e-12); // 1000 m/s, inside the rejected range
+    CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 1650.0, fk), 0.5, 1e-9);  // halfway up the taper (1500..1800)
+    // Pass 800..1200 m/s: the 1000 m/s dip stays, the flat event goes.
+    segy::FkFilterParams band;
+    band.minVelocity = 800.0;
+    band.maxVelocity = 1200.0;
+    band.traceSpacing = 10.0;
+    band.pass = true;
+    auto flat2 = panelWith(0.0), dipping2 = panelWith(1.0 / 1000.0);
+    segy::fkFilterPanel(flat2, 4000.0, band);
+    segy::fkFilterPanel(dipping2, 4000.0, band);
+    CHECK(energy(flat2) / flatBefore < 0.05);
+    CHECK(energy(dipping2) / dipBefore > 0.9);
+    CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 1000.0, band), 1.0, 1e-12);
+    CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 600.0, band), 0.0, 1e-12); // below 800 x 0.8
 }
 
 void testHorizons() {
@@ -2518,6 +2646,9 @@ int main() {
     testHorizons();
     testDepthConversion();
     testProcessing();
+    testEffectiveClip();
+    testBandpassShapes();
+    testPhaseScan();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

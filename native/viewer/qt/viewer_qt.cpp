@@ -430,6 +430,14 @@ segy::RenderContext makeRenderContextFor(AppState& app) {
     return ctx;
 }
 
+// The clip the renderer really uses for `app` (segy::effectiveClip: one-sided
+// data spans its own min..max), so the legend and the Clip dialog match it.
+// Only call when app.loaded.
+segy::ManualClip displayedClip(const AppState& app) {
+    return segy::effectiveClip(app.display.manualClip, app.foreground->pyramid.globalMin,
+                               app.foreground->pyramid.globalMax, &app.display.processing);
+}
+
 // Builds the exact 3200-character (40 lines x 80 cols, "C 1 "/"C10 "-style
 // prefixes matching the SEG-Y convention) EBCDIC-ready text used by
 // Calculator/Bandpass/Save SEG-Y -- see native/README.md. Shared by all
@@ -1007,9 +1015,9 @@ void ClipHistogramWidget::setHistogram(const segy::HistogramResult& result) {
     update();
 }
 
-void ClipHistogramWidget::setClipValues(float posClip, float negClip) {
-    posClip_ = std::max(posClip, 1e-6f);
-    negClip_ = std::max(negClip, 1e-6f);
+void ClipHistogramWidget::setClipValues(float low, float high) {
+    low_ = low;
+    high_ = std::max(high, low + 1e-6f);
     update();
 }
 
@@ -1037,27 +1045,34 @@ float ClipHistogramWidget::valueForX(int x) const {
 
 int ClipHistogramWidget::hitTestLine(int x) const {
     constexpr int kHitRadius = 8;
-    int negX = xForValue(-negClip_);
-    int posX = xForValue(posClip_);
-    if (std::abs(x - negX) <= kHitRadius) return 0;
-    if (std::abs(x - posX) <= kHitRadius) return 1;
+    int lowX = xForValue(low_);
+    int highX = xForValue(high_);
+    if (std::abs(x - lowX) <= kHitRadius) return 0;
+    if (std::abs(x - highX) <= kHitRadius) return 1;
     return -1;
 }
 
 void ClipHistogramWidget::setValueFromDrag(int lineIndex, float value) {
-    // Each line is a positive magnitude on its own side of zero, so the two
-    // literally cannot cross -- clamp away from zero (never quite reaching
-    // it) instead of letting either collapse to nothing.
-    constexpr float kMinMagnitude = 1e-3f;
+    // The two lines never cross: each stops a hair short of the other.
+    // Symmetrical mirrors the other line around zero (bipolar data only).
+    const float gap = 1e-3f * std::max(1e-6f, result_.rangeMax - result_.rangeMin);
     if (lineIndex == 0) {
-        negClip_ = std::max(-value, kMinMagnitude);
-        if (symmetrical_) posClip_ = negClip_;
+        if (symmetrical_) {
+            high_ = std::max(-value, gap);
+            low_ = -high_;
+        } else {
+            low_ = std::min(value, high_ - gap);
+        }
     } else {
-        posClip_ = std::max(value, kMinMagnitude);
-        if (symmetrical_) negClip_ = posClip_;
+        if (symmetrical_) {
+            high_ = std::max(value, gap);
+            low_ = -high_;
+        } else {
+            high_ = std::max(value, low_ + gap);
+        }
     }
     update();
-    if (onChanged) onChanged(posClip_, negClip_);
+    if (onChanged) onChanged(low_, high_);
 }
 
 void ClipHistogramWidget::mousePressEvent(QMouseEvent* event) {
@@ -1124,8 +1139,8 @@ void ClipHistogramWidget::paintEvent(QPaintEvent*) {
         painter.setBrush(active ? QColor(Qt::white) : QColor(kAccentColor));
         painter.drawRect(x - kHandle / 2, chart.top() - kHandle, kHandle, kHandle);
     };
-    drawLine(-negClip_, draggingLine_ == 0);
-    drawLine(posClip_, draggingLine_ == 1);
+    drawLine(low_, draggingLine_ == 0);
+    drawLine(high_, draggingLine_ == 1);
 }
 
 ClipDialog::ClipDialog(AppState& app, QWidget* parent) : QDialog(parent), app_(app) {
@@ -1142,44 +1157,43 @@ ClipDialog::ClipDialog(AppState& app, QWidget* parent) : QDialog(parent), app_(a
     histogramWidget_ = new ClipHistogramWidget(this);
     layout->addWidget(histogramWidget_, 1);
 
+    // Min and Max are the data values at the two ends of the colour scale,
+    // any sign (velocities 1500..4500, instantaneous frequency 0..125). A
+    // range across zero keeps zero at the middle colour.
     QHBoxLayout* spinRow = new QHBoxLayout();
-    spinRow->addWidget(new QLabel("Min (-):"));
-    negSpin_ = new QDoubleSpinBox();
-    negSpin_->setRange(1e-3, 1e12);
-    negSpin_->setDecimals(3);
-    spinRow->addWidget(negSpin_);
+    spinRow->addWidget(new QLabel("Min"));
+    lowSpin_ = new QDoubleSpinBox();
+    lowSpin_->setRange(-1e12, 1e12);
+    lowSpin_->setDecimals(3);
+    spinRow->addWidget(lowSpin_);
     spinRow->addStretch();
     symmetricalCheck_ = new QCheckBox("Symmetrical");
-    symmetricalCheck_->setChecked(true);
+    symmetricalCheck_->setToolTip("Symmetrical: Min is always minus Max, so zero stays in the middle");
     spinRow->addWidget(symmetricalCheck_);
     spinRow->addStretch();
-    spinRow->addWidget(new QLabel("Max (+):"));
-    posSpin_ = new QDoubleSpinBox();
-    posSpin_->setRange(1e-3, 1e12);
-    posSpin_->setDecimals(3);
-    spinRow->addWidget(posSpin_);
+    spinRow->addWidget(new QLabel("Max"));
+    highSpin_ = new QDoubleSpinBox();
+    highSpin_->setRange(-1e12, 1e12);
+    highSpin_->setDecimals(3);
+    spinRow->addWidget(highSpin_);
     layout->addLayout(spinRow);
 
-    histogramWidget_->setSymmetrical(true);
     connect(symmetricalCheck_, &QCheckBox::toggled, this, [this](bool checked) {
         histogramWidget_->setSymmetrical(checked);
         if (checked) {
-            // Turning it back on snaps to symmetric around whichever of
-            // the two current values is larger, rather than silently
-            // leaving them mismatched until the next drag.
-            float magnitude = std::max(posSpin_->value(), negSpin_->value());
-            applyLive(float(magnitude), float(magnitude), false);
+            // Snap to symmetric around the larger magnitude rather than
+            // leaving the two mismatched until the next drag.
+            float magnitude = float(std::max(std::fabs(highSpin_->value()), std::fabs(lowSpin_->value())));
+            applyLive(-magnitude, magnitude);
         }
     });
 
-    histogramWidget_->onChanged = [this](float posClip, float negClip) { applyLive(posClip, negClip, false); };
-    connect(posSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        float negClip = symmetricalCheck_->isChecked() ? float(v) : float(negSpin_->value());
-        applyLive(float(v), negClip, false);
+    histogramWidget_->onChanged = [this](float low, float high) { applyLive(low, high); };
+    connect(highSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        applyLive(symmetricalCheck_->isChecked() ? -float(v) : float(lowSpin_->value()), float(v));
     });
-    connect(negSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        float posClip = symmetricalCheck_->isChecked() ? float(v) : float(posSpin_->value());
-        applyLive(posClip, float(v), false);
+    connect(lowSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        applyLive(float(v), symmetricalCheck_->isChecked() ? -float(v) : float(highSpin_->value()));
     });
 
     addButtonRow(this, layout,
@@ -1191,7 +1205,7 @@ ClipDialog::ClipDialog(AppState& app, QWidget* parent) : QDialog(parent), app_(a
                       }},
                      {"Apply",
                       [this]() {
-                          recomputeHistogram(-negSpin_->value(), posSpin_->value());
+                          recomputeHistogramAround(float(lowSpin_->value()), float(highSpin_->value()));
                           if (onChanged_) onChanged_();
                       }},
                      {"Cancel",
@@ -1207,22 +1221,31 @@ ClipDialog::ClipDialog(AppState& app, QWidget* parent) : QDialog(parent), app_(a
 
 void ClipDialog::setChangedCallback(std::function<void()> callback) { onChanged_ = std::move(callback); }
 
-void ClipDialog::applyLive(float posClip, float negClip, bool /*fromSymmetricalDrag*/) {
-    posClip = std::max(posClip, 1e-6f);
-    negClip = std::max(negClip, 1e-6f);
-    app_.display.manualClip.enabled = true;
-    app_.display.manualClip.posMagnitude = posClip;
-    app_.display.manualClip.negMagnitude = negClip;
+void ClipDialog::applyLive(float low, float high) {
+    if (!(high > low)) {
+        // A typed value past the other end: keep the range valid by moving
+        // the end that was not being edited.
+        const float span = std::max(1e-3f, std::fabs(high) * 1e-3f);
+        if (lowSpin_->hasFocus()) high = low + span;
+        else low = high - span;
+    }
+    app_.display.manualClip = segy::clipFromRange(low, high);
 
-    posSpin_->blockSignals(true);
-    negSpin_->blockSignals(true);
-    posSpin_->setValue(double(posClip));
-    negSpin_->setValue(double(negClip));
-    posSpin_->blockSignals(false);
-    negSpin_->blockSignals(false);
-    histogramWidget_->setClipValues(posClip, negClip);
+    lowSpin_->blockSignals(true);
+    highSpin_->blockSignals(true);
+    lowSpin_->setValue(double(low));
+    highSpin_->setValue(double(high));
+    lowSpin_->blockSignals(false);
+    highSpin_->blockSignals(false);
+    histogramWidget_->setClipValues(low, high);
 
     if (onChanged_) onChanged_();
+}
+
+void ClipDialog::recomputeHistogramAround(float low, float high) {
+    // Bin over a bit more than the clip so both lines have room to move.
+    const float margin = 0.15f * (high - low);
+    recomputeHistogram(low - margin, high + margin);
 }
 
 void ClipDialog::recomputeHistogram(float rangeMin, float rangeMax) {
@@ -1245,17 +1268,29 @@ void ClipDialog::showEvent(QShowEvent* event) {
     if (!app_.loaded) return;
     original_ = app_.display.manualClip;
 
-    float rawClip = std::max(std::fabs(app_.foreground->pyramid.globalMin), std::fabs(app_.foreground->pyramid.globalMax));
-    float posClip = app_.display.manualClip.enabled ? app_.display.manualClip.posMagnitude : rawClip;
-    float negClip = app_.display.manualClip.enabled ? app_.display.manualClip.negMagnitude : rawClip;
+    const float dataMin = app_.foreground->pyramid.globalMin, dataMax = app_.foreground->pyramid.globalMax;
+    segy::ManualClip clip = segy::effectiveClip(app_.display.manualClip, dataMin, dataMax, nullptr);
+    if (!clip.enabled) {
+        const float rawClip = std::max(std::fabs(dataMin), std::fabs(dataMax));
+        clip = segy::ManualClip{true, rawClip, rawClip, 0.0f};
+    }
+    float low = 0.0f, high = 1.0f;
+    segy::clipToRange(clip, &low, &high);
+    // Symmetrical by default only where it can be: a range around zero.
+    const bool symmetrical = clip.center == 0.0f && clip.posMagnitude == clip.negMagnitude;
+    symmetricalCheck_->blockSignals(true);
+    symmetricalCheck_->setChecked(symmetrical);
+    symmetricalCheck_->blockSignals(false);
+    histogramWidget_->setSymmetrical(symmetrical);
 
-    // Bin over a bit wider than the initial clip so both lines start with
-    // visible headroom on either side to drag into, not pinned to the
-    // chart's own edges.
-    recomputeHistogram(-negClip * 1.3f, posClip * 1.3f);
-    posSpin_->setValue(double(posClip));
-    negSpin_->setValue(double(negClip));
-    histogramWidget_->setClipValues(posClip, negClip);
+    recomputeHistogramAround(low, high);
+    lowSpin_->blockSignals(true);
+    highSpin_->blockSignals(true);
+    lowSpin_->setValue(double(low));
+    highSpin_->setValue(double(high));
+    lowSpin_->blockSignals(false);
+    highSpin_->blockSignals(false);
+    histogramWidget_->setClipValues(low, high);
 }
 
 HistogramDialog::HistogramDialog(AppState& app, QWidget* parent) : QDialog(parent), app_(app) {
@@ -1669,7 +1704,8 @@ AmplitudeProcessingDialog::AmplitudeProcessingDialog(QWidget* parent) : QDialog(
     setWindowTitle("Amplitude Processing");
     QVBoxLayout* layout = new QVBoxLayout(this);
 
-    QLabel* hint = new QLabel("Display only: the data itself, Spectrum, Histogram and Save SEG-Y are unaffected.");
+    QLabel* hint = new QLabel("Writes a new dataset: the gain curve first, then AGC. For AGC on the display only, "
+                              "use the AGC button (right-click it for its window and level).");
     hint->setWordWrap(true);
     hint->setStyleSheet(themed("color: #9a9ca3;"));
     layout->addWidget(hint);
@@ -1707,14 +1743,12 @@ AmplitudeProcessingDialog::AmplitudeProcessingDialog(QWidget* parent) : QDialog(
             db = p.gainCurve.back().gainDb;
         }
         addGainRow(t, db);
-        emitChanged();
     });
     connect(removeButton, &QPushButton::clicked, this, [this]() {
         int row = gainTable_->currentRow();
         if (row < 0) row = gainTable_->rowCount() - 1;
         if (row < 0) return;
         gainTable_->removeRow(row);
-        emitChanged();
     });
     connect(gainGroup_, &QGroupBox::toggled, this, [this](bool on) {
         // A sensible starting curve the first time it's switched on:
@@ -1723,7 +1757,6 @@ AmplitudeProcessingDialog::AmplitudeProcessingDialog(QWidget* parent) : QDialog(
             addGainRow(0.0, 0.0);
             addGainRow(recordLengthMs_, 12.0);
         }
-        emitChanged();
     });
 
     // --- AGC ---
@@ -1738,28 +1771,29 @@ AmplitudeProcessingDialog::AmplitudeProcessingDialog(QWidget* parent) : QDialog(
     agcWindowSpin_->setSuffix(" ms");
     agcWindowSpin_->setValue(500.0);
     agcWindowSpin_->setKeyboardTracking(false);
-    agcWindowSpin_->setToolTip("Length of the RMS window centered on each sample");
-    agcLayout->addRow("Window:", agcWindowSpin_);
-    agcLevelSpin_ = new QDoubleSpinBox;
-    agcLevelSpin_->setRange(1.0, 100.0);
-    agcLevelSpin_->setDecimals(0);
-    agcLevelSpin_->setSingleStep(5.0);
-    agcLevelSpin_->setSuffix(" %");
-    agcLevelSpin_->setValue(25.0);
-    agcLevelSpin_->setKeyboardTracking(false);
-    agcLevelSpin_->setToolTip("Where each window's RMS lands on the color scale / wiggle excursion "
-                              "(the toolbar gain still applies on top)");
-    agcLayout->addRow("Level (of full scale):", agcLevelSpin_);
+    agcWindowSpin_->setToolTip("Window: length of the RMS window centred on each sample; every window's RMS "
+                               "becomes 1 in the output");
+    agcLayout->addRow("Window", agcWindowSpin_);
     layout->addWidget(agcGroup_);
 
-    connect(agcGroup_, &QGroupBox::toggled, this, [this]() { emitChanged(); });
-    connect(agcWindowSpin_, &QDoubleSpinBox::valueChanged, this, [this]() { emitChanged(); });
-    connect(agcLevelSpin_, &QDoubleSpinBox::valueChanged, this, [this]() { emitChanged(); });
+    QHBoxLayout* nameRow = new QHBoxLayout();
+    nameRow->addWidget(new QLabel("Output name"));
+    outputNameEdit_ = new QLineEdit();
+    nameRow->addWidget(outputNameEdit_, 1);
+    layout->addLayout(nameRow);
 
-    QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
-    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::close);
+    QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
+        const segy::AmplitudeProcessing p = collect();
+        if (!outputNameEdit_->text().trimmed().isEmpty() && p.active()) accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     layout->addWidget(buttons);
 }
+
+void AmplitudeProcessingDialog::setOutputName(const QString& name) { outputNameEdit_->setText(name); }
+
+QString AmplitudeProcessingDialog::outputName() const { return outputNameEdit_->text().trimmed(); }
 
 void AmplitudeProcessingDialog::addGainRow(double timeMs, double gainDb) {
     int row = gainTable_->rowCount();
@@ -1770,9 +1804,7 @@ void AmplitudeProcessingDialog::addGainRow(double timeMs, double gainDb) {
         spin->setDecimals(1);
         spin->setSingleStep(step);
         spin->setValue(value);
-        spin->setKeyboardTracking(false); // apply on Enter/focus-out, not every keystroke
         spin->setFrame(false);
-        connect(spin, &QDoubleSpinBox::valueChanged, this, [this]() { emitChanged(); });
         return spin;
     };
     gainTable_->setCellWidget(row, 0, makeSpin(0.0, 1e6, 100.0, timeMs));
@@ -1789,29 +1821,16 @@ segy::AmplitudeProcessing AmplitudeProcessingDialog::collect() const {
     }
     p.agcEnabled = agcGroup_->isChecked();
     p.agcWindowMs = agcWindowSpin_->value();
-    p.agcLevelPercent = agcLevelSpin_->value();
     return p;
 }
 
-void AmplitudeProcessingDialog::emitChanged() {
-    if (loading_ || !onChanged_) return;
-    onChanged_(collect());
-}
-
 void AmplitudeProcessingDialog::setProcessing(const segy::AmplitudeProcessing& processing, double recordLengthMs) {
-    loading_ = true;
     if (recordLengthMs > 0.0) recordLengthMs_ = recordLengthMs;
     gainTable_->setRowCount(0);
     for (const segy::GainPoint& point : processing.gainCurve) addGainRow(point.timeMs, point.gainDb);
     gainGroup_->setChecked(processing.gainCurveEnabled);
     agcGroup_->setChecked(processing.agcEnabled);
     agcWindowSpin_->setValue(processing.agcWindowMs);
-    agcLevelSpin_->setValue(processing.agcLevelPercent);
-    loading_ = false;
-}
-
-void AmplitudeProcessingDialog::setChangedCallback(std::function<void(const segy::AmplitudeProcessing&)> callback) {
-    onChanged_ = std::move(callback);
 }
 
 CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
@@ -1913,47 +1932,87 @@ BandpassDialog::BandpassDialog(QWidget* parent) : QDialog(parent) {
 
     QVBoxLayout* layout = new QVBoxLayout(this);
 
-    QHBoxLayout* cornerRow = new QHBoxLayout();
-    auto column = [&](const QString& label, QWidget* field) {
+    QHBoxLayout* typeRow = new QHBoxLayout();
+    typeRow->addWidget(new QLabel("Type"));
+    typeCombo_ = new QComboBox();
+    typeCombo_->addItem("Butterworth");
+    typeCombo_->addItem("Trapezoidal (Ormsby)");
+    typeCombo_->setToolTip("Type: Butterworth (corners and a slope per side) or a trapezoid (four corner frequencies)");
+    typeRow->addWidget(typeCombo_);
+    typeRow->addStretch();
+    layout->addLayout(typeRow);
+
+    auto column = [](QHBoxLayout* row, const QString& label, QWidget* field) {
         QVBoxLayout* col = new QVBoxLayout();
         col->addWidget(new QLabel(label));
         col->addWidget(field);
-        cornerRow->addLayout(col);
+        row->addLayout(col);
     };
-    lowSpin_ = new QDoubleSpinBox();
-    lowSpin_->setRange(0.0, 100000.0);
-    lowSpin_->setSuffix(" Hz");
-    lowSpin_->setValue(10.0);
-    lowSpin_->setToolTip("Low corner (-3 dB per pass). 0 Hz: no low cut, i.e. a lowpass.");
-    highSpin_ = new QDoubleSpinBox();
-    highSpin_->setRange(0.1, 100000.0);
-    highSpin_->setSuffix(" Hz");
-    highSpin_->setValue(50.0);
-    highSpin_->setToolTip("High corner (-3 dB per pass). At or above Nyquist: no high cut, i.e. a highpass.");
-    orderSpin_ = new QSpinBox();
-    orderSpin_->setRange(1, 10);
-    orderSpin_->setValue(4);
-    orderSpin_->setToolTip("Butterworth order per pass; filtfilt runs it twice, doubling the roll-off.");
+    auto frequencySpin = [](double value, double minimum) {
+        QDoubleSpinBox* spin = new QDoubleSpinBox();
+        spin->setRange(minimum, 100000.0);
+        spin->setSuffix(" Hz");
+        spin->setValue(value);
+        return spin;
+    };
+    // Slopes after the forward-backward pass: 12 dB/octave per order.
+    auto slopeCombo = [](int defaultOrder) {
+        QComboBox* combo = new QComboBox();
+        for (int order = 1; order <= 10; ++order) combo->addItem(QString("%1 dB/octave").arg(12 * order), order);
+        combo->setCurrentIndex(defaultOrder - 1);
+        return combo;
+    };
+
+    // Butterworth page.
+    butterworthPage_ = new QWidget();
+    QHBoxLayout* butterRow = new QHBoxLayout(butterworthPage_);
+    butterRow->setContentsMargins(0, 0, 0, 0);
+    lowSpin_ = frequencySpin(10.0, 0.0);
+    lowSpin_->setToolTip("Low Corner: -6 dB point of the low cut. 0 Hz: no low cut (a lowpass)");
+    lowSlopeCombo_ = slopeCombo(4);
+    lowSlopeCombo_->setToolTip("Low Slope: how steeply frequencies below the low corner are cut");
+    highSpin_ = frequencySpin(50.0, 0.1);
+    highSpin_->setToolTip("High Corner: -6 dB point of the high cut. At or above Nyquist: no high cut (a highpass)");
+    highSlopeCombo_ = slopeCombo(4);
+    highSlopeCombo_->setToolTip("High Slope: how steeply frequencies above the high corner are cut");
     edgesCombo_ = new QComboBox();
     edgesCombo_->addItem("Mirror (even)", int(segy::EdgePadding::Even));
     edgesCombo_->addItem("Point mirror (odd, scipy default)", int(segy::EdgePadding::Odd));
     edgesCombo_->addItem("Repeat end value (constant)", int(segy::EdgePadding::Constant));
-    edgesCombo_->setToolTip("How each trace is extended past its ends before filtering (scipy's padtype).\n"
+    edgesCombo_->setToolTip("Edges: how each trace is extended past its ends before filtering (scipy's padtype).\n"
                             "Mirror gave the smallest edge effects on real data, especially in low bands.");
-    column("Low Corner", lowSpin_);
-    column("High Corner", highSpin_);
-    column("Order", orderSpin_);
-    column("Edges", edgesCombo_);
-    layout->addLayout(cornerRow);
+    column(butterRow, "Low Corner", lowSpin_);
+    column(butterRow, "Low Slope", lowSlopeCombo_);
+    column(butterRow, "High Corner", highSpin_);
+    column(butterRow, "High Slope", highSlopeCombo_);
+    column(butterRow, "Edges", edgesCombo_);
+    layout->addWidget(butterworthPage_);
 
-    QLabel* hint = new QLabel("Butterworth, applied zero-phase with scipy.signal.sosfiltfilt's method "
-                              "(trace ends padded, steady-state start). Corners end up at -6 dB.");
-    hint->setWordWrap(true);
-    hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
-    layout->addWidget(hint);
+    // Trapezoid page.
+    trapezoidPage_ = new QWidget();
+    QHBoxLayout* trapRow = new QHBoxLayout(trapezoidPage_);
+    trapRow->setContentsMargins(0, 0, 0, 0);
+    const double defaults[4] = {5.0, 10.0, 50.0, 70.0};
+    const char* labels[4] = {"Low Cut", "Low Pass", "High Pass", "High Cut"};
+    const char* tips[4] = {"Low Cut: nothing passes below this frequency",
+                           "Low Pass: everything passes from this frequency (linear ramp from Low Cut)",
+                           "High Pass: everything passes up to this frequency",
+                           "High Cut: nothing passes above this frequency (linear ramp from High Pass)"};
+    for (int k = 0; k < 4; ++k) {
+        trapezoidSpins_[k] = frequencySpin(defaults[k], 0.0);
+        trapezoidSpins_[k]->setToolTip(tips[k]);
+        column(trapRow, labels[k], trapezoidSpins_[k]);
+    }
+    trapRow->addStretch();
+    layout->addWidget(trapezoidPage_);
+
+    hintLabel_ = new QLabel();
+    hintLabel_->setWordWrap(true);
+    hintLabel_->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
+    layout->addWidget(hintLabel_);
 
     QHBoxLayout* nameRow = new QHBoxLayout();
-    nameRow->addWidget(new QLabel("Output Name:"));
+    nameRow->addWidget(new QLabel("Output Name"));
     outputNameEdit_ = new QLineEdit();
     nameRow->addWidget(outputNameEdit_, 1);
     layout->addLayout(nameRow);
@@ -1964,7 +2023,16 @@ BandpassDialog::BandpassDialog(QWidget* parent) : QDialog(parent) {
             updateDefaultOutputName();
         });
     }
-    connect(orderSpin_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { updateDefaultOutputName(); });
+    for (int k = 0; k < 4; ++k) {
+        connect(trapezoidSpins_[k], QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, k](double) {
+            enforceTrapezoidOrdering(k);
+            updateDefaultOutputName();
+        });
+    }
+    for (QComboBox* combo : {lowSlopeCombo_, highSlopeCombo_}) {
+        connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { updateDefaultOutputName(); });
+    }
+    connect(typeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { updateType(); });
     connect(outputNameEdit_, &QLineEdit::textEdited, this, [this](const QString&) { outputNameEdited_ = true; });
 
     addButtonRow(this, layout,
@@ -1977,6 +2045,34 @@ BandpassDialog::BandpassDialog(QWidget* parent) : QDialog(parent) {
                      {"Apply", [this]() { emitApply(); }},
                      {"Cancel", [this]() { reject(); }},
                  });
+    updateType();
+}
+
+void BandpassDialog::updateType() {
+    const bool trapezoid = typeCombo_->currentIndex() == 1;
+    butterworthPage_->setVisible(!trapezoid);
+    trapezoidPage_->setVisible(trapezoid);
+    hintLabel_->setText(trapezoid
+                            ? "Zero-phase trapezoid in the frequency domain: nothing below Low Cut or above High Cut, "
+                              "everything from Low Pass to High Pass, linear ramps between. Trace ends are mirrored "
+                              "so they do not ring."
+                            : "Butterworth, applied zero-phase with scipy.signal.sosfiltfilt's method (trace ends "
+                              "padded, steady-state start). Corners end up at -6 dB; each side has its own slope.");
+    updateDefaultOutputName();
+    adjustSize();
+}
+
+void BandpassDialog::enforceTrapezoidOrdering(int edited) {
+    double v[4];
+    for (int k = 0; k < 4; ++k) v[k] = trapezoidSpins_[k]->value();
+    for (int k = edited + 1; k < 4; ++k) v[k] = std::max(v[k], v[k - 1]);
+    for (int k = edited - 1; k >= 0; --k) v[k] = std::min(v[k], v[k + 1]);
+    for (int k = 0; k < 4; ++k) {
+        if (k == edited || v[k] == trapezoidSpins_[k]->value()) continue;
+        trapezoidSpins_[k]->blockSignals(true);
+        trapezoidSpins_[k]->setValue(v[k]);
+        trapezoidSpins_[k]->blockSignals(false);
+    }
 }
 
 void BandpassDialog::refreshSource(const QString& sourceName, bool loaded) {
@@ -1985,7 +2081,7 @@ void BandpassDialog::refreshSource(const QString& sourceName, bool loaded) {
     updateDefaultOutputName();
 }
 
-void BandpassDialog::setApplyCallback(std::function<void(segy::ButterworthBandParams, QString)> callback) {
+void BandpassDialog::setApplyCallback(std::function<void(BandpassRequest, QString)> callback) {
     onApply_ = std::move(callback);
 }
 
@@ -2003,21 +2099,37 @@ void BandpassDialog::enforceOrdering(QDoubleSpinBox* edited) {
 
 void BandpassDialog::updateDefaultOutputName() {
     if (outputNameEdited_ || sourceName_.isEmpty()) return;
-    outputNameEdit_->setText(QString("%1_Bandpass_%2_%3_N%4")
+    if (typeCombo_->currentIndex() == 1) {
+        outputNameEdit_->setText(QString("%1_Ormsby_%2_%3_%4_%5")
+                                      .arg(sourceName_)
+                                      .arg(trapezoidSpins_[0]->value(), 0, 'g', 4)
+                                      .arg(trapezoidSpins_[1]->value(), 0, 'g', 4)
+                                      .arg(trapezoidSpins_[2]->value(), 0, 'g', 4)
+                                      .arg(trapezoidSpins_[3]->value(), 0, 'g', 4));
+        return;
+    }
+    outputNameEdit_->setText(QString("%1_Bandpass_%2_%3_%4_%5dB")
                                   .arg(sourceName_)
                                   .arg(lowSpin_->value(), 0, 'g', 4)
                                   .arg(highSpin_->value(), 0, 'g', 4)
-                                  .arg(orderSpin_->value()));
+                                  .arg(12 * lowSlopeCombo_->currentData().toInt())
+                                  .arg(12 * highSlopeCombo_->currentData().toInt()));
 }
 
 void BandpassDialog::emitApply() {
     if (!onApply_) return;
-    segy::ButterworthBandParams params;
+    BandpassRequest request;
+    request.trapezoid = typeCombo_->currentIndex() == 1;
+    segy::ButterworthBandParams& params = request.butterworth;
     params.lowHz = lowSpin_->value();
     params.highHz = highSpin_->value();
-    params.order = orderSpin_->value();
+    params.lowOrder = lowSlopeCombo_->currentData().toInt();
+    params.highOrder = highSlopeCombo_->currentData().toInt();
+    params.order = params.lowOrder;
     params.padding = segy::EdgePadding(edgesCombo_->currentData().toInt());
-    onApply_(params, outputNameEdit_->text());
+    request.ormsby = segy::OrmsbyParams{trapezoidSpins_[0]->value(), trapezoidSpins_[1]->value(),
+                                        trapezoidSpins_[2]->value(), trapezoidSpins_[3]->value()};
+    onApply_(request, outputNameEdit_->text());
 }
 
 SaveSegyDialog::SaveSegyDialog(QWidget* parent) : QDialog(parent) {
@@ -3144,6 +3256,25 @@ void DbCurveChart::setCrosshairEnabled(bool enabled) {
 
 void DbCurveChart::setHoverCallback(std::function<void(int, double)> callback) { onHover_ = std::move(callback); }
 
+void DbCurveChart::setAxisLabels(const QString& xLabel, const QString& yLabel) {
+    xLabel_ = xLabel;
+    yLabel_ = yLabel;
+    update();
+}
+
+void DbCurveChart::setFixedYRange(double y0, double y1) {
+    fixedY_ = true;
+    fixedY0_ = y0;
+    fixedY1_ = y1;
+    updateRange();
+    update();
+}
+
+void DbCurveChart::setMarkers(std::vector<std::pair<double, QColor>> markers) {
+    markers_ = std::move(markers);
+    update();
+}
+
 void DbCurveChart::viewChanged() {
     hoverIndex_ = -1;
     update();
@@ -3174,7 +3305,11 @@ void DbCurveChart::updateRange() {
     range.y1 = std::ceil(double(hi) / 5.0) * 5.0 + 5.0;
     range.y0 = std::floor(double(lo) / 10.0) * 10.0;
     if (range.y1 - range.y0 < 10.0) range.y0 = range.y1 - 10.0;
-    range.x0 = 0.0;
+    if (fixedY_) {
+        range.y0 = fixedY0_;
+        range.y1 = fixedY1_;
+    }
+    range.x0 = frequencyHz_.empty() ? 0.0 : std::min(0.0, double(frequencyHz_.front()));
     range.x1 = frequencyHz_.empty() || frequencyHz_.back() <= 0.0f ? 1.0 : double(frequencyHz_.back());
     setAutoRange(range);
 }
@@ -3237,12 +3372,17 @@ void DbCurveChart::paintEvent(QPaintEvent*) {
             }
         }
     }
+    for (const auto& [x, color] : markers_) {
+        if (x < v.x0 || x > v.x1) continue;
+        painter.setPen(QPen(color, 1.0, Qt::DashLine));
+        painter.drawLine(QPointF(xFor(x), chart.top()), QPointF(xFor(x), chart.bottom()));
+    }
     painter.restore();
     paintBox(painter);
 
     drawXAxisTicksAndLabels(painter, chart, xTicks, kSecondaryTextColor, measureWidth);
     painter.setPen(kSecondaryTextColor);
-    painter.drawText(QRect(chart.left(), height() - 20, chart.width(), 20), Qt::AlignHCenter, "Frequency (Hz)");
+    painter.drawText(QRect(chart.left(), height() - 20, chart.width(), 20), Qt::AlignHCenter, xLabel_);
 
     // Crosshair: same black-underlay + white-dash look as the Octave Band
     // Display's, snapped to the hovered frequency bin, with a marker on
@@ -3272,7 +3412,7 @@ void DbCurveChart::paintEvent(QPaintEvent*) {
 void DbCurveChart::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::RightButton) {
         if (frequencyHz_.size() >= 2) {
-            showAxisMenu(event->globalPosition().toPoint(), "Frequency (Hz)", "Level (dB)", 1, 1);
+            showAxisMenu(event->globalPosition().toPoint(), xLabel_, yLabel_, 1, 1);
         }
         return;
     }
@@ -5081,7 +5221,8 @@ void SegyCanvas::setAmplitudeScale(float posClip, float negClip, bool visible, s
                                     bool colorScaleFlipped) {
     amplitudeScale_->setClipRange(posClip, negClip);
     amplitudeScale_->setColorScale(colorScale, colorScaleFlipped);
-    amplitudeScale_->setCenter(app_.display.manualClip.center, app_.display.frequencyAxis ? "dB" : QString());
+    amplitudeScale_->setCenter(app_.loaded ? displayedClip(app_).center : 0.0f,
+                               app_.display.frequencyAxis ? "dB" : QString());
     amplitudeScale_->setVisible(visible);
 }
 
@@ -6698,6 +6839,8 @@ MainWindow::MainWindow() : QMainWindow() {
     connect(differentiationAction, &QAction::triggered, this, [this]() { openTraceDerivative(false); });
     QAction* scaleAction = processingMenu->addAction("&Scale...");
     connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
+    QAction* amplitudeAction = processingMenu->addAction("A&mplitude Processing...");
+    connect(amplitudeAction, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
     processingMenu->addSeparator();
     QAction* timeDepthAction = processingMenu->addAction("&Time-Depth Conversion...");
     connect(timeDepthAction, &QAction::triggered, this, &MainWindow::openTimeDepthConversion);
@@ -6949,7 +7092,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // the panel already had -- it only flips agcEnabled.
     agcAction_ = toolbar->addAction(iconAgc(), "AGC");
     agcAction_->setCheckable(true);
-    agcAction_->setToolTip("AGC: automatic gain control (right-click for its window and level)");
+    agcAction_->setToolTip("AGC: automatic gain control on the display, no new dataset (right-click for its window and level)");
     connect(agcAction_, &QAction::triggered, this, [this](bool checked) {
         segy::AmplitudeProcessing processing = app_->display.processing;
         processing.agcEnabled = checked;
@@ -7219,8 +7362,8 @@ MainWindow::MainWindow() : QMainWindow() {
         agcButton->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(agcButton, &QWidget::customContextMenuRequested, this, [this, agcButton](const QPoint& pos) {
             QMenu menu(this);
-            QAction* params = menu.addAction("Amplitude Processing...");
-            connect(params, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
+            QAction* params = menu.addAction("AGC Window and Level...");
+            connect(params, &QAction::triggered, this, &MainWindow::openAgcSettings);
             menu.exec(agcButton->mapToGlobal(pos));
         });
     }
@@ -7276,8 +7419,8 @@ MainWindow::MainWindow() : QMainWindow() {
     QAction* setGainMenuAction = gainMenu->addAction("&Set Gain...");
     connect(setGainMenuAction, &QAction::triggered, this, &MainWindow::promptForGainDb);
     addMenuMirror(viewMenu, agcAction_, "&AGC");
-    QAction* amplitudeProcessingMenuAction = viewMenu->addAction("A&mplitude Processing...");
-    connect(amplitudeProcessingMenuAction, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
+    QAction* agcSettingsAction = viewMenu->addAction("AGC &Window and Level...");
+    connect(agcSettingsAction, &QAction::triggered, this, &MainWindow::openAgcSettings);
     addMenuMirror(viewMenu, gainDetailAction_, "Display &Parameters...");
     viewMenu->addSeparator();
     // Rebuilt on every open, from whichever panel is active right then.
@@ -7353,6 +7496,8 @@ MainWindow::MainWindow() : QMainWindow() {
         }
         computeAndShowSignalNoise(activePanel_);
     });
+    QAction* phaseEstimateAction = analysisMenu->addAction("&Phase Estimate");
+    connect(phaseEstimateAction, &QAction::triggered, this, [this]() { computeAndShowPhaseEstimate(activePanel_); });
     analysisMenu->addSeparator();
     addMenuMirror(analysisMenu, xfAction_, "&x-f Display");
     fkAction_ = analysisMenu->addAction("&f-k Display");
@@ -7925,31 +8070,46 @@ void MainWindow::setAmplitudeProcessing(const segy::AmplitudeProcessing& process
 
 void MainWindow::refreshAmplitudeProcessingControls() {
     agcAction_->setChecked(app_->display.processing.agcEnabled);
-    if (amplitudeProcessingDialog_ && amplitudeProcessingDialog_->isVisible()) {
-        double recordLengthMs = 0.0;
-        if (app_->loaded) {
-            recordLengthMs = double(app_->foreground->binHeader.samplesPerTrace) *
-                             app_->foreground->binHeader.sampleIntervalUs / 1000.0;
-        }
-        amplitudeProcessingDialog_->setProcessing(app_->display.processing, recordLengthMs);
-        amplitudeProcessingDialog_->setWindowTitle(QString("Amplitude Processing") + datasetTitleSuffix(*app_));
-    }
 }
 
-void MainWindow::openAmplitudeProcessingDialog() {
-    if (!amplitudeProcessingDialog_) {
-        amplitudeProcessingDialog_ = new AmplitudeProcessingDialog(this);
-        // Only this dialog's own edits come through here; its controls are
-        // re-filled by refreshAmplitudeProcessingControls() with the
-        // callback suppressed, so there's no feedback loop.
-        amplitudeProcessingDialog_->setChangedCallback(
-            [this](const segy::AmplitudeProcessing& processing) { setAmplitudeProcessing(processing); });
-    }
-    amplitudeProcessingDialog_->show();
-    refreshAmplitudeProcessingControls(); // after show(): it only refreshes a visible dialog
-    amplitudeProcessingDialog_->raise();
-    amplitudeProcessingDialog_->activateWindow();
+void MainWindow::openAgcSettings() {
+    segy::AmplitudeProcessing processing = app_->display.processing;
+    QDialog dialog(this);
+    dialog.setWindowTitle("AGC");
+    QFormLayout* form = new QFormLayout(&dialog);
+    QDoubleSpinBox* window = new QDoubleSpinBox();
+    window->setRange(4.0, 20000.0);
+    window->setDecimals(0);
+    window->setSingleStep(50.0);
+    window->setSuffix(" ms");
+    window->setValue(processing.agcWindowMs);
+    window->setToolTip("Window: length of the RMS window centred on each sample");
+    QDoubleSpinBox* level = new QDoubleSpinBox();
+    level->setRange(1.0, 100.0);
+    level->setDecimals(0);
+    level->setSingleStep(5.0);
+    level->setSuffix(" %");
+    level->setValue(processing.agcLevelPercent);
+    level->setToolTip("Level: where each window's RMS lands, in percent of the maximum amplitude on the colour "
+                      "scale or wiggle excursion (the toolbar gain still applies on top)");
+    form->addRow("Window", window);
+    form->addRow("Level (% of max amplitude)", level);
+    QLabel* hint = new QLabel("Display only, on the fly: no new dataset. Processing > Amplitude Processing... writes one.");
+    hint->setWordWrap(true);
+    hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
+    form->addRow(hint);
+    QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    form->addRow(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+    processing.agcWindowMs = window->value();
+    processing.agcLevelPercent = level->value();
+    processing.agcEnabled = true; // setting it means wanting to see it
+    processing.gainCurveEnabled = false;
+    setAmplitudeProcessing(processing);
 }
+
 
 void MainWindow::zoomToBox() {
     if (app_->loaded && app_->viewLocked) {
@@ -8290,7 +8450,7 @@ void MainWindow::refreshAmplitudeScale() {
         if (p->app.loaded) {
             float rawClip = std::max(std::fabs(p->app.foreground->pyramid.globalMin),
                                      std::fabs(p->app.foreground->pyramid.globalMax));
-            segy::displayClipPosNeg(rawClip, p->app.display.gainDb, p->app.display.manualClip,
+            segy::displayClipPosNeg(rawClip, p->app.display.gainDb, displayedClip(p->app),
                                     &p->app.display.processing, &posClip, &negClip);
         }
         p->canvas->setAmplitudeScale(posClip, negClip, visible, p->app.display.colorScale,
@@ -8301,7 +8461,7 @@ void MainWindow::refreshAmplitudeScale() {
             float bandPos = 1.0f, bandNeg = 1.0f;
             const float rawClip = std::max(std::fabs(p->app.foreground->pyramid.globalMin),
                                            std::fabs(p->app.foreground->pyramid.globalMax));
-            segy::displayClipPosNeg(rawClip, p->app.display.gainDb, p->app.display.manualClip, nullptr, &bandPos, &bandNeg);
+            segy::displayClipPosNeg(rawClip, p->app.display.gainDb, displayedClip(p->app), nullptr, &bandPos, &bandNeg);
             octaveBandDialog_->setMainClip(bandPos, bandNeg);
         }
     }
@@ -8527,7 +8687,7 @@ void MainWindow::runCalculator(std::shared_ptr<Dataset> dsA, std::shared_ptr<Dat
         });
 }
 
-void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams& params, const QString& outputName) {
+void MainWindow::runBandpass(AppState& source, const BandpassRequest& request, const QString& outputName) {
     if (!source.loaded || source.foreground->traceCount <= 0 || source.foreground->binHeader.samplesPerTrace <= 0) {
         flashStatusMessage("No data selected");
         return;
@@ -8554,28 +8714,51 @@ void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams
     // open, low corner above Nyquist, low >= high -- is refused with a
     // message instead of silently writing an unfiltered copy.
     const double sampleRateHz = ds->binHeader.sampleIntervalUs > 0 ? 1'000'000.0 / ds->binHeader.sampleIntervalUs : 0.0;
-    std::string designError;
-    const std::vector<segy::Biquad> sos = segy::designButterworthBand(params, sampleRateHz, &designError);
-    if (sos.empty()) {
-        QMessageBox::warning(this, "Bandpass Filter", QString::fromStdString(designError));
-        return;
-    }
     const double nyquistHz = sampleRateHz / 2.0;
-    const bool hasLow = params.lowHz > 0.0;
-    const bool hasHigh = params.highHz < nyquistHz * 0.999;
-    QString filterText = hasLow && hasHigh ? QString("BANDPASS %1-%2 HZ").arg(params.lowHz, 0, 'g', 4).arg(params.highHz, 0, 'g', 4)
-                         : hasLow          ? QString("HIGHPASS %1 HZ").arg(params.lowHz, 0, 'g', 4)
-                                           : QString("LOWPASS %1 HZ").arg(params.highHz, 0, 'g', 4);
+    const segy::ButterworthBandParams& params = request.butterworth;
+    const segy::OrmsbyParams ormsby = request.ormsby;
+    const bool trapezoid = request.trapezoid;
     std::vector<std::string> history = ds->processingHistory;
-    const char* paddingText = params.padding == segy::EdgePadding::Even  ? "EVEN"
-                              : params.padding == segy::EdgePadding::Odd ? "ODD"
-                                                                          : "CONSTANT";
-    history.push_back(QString("BUTTERWORTH %1, ORDER %2, ZERO-PHASE SOSFILTFILT, %3 PADDING")
-                          .arg(filterText)
-                          .arg(params.order)
-                          .arg(paddingText)
-                          .toStdString());
+    std::vector<segy::Biquad> sos;
+    if (trapezoid) {
+        if (!(ormsby.highCutHz > ormsby.lowCutHz) || ormsby.lowCutHz >= nyquistHz) {
+            QMessageBox::warning(this, "Bandpass Filter", "The trapezoid passes nothing below Nyquist.");
+            return;
+        }
+        history.push_back(QString("ORMSBY TRAPEZOID %1-%2-%3-%4 HZ, ZERO-PHASE, MIRRORED ENDS")
+                              .arg(ormsby.lowCutHz, 0, 'g', 4)
+                              .arg(ormsby.lowPassHz, 0, 'g', 4)
+                              .arg(ormsby.highPassHz, 0, 'g', 4)
+                              .arg(ormsby.highCutHz, 0, 'g', 4)
+                              .toStdString());
+    } else {
+        // Designed up front (cheap), so an impossible request -- both
+        // corners open, low corner above Nyquist, low >= high -- is refused
+        // with a message instead of silently writing an unfiltered copy.
+        std::string designError;
+        sos = segy::designButterworthBand(params, sampleRateHz, &designError);
+        if (sos.empty()) {
+            QMessageBox::warning(this, "Bandpass Filter", QString::fromStdString(designError));
+            return;
+        }
+        const bool hasLow = params.lowHz > 0.0;
+        const bool hasHigh = params.highHz < nyquistHz * 0.999;
+        const int lowSlope = 12 * (params.lowOrder > 0 ? params.lowOrder : params.order);
+        const int highSlope = 12 * (params.highOrder > 0 ? params.highOrder : params.order);
+        QString filterText =
+            hasLow && hasHigh ? QString("BANDPASS %1-%2 HZ, %3/%4 DB/OCT").arg(params.lowHz, 0, 'g', 4).arg(params.highHz, 0, 'g', 4).arg(lowSlope).arg(highSlope)
+            : hasLow          ? QString("HIGHPASS %1 HZ, %2 DB/OCT").arg(params.lowHz, 0, 'g', 4).arg(lowSlope)
+                              : QString("LOWPASS %1 HZ, %2 DB/OCT").arg(params.highHz, 0, 'g', 4).arg(highSlope);
+        const char* paddingText = params.padding == segy::EdgePadding::Even  ? "EVEN"
+                                  : params.padding == segy::EdgePadding::Odd ? "ODD"
+                                                                              : "CONSTANT";
+        history.push_back(QString("BUTTERWORTH %1, ZERO-PHASE SOSFILTFILT, %2 PADDING")
+                              .arg(filterText)
+                              .arg(paddingText)
+                              .toStdString());
+    }
     const segy::EdgePadding padding = params.padding;
+    const double sampleIntervalUs = ds->binHeader.sampleIntervalUs;
 
     QString textHeader = buildSegyTextHeader(inputBlocks, history, outputName, traceCount, samplesPerTrace,
                                               ds->binHeader.sampleIntervalUs);
@@ -8587,7 +8770,8 @@ void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams
 
     runBackgroundTask(
         QString("Bandpass: %1").arg(sourceName),
-        [this, ds, traceCount, samplesPerTrace, sos, padding, outHeader, textHeader, outPath, writeOk, writeError]() {
+        [this, ds, traceCount, samplesPerTrace, sos, padding, trapezoid, ormsby, sampleIntervalUs, outHeader, textHeader,
+         outPath, writeOk, writeError]() {
             backgroundTaskTotal_ = traceCount;
             *writeOk = streamTraces(
                 outPath, textHeader.toStdString(), outHeader, traceCount,
@@ -8597,7 +8781,8 @@ void MainWindow::runBandpass(AppState& source, const segy::ButterworthBandParams
                     out.samples.resize(size_t(samplesPerTrace));
                     segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
                                         ds->binHeader.formatCode);
-                    segy::sosFiltFilt(sos, out.samples, -1, padding);
+                    if (trapezoid) segy::ormsbyFilter(out.samples, sampleIntervalUs, ormsby);
+                    else segy::sosFiltFilt(sos, out.samples, -1, padding);
                 },
                 backgroundTaskDone_, writeError.get());
         },
@@ -8706,7 +8891,7 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
         // The main display's clip, exactly as the seismic renderer gets it.
         // Computed gain/AGC is not applied to the bands, so it is left out.
         const float rawClip = std::max(std::fabs(app.foreground->pyramid.globalMin), std::fabs(app.foreground->pyramid.globalMax));
-        segy::displayClipPosNeg(rawClip, app.display.gainDb, app.display.manualClip, nullptr, &result->mainClipPos,
+        segy::displayClipPosNeg(rawClip, app.display.gainDb, displayedClip(app), nullptr, &result->mainClipPos,
                                 &result->mainClipNeg);
     }
     const bool reversePolarity = app.display.reversePolarity;
@@ -8950,12 +9135,24 @@ struct ProcessingField {
     int decimals;
     QString suffix;
     double* value;
+    QString specialValueText = QString(); // shown instead of the minimum (e.g. "none")
+};
+
+// A choice shown above the numbers; `disableField` (an index into the
+// fields) is greyed out while option `disableOn` is chosen.
+struct ProcessingChoice {
+    QString label;
+    QStringList options;
+    int* value;
+    int disableField = -1;
+    int disableOn = -1;
 };
 
 // The processing dialogs' shared shape: a few numbers, an output name, a
 // one-paragraph explanation, OK/Cancel. Returns false on Cancel.
 bool askProcessingValues(QWidget* parent, const QString& title, const QString& explanation,
-                         const std::vector<ProcessingField>& fields, QString& outputName) {
+                         const std::vector<ProcessingField>& fields, QString& outputName,
+                         const std::vector<ProcessingChoice>& choices = {}) {
     QDialog dialog(parent);
     dialog.setWindowTitle(title);
     QVBoxLayout* layout = new QVBoxLayout(&dialog);
@@ -8963,17 +9160,36 @@ bool askProcessingValues(QWidget* parent, const QString& title, const QString& e
     grid->setHorizontalSpacing(10);
     grid->setVerticalSpacing(8);
     std::vector<QDoubleSpinBox*> spins;
+    std::vector<QComboBox*> combos;
     int row = 0;
+    for (const ProcessingChoice& choice : choices) {
+        QComboBox* combo = new QComboBox();
+        combo->addItems(choice.options);
+        combo->setCurrentIndex(std::clamp(*choice.value, 0, int(choice.options.size()) - 1));
+        grid->addWidget(new QLabel(choice.label), row, 0);
+        grid->addWidget(combo, row++, 1);
+        combos.push_back(combo);
+    }
     for (const ProcessingField& field : fields) {
         QDoubleSpinBox* spin = new QDoubleSpinBox();
         spin->setRange(field.minimum, field.maximum);
         spin->setSingleStep(field.step);
         spin->setDecimals(field.decimals);
         spin->setSuffix(field.suffix);
+        if (!field.specialValueText.isEmpty()) spin->setSpecialValueText(field.specialValueText);
         spin->setValue(*field.value);
         grid->addWidget(new QLabel(field.label), row, 0);
         grid->addWidget(spin, row++, 1);
         spins.push_back(spin);
+    }
+    for (size_t c = 0; c < choices.size(); ++c) {
+        const ProcessingChoice& choice = choices[c];
+        if (choice.disableField < 0 || choice.disableField >= int(spins.size())) continue;
+        QDoubleSpinBox* target = spins[size_t(choice.disableField)];
+        const int disableOn = choice.disableOn;
+        auto update = [target, disableOn](int index) { target->setEnabled(index != disableOn); };
+        update(combos[c]->currentIndex());
+        QObject::connect(combos[c], QOverload<int>::of(&QComboBox::currentIndexChanged), target, update);
     }
     QLineEdit* name = new QLineEdit(outputName);
     grid->addWidget(new QLabel("Output name"), row, 0);
@@ -8998,6 +9214,7 @@ bool askProcessingValues(QWidget* parent, const QString& title, const QString& e
     dialog.resize(440, dialog.sizeHint().height());
     if (dialog.exec() != QDialog::Accepted) return false;
     for (size_t i = 0; i < fields.size(); ++i) *fields[i].value = spins[i]->value();
+    for (size_t i = 0; i < choices.size(); ++i) *choices[i].value = combos[i]->currentIndex();
     outputName = name->text().trimmed();
     return true;
 }
@@ -9074,22 +9291,27 @@ void MainWindow::openDeconvolution() {
     if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
     segy::DeconParams p = lastDecon_;
     const double dtMs = panel->app.foreground->binHeader.sampleIntervalUs / 1000.0;
+    int type = lastDeconSpiking_ ? 1 : 0;
     QString name = QString::fromStdString(panel->app.foreground->filePath.stem().string()) + "_decon";
     if (!askProcessingValues(this, "Deconvolution",
-                             QString("Predictive (Wiener) deconvolution, designed per trace on the whole trace. It "
-                                     "removes what can be predicted from the gap on: reverberations and short-period "
-                                     "multiples. A gap of one sample (%1 ms) is spiking deconvolution, which whitens. "
+                             QString("Wiener deconvolution, designed per trace on the whole trace. Gapped "
+                                     "(predictive) removes what can be predicted from the gap on: reverberations "
+                                     "and short-period multiples, keeping the wavelet's first gap "
+                                     "milliseconds. Spiking (a gap of one sample, %1 ms) also compresses the wavelet and whitens the spectrum. "
                                      "White noise stabilises the filter.")
                                  .arg(compactNumber(dtMs)),
                              {{"Operator length", 2.0 * dtMs, 2000.0, 10.0, 1, " ms", &p.operatorMs},
                               {"Prediction gap", dtMs, 1000.0, dtMs, 1, " ms", &p.gapMs},
                               {"White noise", 0.0, 50.0, 0.1, 2, " %", &p.whiteNoisePercent}},
-                             name)) {
+                             name, {{"Type", {"Gapped (predictive)", "Spiking"}, &type, 1, 1}})) {
         return;
     }
     lastDecon_ = p;
+    lastDeconSpiking_ = type == 1;
+    if (lastDeconSpiking_) p.gapMs = dtMs; // one sample
     runTraceTransform(panel, "Deconvolution", name,
-                      QString("PREDICTIVE DECONVOLUTION, OPERATOR %1 MS, GAP %2 MS, WHITE NOISE %3%")
+                      (lastDeconSpiking_ ? QString("SPIKING DECONVOLUTION, OPERATOR %1 MS, WHITE NOISE %3%")
+                                         : QString("PREDICTIVE DECONVOLUTION, OPERATOR %1 MS, GAP %2 MS, WHITE NOISE %3%"))
                           .arg(compactNumber(p.operatorMs), compactNumber(p.gapMs), compactNumber(p.whiteNoisePercent)),
                       [p](std::vector<float>& trace, double intervalUs) {
                           segy::predictiveDeconvolution(trace, intervalUs, p);
@@ -9136,24 +9358,36 @@ void MainWindow::openFkFilter() {
     const double estimated = estimateTraceSpacing(*ds);
     if (estimated > 0.0) p.traceSpacing = estimated;
     QString name = QString::fromStdString(ds->filePath.stem().string()) + "_fk";
+    int mode = p.pass ? 0 : 1;
     if (!askProcessingValues(this, "f-k Filter",
-                             QString("Removes events whose apparent velocity is below the cut (steep dips: ground "
-                                     "roll, steep noise, diffraction tails), along consecutive traces in panels of %1 "
-                                     "traces with 50% overlap. Flat events always pass. The taper ramps from (1 - "
-                                     "taper) x velocity up to the velocity. Trace spacing %2.")
+                             QString("Keeps (Pass) or removes (Reject) the events whose apparent velocity lies "
+                                     "between Min and Max velocity; Max none = no upper limit, which includes flat "
+                                     "events. Reject 0 to 1500 m/s removes steep dips: ground roll, steep noise, "
+                                     "diffraction tails. The range is kept or removed in full; the taper lies "
+                                     "outside it. Along consecutive traces in panels of %1 traces with 50% overlap. "
+                                     "Trace spacing %2.")
                                  .arg(kFkFilterPanelTraces)
                                  .arg(estimated > 0.0 ? QString("from the coordinates: %1 m").arg(compactNumber(estimated))
                                                       : QString("not in the headers: please check")),
-                             {{"Remove below", 10.0, 100000.0, 100.0, 0, " m/s", &p.velocity},
+                             {{"Min velocity", 0.0, 100000.0, 100.0, 0, " m/s", &p.minVelocity},
+                              {"Max velocity", 0.0, 100000.0, 100.0, 0, " m/s", &p.maxVelocity, "none"},
                               {"Taper", 0.0, 90.0, 5.0, 0, " %", &p.taperPercent},
                               {"Trace spacing", 0.01, 100000.0, 0.5, 2, " m", &p.traceSpacing}},
-                             name)) {
+                             name, {{"Mode", {"Pass the range", "Reject the range"}, &mode}})) {
+        return;
+    }
+    p.pass = mode == 0;
+    if (p.maxVelocity > 0.0 && p.maxVelocity <= p.minVelocity) {
+        QMessageBox::warning(this, "f-k Filter", "Max velocity must be above Min velocity (or none).");
         return;
     }
     lastFk_ = p;
     std::vector<std::string> history = ds->processingHistory;
-    history.push_back(QString("F-K FILTER: REMOVE BELOW %1 M/S, TAPER %2%, DX %3 M, PANELS %4 TRACES")
-                          .arg(compactNumber(p.velocity), compactNumber(p.taperPercent), compactNumber(p.traceSpacing))
+    history.push_back(QString("F-K FILTER: %1 %2-%3 M/S, TAPER %4%, DX %5 M, PANELS %6 TRACES")
+                          .arg(p.pass ? "PASS" : "REJECT")
+                          .arg(compactNumber(p.minVelocity))
+                          .arg(p.maxVelocity > 0.0 ? compactNumber(p.maxVelocity) : QString("INF"))
+                          .arg(compactNumber(p.taperPercent), compactNumber(p.traceSpacing))
                           .arg(kFkFilterPanelTraces)
                           .toStdString());
     const int samplesPerTrace = ds->binHeader.samplesPerTrace;
@@ -9293,7 +9527,7 @@ void MainWindow::runTraceTransform(Panel* panel, const QString& title, const QSt
 void MainWindow::openBandpassDialog() {
     if (!bandpassDialog_) {
         bandpassDialog_ = new BandpassDialog(this);
-        bandpassDialog_->setApplyCallback([this](segy::ButterworthBandParams params, QString outputName) {
+        bandpassDialog_->setApplyCallback([this](BandpassRequest params, QString outputName) {
             // Filters whichever panel is active when Apply is pressed, not
             // whichever was active when the dialog first opened -- it's a
             // non-modal dialog, so the user may have clicked the other
@@ -9786,6 +10020,276 @@ QString formatMetres(double metres) {
     return QString::number(metres, 'f', metres < 10.0 ? 2 : 1).remove(QRegularExpression("\\.?0+$"));
 }
 } // namespace
+
+// Analysis > Phase Estimate: the three scores against the rotation angle,
+// the best angle of each, and Apply Rotation (a Phase Rotation of the
+// source panel by the chosen angle, optionally + 180 for the other polarity).
+class PhaseEstimateWindow : public QWidget {
+public:
+    explicit PhaseEstimateWindow(QWidget* parent) : QWidget(parent, Qt::Window) {
+        setWindowTitle("Phase Estimate");
+        resize(820, 600);
+        QVBoxLayout* layout = new QVBoxLayout(this);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(0);
+        layout->addWidget(buildResultWindowMenuBar(
+            this, [this](bool on) { chart_->setGridLinesVisible(on); }, nullptr,
+            [this](bool on) { chart_->setCrosshairEnabled(on); }));
+        chart_ = new DbCurveChart(this);
+        chart_->setTitle("Simplicity of the data vs. phase rotation");
+        chart_->setAxisLabels(QString::fromUtf8("Phase rotation (\xc2\xb0)"), "Score (1 = simplest)");
+        chart_->setFixedYRange(0.0, 1.05);
+        chart_->setEmptyText("No result yet.");
+        chart_->setHoverCallback([this](int index, double) { showHover(index); });
+        layout->addWidget(chart_, 1);
+
+        QWidget* footer = new QWidget(this);
+        footer->setStyleSheet(themed("background-color: #141416;"));
+        QVBoxLayout* footerLayout = new QVBoxLayout(footer);
+        footerLayout->setContentsMargins(14, 10, 14, 10);
+        footerLayout->setSpacing(8);
+        summary_ = new QLabel();
+        summary_->setWordWrap(true);
+        summary_->setTextFormat(Qt::RichText);
+        footerLayout->addWidget(summary_);
+        hover_ = new QLabel(" ");
+        hover_->setStyleSheet(themed("color: #9a9ca3;"));
+        footerLayout->addWidget(hover_);
+        QHBoxLayout* row = new QHBoxLayout();
+        row->setSpacing(10);
+        QLabel* methodCaption = new QLabel("Use");
+        methodCaption->setStyleSheet(themed("color: #9a9ca3;"));
+        row->addWidget(methodCaption);
+        methodCombo_ = new QComboBox();
+        methodCombo_->addItem("Agreement");
+        methodCombo_->addItem("Maximum kurtosis (van der Baan)");
+        methodCombo_->addItem("Minimum entropy (varimax)");
+        methodCombo_->setToolTip("Use: which estimate Apply Rotation applies");
+        row->addWidget(methodCombo_);
+        flipCheck_ = new QCheckBox(QString::fromUtf8("+180\xc2\xb0 (other polarity)"));
+        flipCheck_->setToolTip("Other polarity: both measures repeat every 180 degrees, so they cannot tell polarity; "
+                               "tick this when the seabed comes out with the wrong sign");
+        row->addWidget(flipCheck_);
+        row->addStretch();
+        applyButton_ = new QPushButton("Apply Rotation");
+        applyButton_->setToolTip("Apply Rotation: Phase Rotation of the analysed panel by the chosen angle (a new dataset)");
+        row->addWidget(applyButton_);
+        recomputeButton_ = new QPushButton("Recompute");
+        recomputeButton_->setToolTip("Recompute: from the active panel's selection box, or its visible data without one");
+        row->addWidget(recomputeButton_);
+        footerLayout->addLayout(row);
+        layout->addWidget(footer);
+
+        connect(methodCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { refreshApplyText(); });
+        connect(flipCheck_, &QCheckBox::toggled, this, [this](bool) { refreshApplyText(); });
+        connect(applyButton_, &QPushButton::clicked, this, [this]() {
+            if (result_.valid && onApply) onApply(chosenAngle());
+        });
+        connect(recomputeButton_, &QPushButton::clicked, this, [this]() {
+            if (onRecompute) onRecompute();
+        });
+        applyButton_->setEnabled(false);
+    }
+
+    std::function<void(double)> onApply;
+    std::function<void()> onRecompute;
+
+    void setResult(const segy::PhaseScanResult& result, const QString& sourceText) {
+        result_ = result;
+        if (!result.valid) {
+            chart_->setCurves({}, {});
+            summary_->setText("Not enough live data in " + sourceText + ".");
+            applyButton_->setEnabled(false);
+            return;
+        }
+        std::vector<float> angles(result.anglesDeg.begin(), result.anglesDeg.end());
+        auto curve = [](const QString& name, QColor color, const std::vector<double>& v, bool dashed) {
+            DbCurve c;
+            c.name = name;
+            c.color = color;
+            c.db.assign(v.begin(), v.end());
+            c.dashed = dashed;
+            return c;
+        };
+        chart_->setCurves(angles, {curve("Maximum kurtosis", kKurtosisColor, result.kurtosisScore, false),
+                                   curve("Minimum entropy", kEntropyColor, result.entropyScore, false),
+                                   curve("Agreement", kAgreementColor, result.agreementScore, true)});
+        chart_->setMarkers({{result.kurtosisAngle, kKurtosisColor},
+                            {result.entropyAngle, kEntropyColor},
+                            {result.agreementAngle, kAgreementColor}});
+        auto swatch = [](QColor c) {
+            return QString("<span style='color:%1'>&#9632;</span> ").arg(c.name());
+        };
+        const QString deg = QString::fromUtf8("\xc2\xb0");
+        const QString agreeText =
+            result.spreadDeg <= 10.0   ? QString("the two agree within %1%2").arg(result.spreadDeg, 0, 'f', 0).arg(deg)
+            : result.spreadDeg <= 25.0 ? QString("the two differ by %1%2: use with care").arg(result.spreadDeg, 0, 'f', 0).arg(deg)
+                                       : QString("the two differ by %1%2: no clear answer in this window")
+                                             .arg(result.spreadDeg, 0, 'f', 0)
+                                             .arg(deg);
+        summary_->setText(
+            QString("%1Maximum kurtosis (van der Baan): rotate by <b>%2%3</b> &nbsp; %4Minimum entropy (varimax): "
+                    "<b>%5%3</b> &nbsp; %6Agreement: <b>%7%3</b><br>"
+                    "<span style='color:%8'>%9; the wavelet's phase is about the opposite angle. "
+                    "From %10.</span>")
+                .arg(swatch(kKurtosisColor), signedAngle(result.kurtosisAngle), deg, swatch(kEntropyColor),
+                     signedAngle(result.entropyAngle), swatch(kAgreementColor), signedAngle(result.agreementAngle))
+                .arg(tc(QColor(0x9a, 0x9c, 0xa3)).name(), agreeText.left(1).toUpper() + agreeText.mid(1), sourceText));
+        applyButton_->setEnabled(true);
+        refreshApplyText();
+    }
+
+private:
+    // Data colours (never themed).
+    inline static const QColor kKurtosisColor{0x4e, 0x9b, 0xe6};
+    inline static const QColor kEntropyColor{0xe6, 0x9f, 0x3c};
+    inline static const QColor kAgreementColor{0x3f, 0xb2, 0x7f};
+    DbCurveChart* chart_ = nullptr;
+    QLabel* summary_ = nullptr;
+    QLabel* hover_ = nullptr;
+    QComboBox* methodCombo_ = nullptr;
+    QCheckBox* flipCheck_ = nullptr;
+    QPushButton* applyButton_ = nullptr;
+    QPushButton* recomputeButton_ = nullptr;
+    segy::PhaseScanResult result_;
+
+    static QString signedAngle(double a) {
+        const long rounded = std::lround(a);
+        return rounded > 0 ? QString("+%1").arg(rounded)
+               : rounded < 0 ? QString(QChar(0x2212)) + QString::number(-rounded)
+                             : QString("0");
+    }
+    double chosenAngle() const {
+        const int m = methodCombo_->currentIndex();
+        double a = m == 1 ? result_.kurtosisAngle : m == 2 ? result_.entropyAngle : result_.agreementAngle;
+        a = double(std::lround(a));
+        if (flipCheck_->isChecked()) a += a > 0.0 ? -180.0 : 180.0;
+        return a;
+    }
+    void refreshApplyText() {
+        if (!result_.valid) return;
+        applyButton_->setText(QString("Apply Rotation %1%2").arg(signedAngle(chosenAngle()), QString::fromUtf8("\xc2\xb0")));
+    }
+    void showHover(int index) {
+        if (index < 0 || !result_.valid || size_t(index) >= result_.anglesDeg.size()) {
+            hover_->setText(" ");
+            return;
+        }
+        const size_t i = size_t(index);
+        hover_->setText(QString("Rotation %1%2 \xc2\xb7 kurtosis %3 \xc2\xb7 entropy score %4 \xc2\xb7 agreement %5")
+                            .arg(signedAngle(result_.anglesDeg[i]), QString::fromUtf8("\xc2\xb0"))
+                            .arg(result_.kurtosis[i], 0, 'f', 2)
+                            .arg(result_.entropyScore[i], 0, 'f', 2)
+                            .arg(result_.agreementScore[i], 0, 'f', 2));
+    }
+};
+
+void MainWindow::openAmplitudeProcessingDialog() {
+    Panel* panel = activePanel_;
+    if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
+    const Dataset& ds = *panel->app.foreground;
+    const double dtMs = ds.binHeader.sampleIntervalUs / 1000.0;
+    AmplitudeProcessingDialog dialog(this);
+    dialog.setProcessing(lastAmplitudeProcessing_, double(ds.binHeader.samplesPerTrace) * dtMs);
+    dialog.setOutputName(QString::fromStdString(ds.filePath.stem().string()) + "_amp");
+    if (dialog.exec() != QDialog::Accepted) return;
+    const segy::AmplitudeProcessing p = dialog.collect();
+    lastAmplitudeProcessing_ = p;
+    QStringList parts;
+    if (p.gainCurveEnabled && !p.gainCurve.empty()) {
+        QStringList pairs;
+        for (const segy::GainPoint& g : p.gainCurve) pairs << QString("%1MS %2DB").arg(compactNumber(g.timeMs), compactNumber(g.gainDb));
+        parts << "GAIN CURVE " + pairs.join(", ");
+    }
+    if (p.agcEnabled) parts << QString("AGC %1 MS").arg(compactNumber(p.agcWindowMs));
+    runTraceTransform(panel, "Amplitude Processing", dialog.outputName(), "AMPLITUDE PROCESSING: " + parts.join("; "),
+                      [p](std::vector<float>& trace, double intervalUs) {
+                          const segy::AmplitudeProcessor processor(p, 0, int(trace.size()), intervalUs / 1000.0);
+                          if (processor.active()) processor.apply(trace.data());
+                      });
+}
+
+void MainWindow::applyPhaseRotation(Panel* panel, double degrees) {
+    if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
+    lastRotationDegrees_ = degrees;
+    const QString name = QString::fromStdString(panel->app.foreground->filePath.stem().string()) +
+                         QString("_rot%1").arg(std::lround(degrees));
+    runTraceTransform(panel, "Phase Rotation", name,
+                      QString("PHASE ROTATION %1 DEGREES (STATISTICAL ESTIMATE)").arg(compactNumber(degrees)),
+                      [degrees](std::vector<float>& trace, double) { segy::phaseRotate(trace, degrees); });
+}
+
+void MainWindow::computeAndShowPhaseEstimate(Panel* sourcePanel) {
+    AppState& app = sourcePanel->app;
+    if (!app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    if (app.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    const SignalNoiseSource src = resolveSignalNoiseSource(sourcePanel);
+    if (!src.valid || src.t1 - src.t0 < 1 || src.s1 - src.s0 < 16) {
+        flashStatusMessage("Not enough data for a phase estimate");
+        return;
+    }
+    if (!phaseWindow_) {
+        phaseWindow_ = new PhaseEstimateWindow(this);
+        phaseWindow_->onApply = [this](double degrees) {
+            Panel* panel = phaseSourcePanel_ ? phaseSourcePanel_ : activePanel_;
+            applyPhaseRotation(panel, degrees);
+        };
+        phaseWindow_->onRecompute = [this]() { computeAndShowPhaseEstimate(activePanel_); };
+    }
+    phaseSourcePanel_ = sourcePanel;
+    std::shared_ptr<Dataset> ds = app.foreground;
+    // Bounded work: at most ~4M samples, every Nth trace of the window.
+    const int64_t traces = src.t1 - src.t0;
+    const int64_t window = src.s1 - src.s0;
+    const int64_t stride = std::max<int64_t>(1, (traces * window + 3'999'999) / 4'000'000);
+    const QString sourceText =
+        QString("%1, traces %2" "\xe2\x80\x93" "%3%4, %5" "\xe2\x80\x93" "%6 ms")
+            .arg(src.sourceText)
+            .arg(src.t0 + 1)
+            .arg(src.t1)
+            .arg(stride > 1 ? QString(" (every %1th)").arg(stride) : QString())
+            .arg(compactNumber(src.s0 * ds->binHeader.sampleIntervalUs / 1000.0))
+            .arg(compactNumber((src.s1 - 1) * ds->binHeader.sampleIntervalUs / 1000.0));
+    auto result = std::make_shared<segy::PhaseScanResult>();
+    runBackgroundTask(
+        QString("Phase Estimate: %1 traces").arg((traces + stride - 1) / stride),
+        [this, ds, src, stride, result]() {
+            const int64_t count = (src.t1 - src.t0 + stride - 1) / stride;
+            backgroundTaskDone_ = 0;
+            backgroundTaskTotal_ = count;
+            segy::PhaseScanSums total;
+            std::mutex mutex;
+            std::atomic<int64_t> done{0};
+            segy::ThreadPool pool;
+            pool.parallelFor(size_t(count), 64, [&](size_t begin, size_t end) {
+                segy::PhaseScanSums local;
+                std::vector<float> samples(size_t(ds->binHeader.samplesPerTrace));
+                for (size_t i = begin; i < end; ++i) {
+                    const int64_t t = src.t0 + int64_t(i) * stride;
+                    const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                    segy::decodeSamples(base + segy::kTraceHeaderSize, samples.data(), samples.size(), ds->binHeader.formatCode);
+                    std::vector<float> cut(samples.begin() + src.s0, samples.begin() + src.s1);
+                    segy::addPhaseScanTrace(local, cut);
+                }
+                std::lock_guard<std::mutex> lock(mutex);
+                segy::mergePhaseScan(total, local);
+                backgroundTaskDone_ = done.fetch_add(int64_t(end - begin)) + int64_t(end - begin);
+            });
+            *result = segy::finishPhaseScan(total);
+        },
+        [this, result, sourceText]() {
+            phaseWindow_->setResult(*result, sourceText);
+            phaseWindow_->show();
+            phaseWindow_->raise();
+            phaseWindow_->activateWindow();
+        });
+}
 
 void MainWindow::computeAndShowFk(Panel* sourcePanel) {
     AppState& app = sourcePanel->app;

@@ -58,11 +58,17 @@ enum class EdgePadding {
 // (each at -3 dB per pass, so -6 dB after the forward-backward sosfiltfilt).
 // lowHz <= 0 means no low cut (a lowpass at highHz); highHz >= Nyquist
 // means no high cut (a highpass at lowHz).
+// The low cut and the high cut can have their own order (lowOrder /
+// highOrder, 0 = `order`); each order adds 6 dB/octave per pass, so 12 after
+// sosfiltfilt. Equal orders use scipy's bandpass design exactly; different
+// ones cascade a highpass (low corner) and a lowpass (high corner).
 struct ButterworthBandParams {
     double lowHz = 10.0;
     double highHz = 50.0;
     int order = 4;
     EdgePadding padding = EdgePadding::Even; // passed to sosFiltFilt, not part of the design
+    int lowOrder = 0;
+    int highOrder = 0;
 };
 
 // Designs the filter for `params` at `sampleRateHz`. Returns no sections

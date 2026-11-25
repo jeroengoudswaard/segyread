@@ -3371,6 +3371,89 @@ Rotation..., then Integration, Differentiation, Scale, Time-Depth.
   traces (sort prestack data into gathers first, and note that a panel can
   straddle two gathers); only a reject-below-velocity fan, no polygons.
 
+### Second processing round: clip ranges, bandpass shapes, f-k ranges, amplitude processing, phase estimate
+
+Supersedes the matching parts of the sections above (Interactive clip
+dialog, Octave-band and Bandpass filtering, Filters/deconvolution, Computed
+gain and AGC).
+
+- **Colour scale for one-sided data.** The clip was a pair of magnitudes
+  around zero, so 0..125 Hz or 1500..4500 m/s used half the colour scale.
+  `segy::effectiveClip` (renderer.h): without a manual clip (and without
+  AGC), data whose min >= 0 or max <= 0 spans its own min..max over the
+  whole scale (centre the midpoint); bipolar data keeps the zero-centred
+  clip. `clipFromRange` / `clipToRange` convert between a clip and the
+  values at the two ends of the scale: a range across zero keeps zero at
+  the middle colour, a one-sided range is centred on its midpoint. The
+  renderer, the amplitude-scale legend and the octave bands all use it
+  (`displayedClip(app)`). The Clip dialog now edits **Min** and **Max**
+  as plain values of any sign (the two histogram lines can sit anywhere,
+  never crossing); Symmetrical (Min = -Max) is on by default only for a
+  zero-centred clip. Tests: `testEffectiveClip`.
+- **Bandpass Filter** has a Type: **Butterworth** with Low Corner, Low
+  Slope, High Corner, High Slope (slopes in dB/octave after the two
+  sosfiltfilt passes: 12 per order, 12..120), or **Trapezoidal (Ormsby)**
+  with Low Cut, Low Pass, High Pass, High Cut (pushed into order as you
+  type). `ButterworthBandParams::lowOrder/highOrder`: equal orders keep
+  scipy's bandpass design exactly; different ones cascade a highpass and a
+  lowpass. `segy::ormsbyFilter`: mirrored trace ends (up to the trace's own
+  length), FFT, linear-ramp trapezoid, inverse; zero-phase. Tests
+  (`testBandpassShapes`): trapezoid weights; tones at 30/60/100 Hz through
+  5-10-50-70 give 1, 0.5, 0; Butterworth with a 24 dB/oct low side and a
+  72 dB/oct high side gives 0.5 at both corners and 1/17 an octave below
+  the low corner.
+- **f-k Filter** is a velocity range with a Mode: Pass the range or Reject
+  the range (Min velocity, Max velocity with 0 = none = no upper limit,
+  which includes flat events). The range is passed or removed in full; the
+  cosine taper lies outside it (from (1 - taper) x min, up to (1 + taper) x
+  max). The default, Reject 0..1500 m/s, is the old "remove below 1500".
+  Tests: a 1000 m/s dip passes a Pass 800..1200 filter (> 90 %) while the
+  flat event goes (< 5 %).
+- **Deconvolution** has a Type: Gapped (predictive, the default: 24 ms gap)
+  or Spiking (the gap is one sample, its field greyed out). The shared
+  processing dialog (`askProcessingValues`) got optional combo rows
+  (`ProcessingChoice`, which can grey out a field) and a special-value text
+  for spin boxes ("none").
+- **Amplitude processing writes a dataset.** Processing > Amplitude
+  Processing... (gain curve as time-dB pairs and/or AGC with a window)
+  runs `AmplitudeProcessor` over whole traces and writes a new dataset;
+  AGC output has every window's RMS at 1. The toolbar **AGC** button stays
+  display-only, on the fly (default 500 ms); right-click it (or View > AGC
+  Window and Level...) for Window and Level (% of max amplitude). The
+  display gain curve is gone from the View menu.
+- **Analysis > Phase Estimate** (COPILOT item 41). On the selection box, or
+  the visible data (at most ~4M samples: every Nth trace), every constant
+  rotation from -90 to +89 degrees is scored, and the best one is the Phase
+  Rotation to apply (the wavelet's phase is about the opposite angle). Two
+  measures, both trigonometric polynomials in the angle, so the whole scan
+  comes from eight sums of the analytic signal (`segy::addPhaseScanTrace`
+  / `finishPhaseScan`, processing.h):
+  - **Maximum kurtosis** (van der Baan 2008): N sum x^4 / (sum x^2)^2 over
+    all samples together.
+  - **Minimum entropy**: Wiggins' varimax norm per trace, averaged (as Levy
+    & Oldenburg 1987 used it to phase-correct stacks), so every trace
+    counts the same however loud.
+  - **Agreement**: the product of the two scores (each scaled 0..1), with
+    the spread between the two angles reported ("agree within 3 degrees",
+    "use with care" above 10, "no clear answer" above 25).
+  Low-order measures were tried first and rejected: the Shannon entropy of
+  x^2 / sum x^2, L1/L2 and negentropy (log cosh or exp contrasts) all
+  preferred the two-lobed 90-degree wavelet on a synthetic. Checked
+  directly: L1/L2 is lower at +50 than at the correct -40 degrees; kurtosis
+  is higher at -40. The varimax norm is the Renyi order-2 entropy, which
+  works. Both measures repeat every 180 degrees: polarity is the user's
+  call (a "+180 (other polarity)" box). The window shows the three curves
+  against the angle (the dB chart, generalised with axis labels, a fixed y
+  range and marker lines), the three angles, and Apply Rotation (a new
+  dataset) / Recompute. Test (`testPhaseScan`): a 25 Hz ricker rotated by
+  +40 degrees on sparse reflectivity, traces of different loudness, comes
+  back as -39.6 (kurtosis), -40.4 (entropy), -40.0 (agreement); the
+  analytic kurtosis equals the directly computed one. On PARAGON (visible
+  data, every 10th trace) both say +18 degrees.
+- Checked by screenshot: instantaneous frequency on PARAGON spans 0..62 Hz
+  over the whole colour scale; the Bandpass, f-k, Deconvolution, Amplitude
+  Processing and AGC dialogs; the Phase Estimate window.
+
 ### UX pass: one zoom, fewer menus, two themes
 
 A review of every window, aiming for less: nothing shown twice, nothing

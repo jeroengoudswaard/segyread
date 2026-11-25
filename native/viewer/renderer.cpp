@@ -209,10 +209,38 @@ void displayClipPosNeg(float rawClip, double gainDb, const ManualClip& manualCli
     *clipNeg = clipForGain(baseNeg, gainDb);
 }
 
+ManualClip effectiveClip(const ManualClip& manualClip, float dataMin, float dataMax,
+                         const AmplitudeProcessing* processing) {
+    if (manualClip.enabled || (processing && processing->agcEnabled)) return manualClip;
+    if (!(dataMax > dataMin) || (dataMin < 0.0f && dataMax > 0.0f)) return manualClip;
+    return clipFromRange(dataMin, dataMax);
+}
+
+void clipToRange(const ManualClip& clip, float* low, float* high) {
+    *low = clip.center - clip.negMagnitude;
+    *high = clip.center + clip.posMagnitude;
+}
+
+ManualClip clipFromRange(float low, float high) {
+    if (!(high > low)) high = low + 1.0f;
+    ManualClip clip;
+    clip.enabled = true;
+    if (low < 0.0f && high > 0.0f) {
+        clip.center = 0.0f;
+        clip.posMagnitude = high;
+        clip.negMagnitude = -low;
+    } else {
+        clip.center = 0.5f * (low + high);
+        clip.posMagnitude = clip.negMagnitude = 0.5f * (high - low);
+    }
+    return clip;
+}
+
 double renderFrame(const RenderContext& ctx, const ViewRange& view, uint32_t* pixels, int width, int height,
                     double gainDb, ColorScale colorScale, ManualClip manualClip, bool reversePolarity,
                     bool colorScaleFlipped, const AmplitudeProcessing* processing) {
     if (width <= 0 || height <= 0 || !ctx.pyramid || !ctx.pool) return 0.0;
+    manualClip = effectiveClip(manualClip, ctx.pyramid->globalMin, ctx.pyramid->globalMax, processing);
     auto start = std::chrono::high_resolution_clock::now();
 
     if (ctx.file && ctx.file->isOpen()) {

@@ -207,16 +207,22 @@ std::vector<Biquad> designButterworthBand(const ButterworthBandParams& params, d
     const double nyquist = sampleRateHz / 2.0;
     if (sampleRateHz <= 0.0) return fail("The file has no valid sample interval.");
     const int order = std::clamp(params.order, 1, 20);
+    const int lowOrder = params.lowOrder > 0 ? std::clamp(params.lowOrder, 1, 20) : order;
+    const int highOrder = params.highOrder > 0 ? std::clamp(params.highOrder, 1, 20) : order;
     const bool hasLow = params.lowHz > 0.0;
     const bool hasHigh = params.highHz < nyquist * 0.999;
     if (hasLow && params.lowHz >= nyquist * 0.999) return fail("The low corner is at or above the Nyquist frequency.");
     if (!hasLow && !hasHigh) return fail("Both corners are open (low 0 Hz, high at/above Nyquist): nothing to filter.");
     if (hasLow && hasHigh) {
         if (params.lowHz >= params.highHz) return fail("The low corner must be below the high corner.");
-        return butterworthBandpass(order, params.lowHz, params.highHz, sampleRateHz);
+        if (lowOrder == highOrder) return butterworthBandpass(lowOrder, params.lowHz, params.highHz, sampleRateHz);
+        std::vector<Biquad> sos = butterworthHighpass(lowOrder, params.lowHz, sampleRateHz);
+        const std::vector<Biquad> low = butterworthLowpass(highOrder, params.highHz, sampleRateHz);
+        sos.insert(sos.end(), low.begin(), low.end());
+        return sos;
     }
-    return hasLow ? butterworthHighpass(order, params.lowHz, sampleRateHz)
-                  : butterworthLowpass(order, params.highHz, sampleRateHz);
+    return hasLow ? butterworthHighpass(lowOrder, params.lowHz, sampleRateHz)
+                  : butterworthLowpass(highOrder, params.highHz, sampleRateHz);
 }
 
 int sosFiltFiltDefaultPadlen(const std::vector<Biquad>& sos) {

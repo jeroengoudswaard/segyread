@@ -73,6 +73,21 @@ struct ManualClip {
 void displayClipPosNeg(float rawClip, double gainDb, const ManualClip& manualClip,
                        const AmplitudeProcessing* processing, float* clipPos, float* clipNeg);
 
+// The clip a display really uses: `manualClip` when it is set (or when AGC
+// is on, whose output is bipolar); otherwise, for one-sided data (dataMin
+// >= 0 or dataMax <= 0: velocities, envelope, instantaneous frequency), the
+// data's own dataMin..dataMax spread over the whole colour scale (centre
+// the midpoint). Bipolar data keeps the default zero-centred clip.
+ManualClip effectiveClip(const ManualClip& manualClip, float dataMin, float dataMax,
+                         const AmplitudeProcessing* processing);
+
+// A clip as the data values at the bottom and top of the colour scale, and
+// back. A range spanning zero keeps zero at the scale's middle colour
+// (centre 0, magnitudes -low and high); a one-sided range is centred on its
+// midpoint. low < high.
+void clipToRange(const ManualClip& clip, float* low, float* high);
+ManualClip clipFromRange(float low, float high);
+
 void resetView(ViewRange& view, int64_t traceCount, int samplesPerTrace);
 void clampView(ViewRange& view, int64_t traceCount, int samplesPerTrace);
 

@@ -25,6 +25,15 @@
 #include "analysis.h"
 #include "horizons.h"
 #include "processing.h"
+#include "iirfilter.h"
+
+// Processing > Bandpass Filter's request: Butterworth (corners, a slope per
+// side) or a trapezoid (Ormsby, four corners).
+struct BandpassRequest {
+    bool trapezoid = false;
+    segy::ButterworthBandParams butterworth;
+    segy::OrmsbyParams ormsby;
+};
 #include "segy_select.h"
 #include "trace_header_defs.h"
 #include "iirfilter.h"
@@ -454,10 +463,11 @@ class ClipHistogramWidget : public QWidget {
 public:
     explicit ClipHistogramWidget(QWidget* parent = nullptr);
     void setHistogram(const segy::HistogramResult& result);
-    void setClipValues(float posClip, float negClip);
+    // The data values at the bottom and top of the colour scale (low < high).
+    void setClipValues(float low, float high);
     void setSymmetrical(bool symmetrical);
 
-    std::function<void(float posClip, float negClip)> onChanged;
+    std::function<void(float low, float high)> onChanged;
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -467,10 +477,10 @@ protected:
 
 private:
     segy::HistogramResult result_;
-    float posClip_ = 1.0f;
-    float negClip_ = 1.0f;
+    float low_ = -1.0f;
+    float high_ = 1.0f;
     bool symmetrical_ = true;
-    int draggingLine_ = -1; // -1 none, 0 = negative (left) line, 1 = positive (right) line
+    int draggingLine_ = -1; // -1 none, 0 = low (left) line, 1 = high (right) line
 
     QRect chartRect() const;
     int xForValue(float value) const;
@@ -505,14 +515,15 @@ protected:
 private:
     AppState& app_;
     ClipHistogramWidget* histogramWidget_ = nullptr;
-    QDoubleSpinBox* negSpin_ = nullptr;
-    QDoubleSpinBox* posSpin_ = nullptr;
+    QDoubleSpinBox* lowSpin_ = nullptr;
+    QDoubleSpinBox* highSpin_ = nullptr;
     QCheckBox* symmetricalCheck_ = nullptr;
     segy::ManualClip original_;
     std::function<void()> onChanged_;
 
     void recomputeHistogram(float rangeMin, float rangeMax);
-    void applyLive(float posClip, float negClip, bool fromSymmetricalDrag);
+    void recomputeHistogramAround(float low, float high);
+    void applyLive(float low, float high);
 };
 
 // Parameters dialog for the Histogram feature (see native/README.md).
@@ -711,6 +722,11 @@ public:
     void setGridLinesVisible(bool visible);
     void setCrosshairEnabled(bool enabled);
     void setHoverCallback(std::function<void(int frequencyIndex, double cursorDb)> callback);
+    // For charts that are not dB vs. frequency (the phase scan): axis names,
+    // a fixed y range, and vertical marker lines.
+    void setAxisLabels(const QString& xLabel, const QString& yLabel);
+    void setFixedYRange(double y0, double y1);
+    void setMarkers(std::vector<std::pair<double, QColor>> markers);
     const std::vector<float>& frequencies() const { return frequencyHz_; }
     const std::vector<DbCurve>& curves() const { return curves_; }
 
@@ -727,6 +743,11 @@ private:
     std::vector<float> frequencyHz_;
     std::vector<DbCurve> curves_;
     QString title_ = "Amplitude (dB) vs. Frequency (Hz)";
+    QString xLabel_ = "Frequency (Hz)";
+    QString yLabel_ = "Level (dB)";
+    bool fixedY_ = false;
+    double fixedY0_ = 0.0, fixedY1_ = 1.0;
+    std::vector<std::pair<double, QColor>> markers_;
     QString emptyText_;
     bool gridLinesVisible_ = true;
     bool crosshairEnabled_ = true;
@@ -1018,25 +1039,23 @@ class AmplitudeProcessingDialog : public QDialog {
 public:
     explicit AmplitudeProcessingDialog(QWidget* parent = nullptr);
 
-    // Loads `processing` into the controls without firing the callback.
-    // `recordLengthMs` seeds the default curve the first time computed
-    // gain is switched on with no points yet.
+    // Loads `processing` into the controls. `recordLengthMs` seeds the
+    // default curve the first time computed gain is switched on with no
+    // points yet.
     void setProcessing(const segy::AmplitudeProcessing& processing, double recordLengthMs);
-    void setChangedCallback(std::function<void(const segy::AmplitudeProcessing&)> callback);
+    void setOutputName(const QString& name);
+    QString outputName() const;
+    segy::AmplitudeProcessing collect() const;
 
 private:
+    QLineEdit* outputNameEdit_ = nullptr;
     QGroupBox* gainGroup_ = nullptr;
     QTableWidget* gainTable_ = nullptr;
     QGroupBox* agcGroup_ = nullptr;
     QDoubleSpinBox* agcWindowSpin_ = nullptr;
-    QDoubleSpinBox* agcLevelSpin_ = nullptr;
     double recordLengthMs_ = 1000.0;
-    bool loading_ = false; // suppresses the callback while setProcessing() fills the controls
-    std::function<void(const segy::AmplitudeProcessing&)> onChanged_;
 
     void addGainRow(double timeMs, double gainDb);
-    segy::AmplitudeProcessing collect() const;
-    void emitChanged();
 };
 
 // Edit > Calculator: combines two currently-loaded panels' datasets
@@ -1070,7 +1089,9 @@ private:
     void emitApply();
 };
 
-// Edit > Processing > Bandpass: Butterworth filter (low/high corner, order),
+// Processing > Bandpass Filter: Butterworth (low/high corner, a slope per
+// side in dB/octave) or a trapezoid (Ormsby, f1-f2-f3-f4, zero-phase in the
+// frequency domain). The Butterworth is
 // applied zero-phase with sosfiltfilt -- mirrored (odd) padding at both trace
 // ends, see viewer/iirfilter.h -- to every trace of the active panel's
 // dataset, auto-named and auto-displayed in the left panel
@@ -1084,17 +1105,27 @@ public:
     // Called right before each show() with the active panel's dataset name
     // (for the default output name) and whether one is even loaded.
     void refreshSource(const QString& sourceName, bool loaded);
-    void setApplyCallback(std::function<void(segy::ButterworthBandParams params, QString outputName)> callback);
+    void setApplyCallback(std::function<void(BandpassRequest request, QString outputName)> callback);
 
 private:
+    QComboBox* typeCombo_ = nullptr;     // 0 Butterworth, 1 trapezoid
+    QWidget* butterworthPage_ = nullptr;
+    QWidget* trapezoidPage_ = nullptr;
+    QLabel* hintLabel_ = nullptr;
     QDoubleSpinBox* lowSpin_ = nullptr;  // 0 = no low cut (lowpass)
     QDoubleSpinBox* highSpin_ = nullptr; // at/above Nyquist = no high cut (highpass)
-    QSpinBox* orderSpin_ = nullptr;
+    QComboBox* lowSlopeCombo_ = nullptr;  // dB/octave after filtfilt = 12 x order
+    QComboBox* highSlopeCombo_ = nullptr;
     QComboBox* edgesCombo_ = nullptr; // segy::EdgePadding
+    QDoubleSpinBox* trapezoidSpins_[4] = {}; // f1..f4
     QLineEdit* outputNameEdit_ = nullptr;
     QString sourceName_;
     bool outputNameEdited_ = false;
-    std::function<void(segy::ButterworthBandParams, QString)> onApply_;
+    std::function<void(BandpassRequest, QString)> onApply_;
+
+    void updateType();
+    // Keeps f1 <= f2 <= f3 <= f4 by pushing the neighbours along.
+    void enforceTrapezoidOrdering(int edited);
 
     // Keeps low < high as the user edits either: pushes the other corner
     // out of the way rather than rejecting the edit.
@@ -1390,6 +1421,8 @@ private:
     float valueAt(double frequencyHz, double wavenumber, bool* inside) const;
     void rebuildRaster(const QRect& chart);
 };
+
+class PhaseEstimateWindow;
 
 class FkWindow : public QWidget {
 public:
@@ -1775,16 +1808,17 @@ private:
     QLabel* gainValueLabel_ = nullptr;
     QAction* gainDownAction_ = nullptr;
 
-    // Computed gain + AGC (display-time, see viewer/amplitude.h). agcAction_
-    // is a quick on/off toggle for AGC alone; the full controls (window,
-    // level, time-gain pairs) live in amplitudeProcessingDialog_.
+    // AGC on the display, on the fly (see viewer/amplitude.h): agcAction_
+    // toggles it, right-click sets its window and level. Processing >
+    // Amplitude Processing... (gain curve and/or AGC) writes a new dataset.
     QAction* agcAction_ = nullptr;
-    AmplitudeProcessingDialog* amplitudeProcessingDialog_ = nullptr;
+    segy::AmplitudeProcessing lastAmplitudeProcessing_;
     // Applies `processing` to targetPanels() (Lock-aware), then refreshes
     // the legend, canvases, and the AGC toggle's checked state.
     void setAmplitudeProcessing(const segy::AmplitudeProcessing& processing);
     void openAmplitudeProcessingDialog();
-    // Re-syncs agcAction_ and an open dialog to the active panel's settings.
+    void openAgcSettings();
+    // Re-syncs agcAction_ to the active panel's settings.
     void refreshAmplitudeProcessingControls();
 
     // Spectrum and Histogram open a parameters dialog plus, on Apply/OK, a
@@ -1851,6 +1885,11 @@ private:
     QAction* signalNoiseAction_ = nullptr;
     QAction* fkAction_ = nullptr;
     FkWindow* fkWindow_ = nullptr;
+    // Analysis > Phase Estimate (see native/README.md).
+    PhaseEstimateWindow* phaseWindow_ = nullptr;
+    Panel* phaseSourcePanel_ = nullptr;
+    void computeAndShowPhaseEstimate(Panel* sourcePanel);
+    void applyPhaseRotation(Panel* panel, double degrees);
     bool fkComputed_ = false;
     SignalNoiseSource fkLastSource_;
     int fkLastGatherMode_ = 0;
@@ -2067,7 +2106,7 @@ private:
                        const QString& outputName);
     // Bandpass-filters every trace of `source`'s full sample range, writes
     // the result to a temp SEG-Y file, and loads it into panelA_.
-    void runBandpass(AppState& source, const segy::ButterworthBandParams& params, const QString& outputName);
+    void runBandpass(AppState& source, const BandpassRequest& request, const QString& outputName);
     // Writes `source`'s current dataset to `filePath` with a synthesized
     // EBCDIC header recording its processing history (see
     // buildSegyTextHeader in viewer_qt.cpp).
@@ -2132,6 +2171,7 @@ private:
     // values are the next defaults.
     segy::WhiteningParams lastWhitening_;
     segy::DeconParams lastDecon_;
+    bool lastDeconSpiking_ = false;
     segy::FkFilterParams lastFk_;
     double lastRotationDegrees_ = 90.0;
     void openSpectralWhitening();

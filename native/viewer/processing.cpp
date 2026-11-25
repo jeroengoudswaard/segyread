@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace segy {
 
@@ -74,6 +75,157 @@ void phaseRotate(std::vector<float>& trace, double degrees) {
     const auto a = analyticSignal(trace);
     const double c = std::cos(degrees * kPi / 180.0), s = std::sin(degrees * kPi / 180.0);
     for (size_t i = 0; i < trace.size(); ++i) trace[i] = float(a[i].real() * c - a[i].imag() * s);
+}
+
+namespace {
+
+double phaseScanAngle(int i) { return -90.0 + double(i) * 180.0 / double(kPhaseScanSteps); }
+
+// Best index of a 180-degree-periodic curve, refined by a parabola through
+// its neighbours; returned as an angle in -90..90.
+double refinedPeak(const std::vector<double>& score) {
+    const int n = int(score.size());
+    int best = 0;
+    for (int i = 1; i < n; ++i) if (score[size_t(i)] > score[size_t(best)]) best = i;
+    const double l = score[size_t((best + n - 1) % n)], c = score[size_t(best)], r = score[size_t((best + 1) % n)];
+    const double denom = l - 2.0 * c + r;
+    const double shift = denom < 0.0 ? std::clamp(0.5 * (l - r) / denom, -0.5, 0.5) : 0.0;
+    double angle = phaseScanAngle(best) + shift * 180.0 / double(n);
+    if (angle < -90.0) angle += 180.0;
+    if (angle >= 90.0) angle -= 180.0;
+    return angle;
+}
+
+std::vector<double> normalised(const std::vector<double>& v, bool higherIsBetter) {
+    const auto [lo, hi] = std::minmax_element(v.begin(), v.end());
+    const double span = *hi - *lo;
+    std::vector<double> out(v.size(), 1.0);
+    if (span <= 0.0) return out;
+    for (size_t i = 0; i < v.size(); ++i) out[i] = higherIsBetter ? (v[i] - *lo) / span : (*hi - v[i]) / span;
+    return out;
+}
+
+} // namespace
+
+namespace {
+
+void addMoments(PhaseScanMoments& m, const std::vector<std::complex<float>>& analytic) {
+    for (const auto& z : analytic) {
+        const double a = z.real(), b = z.imag();
+        const double aa = a * a, bb = b * b;
+        m.a2 += aa;
+        m.ab += a * b;
+        m.b2 += bb;
+        m.a4 += aa * aa;
+        m.a3b += aa * a * b;
+        m.a2b2 += aa * bb;
+        m.ab3 += a * b * bb;
+        m.b4 += bb * bb;
+    }
+    m.count += double(analytic.size());
+}
+
+// count x sum x^4 / (sum x^2)^2 of x = a cos - b sin, from the moments.
+double kurtosisAt(const PhaseScanMoments& m, double c, double sn) {
+    const double e = c * c * m.a2 - 2.0 * c * sn * m.ab + sn * sn * m.b2;
+    const double q = c * c * c * c * m.a4 - 4.0 * c * c * c * sn * m.a3b + 6.0 * c * c * sn * sn * m.a2b2 -
+                     4.0 * c * sn * sn * sn * m.ab3 + sn * sn * sn * sn * m.b4;
+    return e > 0.0 ? m.count * q / (e * e) : 0.0;
+}
+
+} // namespace
+
+void addPhaseScanTrace(PhaseScanSums& sums, const std::vector<float>& trace) {
+    if (!(rms(trace) > 0.0)) return;
+    const auto analytic = analyticSignal(trace);
+    PhaseScanMoments m;
+    addMoments(m, analytic);
+    for (int k = 0; k < kPhaseScanSteps; ++k) {
+        const double angle = phaseScanAngle(k) * kPi / 180.0;
+        sums.varimaxSum[size_t(k)] += kurtosisAt(m, std::cos(angle), std::sin(angle));
+    }
+    PhaseScanMoments& p = sums.pooled;
+    p.a2 += m.a2;
+    p.ab += m.ab;
+    p.b2 += m.b2;
+    p.a4 += m.a4;
+    p.a3b += m.a3b;
+    p.a2b2 += m.a2b2;
+    p.ab3 += m.ab3;
+    p.b4 += m.b4;
+    p.count += m.count;
+    sums.traces += 1.0;
+}
+
+void mergePhaseScan(PhaseScanSums& into, const PhaseScanSums& from) {
+    PhaseScanMoments& p = into.pooled;
+    const PhaseScanMoments& q = from.pooled;
+    p.a2 += q.a2;
+    p.ab += q.ab;
+    p.b2 += q.b2;
+    p.a4 += q.a4;
+    p.a3b += q.a3b;
+    p.a2b2 += q.a2b2;
+    p.ab3 += q.ab3;
+    p.b4 += q.b4;
+    p.count += q.count;
+    into.traces += from.traces;
+    for (size_t k = 0; k < into.varimaxSum.size() && k < from.varimaxSum.size(); ++k) into.varimaxSum[k] += from.varimaxSum[k];
+}
+
+PhaseScanResult finishPhaseScan(const PhaseScanSums& s) {
+    PhaseScanResult r;
+    if (s.pooled.count < 8 || !(s.pooled.a2 > 0.0) || s.traces < 1.0) return r;
+    r.anglesDeg.resize(kPhaseScanSteps);
+    r.kurtosis.resize(kPhaseScanSteps);
+    r.varimax.resize(kPhaseScanSteps);
+    for (int k = 0; k < kPhaseScanSteps; ++k) {
+        const double angle = phaseScanAngle(k);
+        r.anglesDeg[size_t(k)] = angle;
+        r.kurtosis[size_t(k)] = kurtosisAt(s.pooled, std::cos(angle * kPi / 180.0), std::sin(angle * kPi / 180.0));
+        r.varimax[size_t(k)] = s.varimaxSum[size_t(k)] / s.traces;
+    }
+    r.kurtosisScore = normalised(r.kurtosis, true);
+    r.entropyScore = normalised(r.varimax, true);
+    std::vector<double> product(kPhaseScanSteps);
+    for (int k = 0; k < kPhaseScanSteps; ++k) product[size_t(k)] = r.kurtosisScore[size_t(k)] * r.entropyScore[size_t(k)];
+    r.agreementScore = normalised(product, true);
+    r.kurtosisAngle = refinedPeak(r.kurtosisScore);
+    r.entropyAngle = refinedPeak(r.entropyScore);
+    r.agreementAngle = refinedPeak(r.agreementScore);
+    const double spread = std::fabs(r.kurtosisAngle - r.entropyAngle);
+    r.spreadDeg = std::min(spread, 180.0 - spread);
+    r.valid = true;
+    return r;
+}
+
+double ormsbyWeight(double frequencyHz, const OrmsbyParams& p) {
+    const double f = std::fabs(frequencyHz);
+    if (f < p.lowCutHz || f > p.highCutHz) return 0.0;
+    if (f < p.lowPassHz) return p.lowPassHz > p.lowCutHz ? (f - p.lowCutHz) / (p.lowPassHz - p.lowCutHz) : 1.0;
+    if (f > p.highPassHz) return p.highCutHz > p.highPassHz ? (p.highCutHz - f) / (p.highCutHz - p.highPassHz) : 1.0;
+    return 1.0;
+}
+
+void ormsbyFilter(std::vector<float>& trace, double sampleIntervalUs, const OrmsbyParams& params) {
+    const size_t n = trace.size();
+    if (n < 2 || sampleIntervalUs <= 0.0) return;
+    const size_t pad = n - 1;
+    // [mirror of x[pad..1] | x | mirror of x[n-2..n-1-pad]], then zeros.
+    std::vector<std::complex<float>> spectrum(nextPowerOfTwo(n + 2 * pad));
+    for (size_t i = 0; i < pad; ++i) spectrum[i] = trace[pad - i];
+    for (size_t i = 0; i < n; ++i) spectrum[pad + i] = trace[i];
+    for (size_t i = 0; i < pad; ++i) spectrum[pad + n + i] = trace[n - 2 - i];
+    fft(spectrum);
+    const size_t m = spectrum.size();
+    const double df = 1.0 / (double(m) * sampleIntervalUs * 1e-6);
+    for (size_t i = 0; i <= m / 2; ++i) {
+        const float w = float(ormsbyWeight(double(i) * df, params));
+        spectrum[i] *= w;
+        if (i > 0 && i < m / 2) spectrum[m - i] *= w;
+    }
+    ifft(spectrum);
+    for (size_t i = 0; i < n; ++i) trace[i] = spectrum[pad + i].real();
 }
 
 void spectralWhitening(std::vector<float>& trace, double sampleIntervalUs, const WhiteningParams& params) {
@@ -180,13 +332,20 @@ void predictiveDeconvolution(std::vector<float>& trace, double sampleIntervalUs,
 
 double fkFilterWeight(double frequencyHz, double wavenumberPerM, const FkFilterParams& params) {
     const double f = std::fabs(frequencyHz), k = std::fabs(wavenumberPerM);
-    if (k <= 0.0) return 1.0; // flat events
-    const double v = f / k;
-    const double high = params.velocity;
-    const double low = params.velocity * (1.0 - std::clamp(params.taperPercent, 0.0, 99.0) / 100.0);
-    if (v >= high) return 1.0;
-    if (v <= low) return 0.0;
-    return 0.5 - 0.5 * std::cos(kPi * (v - low) / (high - low));
+    const double v = k > 0.0 ? f / k : std::numeric_limits<double>::infinity(); // k = 0: flat events
+    const double lo = std::max(0.0, params.minVelocity);
+    const double hi = params.maxVelocity > 0.0 ? params.maxVelocity : std::numeric_limits<double>::infinity();
+    const double t = std::clamp(params.taperPercent, 0.0, 99.0) / 100.0;
+    // 1 inside [lo, hi], cosine down to 0 outside it.
+    double inside = 1.0;
+    if (v < lo) {
+        const double edge = lo * (1.0 - t);
+        inside = v <= edge ? 0.0 : 0.5 - 0.5 * std::cos(kPi * (v - edge) / (lo - edge));
+    } else if (v > hi) {
+        const double edge = hi * (1.0 + t);
+        inside = v >= edge ? 0.0 : 0.5 + 0.5 * std::cos(kPi * (v - hi) / (edge - hi));
+    }
+    return params.pass ? inside : 1.0 - inside;
 }
 
 void fkFilterPanel(std::vector<std::vector<float>>& traces, double sampleIntervalUs, const FkFilterParams& params) {

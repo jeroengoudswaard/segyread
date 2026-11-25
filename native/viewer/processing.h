@@ -28,6 +28,24 @@ void instantaneousFrequency(std::vector<float>& trace, double sampleIntervalUs);
 // zero-phase wavelet into an antisymmetric one.
 void phaseRotate(std::vector<float>& trace, double degrees);
 
+// ---- Trapezoidal (Ormsby) bandpass ------------------------------------------
+
+struct OrmsbyParams {
+    double lowCutHz = 5.0;   // f1: zero below
+    double lowPassHz = 10.0; // f2: full from here ...
+    double highPassHz = 50.0;// f3: ... to here
+    double highCutHz = 70.0; // f4: zero above
+};
+
+// The trapezoid's amplitude at f: 0 below f1 and above f4, 1 from f2 to f3,
+// linear ramps in between (f1 == f2 or f3 == f4: a hard edge).
+double ormsbyWeight(double frequencyHz, const OrmsbyParams& params);
+
+// Zero-phase trapezoidal bandpass in the frequency domain. The trace is
+// mirrored past both ends (up to its own length, like the Butterworth
+// filter's even padding) so the ends do not ring, FFT'd, weighted, inverted.
+void ormsbyFilter(std::vector<float>& trace, double sampleIntervalUs, const OrmsbyParams& params);
+
 // ---- Spectral whitening -----------------------------------------------------
 
 struct WhiteningParams {
@@ -62,21 +80,81 @@ void predictiveDeconvolution(std::vector<float>& trace, double sampleIntervalUs,
 
 // ---- f-k filter -------------------------------------------------------------
 
+// A range of apparent velocities |f| / |k| that is passed (everything
+// else removed) or rejected (everything else kept). The range is passed or
+// removed in full; the cosine taper lies outside it, from (1 - taper) x
+// min up to min and from max up to (1 + taper) x max. maxVelocity 0 = no
+// upper limit (flat events, k = 0, have infinite apparent velocity).
+// The default rejects 0..1500 m/s: steep dips, ground roll.
 struct FkFilterParams {
-    double velocity = 1500.0;    // m/s: apparent velocities below this are removed
+    double minVelocity = 0.0;    // m/s
+    double maxVelocity = 1500.0; // m/s, 0 = no upper limit
     double traceSpacing = 12.5;  // m between traces
-    double taperPercent = 20.0;  // cosine ramp from (1 - taper) x velocity up to velocity
+    double taperPercent = 20.0;
+    bool pass = false;           // true: keep the range; false: remove it
 };
 
 // Velocity (fan) filter on one panel of consecutive traces, in place
 // (traces[i] = one trace, all the same length): 2D FFT (zero-padded to
-// powers of two, the traces to twice their count), weight 0 where the
-// apparent velocity |f| / |k| is below (1 - taper) x velocity, 1 from
-// velocity up (flat events, k = 0, always pass), cosine in between, inverse.
+// powers of two, the traces to twice their count), weighted by
+// fkFilterWeight, inverse.
 void fkFilterPanel(std::vector<std::vector<float>>& traces, double sampleIntervalUs, const FkFilterParams& params);
 
 // The weight fkFilterPanel applies at frequency f (Hz) and wavenumber k
 // (cycles/m).
 double fkFilterWeight(double frequencyHz, double wavenumberPerM, const FkFilterParams& params);
+
+// ---- Statistical phase estimate ---------------------------------------------
+//
+// Ockham's razor: the constant phase rotation that makes the data simplest
+// (spikiest) is the one that makes the wavelet zero-phase. Scanned over
+// -90..+89 degrees in 1-degree steps (both measures repeat every 180
+// degrees: they cannot tell polarity). Each rotation is x cos(a) - H[x]
+// sin(a), exactly phaseRotate's, so the best angle is the Phase Rotation to
+// apply; the wavelet's phase is about minus that angle (or 180 off).
+//  - Maximum kurtosis (van der Baan 2008): N sum x^4 / (sum x^2)^2 over all
+//    samples in the window together.
+//  - Minimum entropy (Wiggins' varimax norm, as Levy & Oldenburg 1987 used
+//    it for phase correction of stacks): n sum x^4 / (sum x^2)^2 per trace,
+//    averaged, so every trace counts the same however loud it is. (Low-order
+//    measures -- Shannon entropy of x^2 / sum x^2, L1/L2, negentropy with
+//    log cosh -- were tried and prefer a two-lobed 90-degree wavelet on
+//    synthetics; the varimax norm is the Renyi order-2 entropy.)
+//  - Agreement: the product of the two normalised scores.
+// Both are trigonometric polynomials in the angle: eight sums of the
+// analytic signal (per trace for the varimax) give the whole scan.
+
+constexpr int kPhaseScanSteps = 180; // -90 .. +89 degrees
+
+struct PhaseScanMoments {
+    double a2 = 0, ab = 0, b2 = 0;                    // sums of a^2, ab, b^2 (a = x, b = H[x])
+    double a4 = 0, a3b = 0, a2b2 = 0, ab3 = 0, b4 = 0; // fourth moments
+    double count = 0;                                 // samples
+};
+
+struct PhaseScanSums {
+    PhaseScanMoments pooled;
+    std::vector<double> varimaxSum = std::vector<double>(kPhaseScanSteps, 0.0); // per angle, over traces
+    double traces = 0;
+};
+
+// Adds one trace (already cut to the analysis window). Dead traces add nothing.
+void addPhaseScanTrace(PhaseScanSums& sums, const std::vector<float>& trace);
+void mergePhaseScan(PhaseScanSums& into, const PhaseScanSums& from);
+
+struct PhaseScanResult {
+    std::vector<double> anglesDeg;      // -90 .. 89
+    std::vector<double> kurtosis;       // pooled kurtosis per angle
+    std::vector<double> varimax;        // mean per-trace varimax per angle
+    std::vector<double> kurtosisScore;  // 0..1, 1 = best
+    std::vector<double> entropyScore;   // 0..1, 1 = best (highest varimax = lowest entropy)
+    std::vector<double> agreementScore; // kurtosisScore x entropyScore, rescaled to 0..1
+    double kurtosisAngle = 0.0;         // best angles, refined between the 1-degree steps
+    double entropyAngle = 0.0;
+    double agreementAngle = 0.0;
+    double spreadDeg = 0.0;             // kurtosis vs. entropy angle, modulo 180
+    bool valid = false;
+};
+PhaseScanResult finishPhaseScan(const PhaseScanSums& sums);
 
 } // namespace segy
