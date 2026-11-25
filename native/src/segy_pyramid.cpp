@@ -167,6 +167,23 @@ Pyramid buildPyramid(const BuildParams& p, ThreadPool& pool, const ProgressFn& o
     if (!(gmin <= gmax)) { gmin = -1.0f; gmax = 1.0f; } // degenerate (empty/NaN) fallback
     pyramid.globalMin = gmin;
     pyramid.globalMax = gmax;
+
+    // Robust clip from at most ~1M evenly spaced finest-level blocks.
+    const PyramidLevel& finest = pyramid.levels.front();
+    const size_t blocks = finest.maxv.size();
+    const size_t step = std::max<size_t>(1, blocks / 1'000'000);
+    std::vector<float> peaks;
+    peaks.reserve(blocks / step + 1);
+    for (size_t i = 0; i < blocks; i += step) {
+        if (finest.count[i] == 0) continue;
+        const float peak = std::max(std::fabs(finest.minv[i]), std::fabs(finest.maxv[i]));
+        if (peak > 0.0f && std::isfinite(peak)) peaks.push_back(peak);
+    }
+    if (peaks.size() >= 100) {
+        const size_t k = size_t(double(peaks.size() - 1) * 0.99);
+        std::nth_element(peaks.begin(), peaks.begin() + std::ptrdiff_t(k), peaks.end());
+        pyramid.robustClip = peaks[k];
+    }
     return pyramid;
 }
 

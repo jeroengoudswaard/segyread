@@ -4,14 +4,29 @@
 // phase and frequency, phase rotation). Qt-free, covered by segytest.
 #pragma once
 #include <complex>
+#include <cstdint>
 #include <vector>
 
 namespace segy {
 
+// ---- Mutes -------------------------------------------------------------------
+
+// The live part of a trace: [first, last] non-zero sample, or first > last
+// for a dead trace. Leading and trailing exact zeros are a mute (a water
+// column, a top mute) that filters must not fill in.
+struct LiveRange {
+    size_t first = 1, last = 0;
+};
+LiveRange liveRange(const float* samples, size_t count);
+// Zeros `samples` outside `range` (everything for a dead trace).
+void applyMute(float* samples, size_t count, const LiveRange& range);
+
 // ---- Complex trace (analytic signal) ---------------------------------------
 
-// x + i H[x], via the FFT (zero-padded to twice the next power of two, so
-// the circular Hilbert transform does not wrap around the trace ends).
+// x + i H[x], via the FFT, zero-padded by at least half the trace length
+// (to a power of two) so the circular Hilbert transform's wrap-around is
+// negligible: the kernel 1/(pi t) is below 1e-3 that far out for any
+// trace over a few hundred samples. Half the FFT of padding to twice.
 std::vector<std::complex<float>> analyticSignal(const std::vector<float>& trace);
 
 // |x + iH[x]|.
@@ -42,8 +57,9 @@ struct OrmsbyParams {
 double ormsbyWeight(double frequencyHz, const OrmsbyParams& params);
 
 // Zero-phase trapezoidal bandpass in the frequency domain. The trace is
-// mirrored past both ends (up to its own length, like the Butterworth
-// filter's even padding) so the ends do not ring, FFT'd, weighted, inverted.
+// mirrored past both ends (a quarter of its length, at least 64 samples,
+// like the Butterworth filter's even padding) so the ends do not ring,
+// FFT'd, weighted, inverted.
 void ormsbyFilter(std::vector<float>& trace, double sampleIntervalUs, const OrmsbyParams& params);
 
 // ---- Spectral whitening -----------------------------------------------------
@@ -99,6 +115,20 @@ struct FkFilterParams {
 // powers of two, the traces to twice their count), weighted by
 // fkFilterWeight, inverse.
 void fkFilterPanel(std::vector<std::vector<float>>& traces, double sampleIntervalUs, const FkFilterParams& params);
+
+// The weights for every (frequency, wavenumber) cell of a panel of `traces`
+// x `samples`, computed once and reused for every panel of a file (the
+// weight costs a division and a cosine; a 6 GB file has ~10k panels).
+// Columns whose weights are all 1 are skipped, all 0 are zeroed.
+struct FkFilterPlan {
+    size_t traces = 0, samples = 0, nt = 0, nk = 0;
+    std::vector<float> weights;     // (nt / 2 + 1) x nk, row = frequency
+    std::vector<uint8_t> columnKind; // per frequency: 0 mixed, 1 all ones, 2 all zeros
+};
+FkFilterPlan makeFkFilterPlan(size_t traces, size_t samples, double sampleIntervalUs, const FkFilterParams& params);
+// Same result as fkFilterPanel for a panel of the plan's size. Two traces
+// share each time FFT (real inputs packed as real and imaginary parts).
+void fkFilterPanel(std::vector<std::vector<float>>& traces, const FkFilterPlan& plan);
 
 // The weight fkFilterPanel applies at frequency f (Hz) and wavenumber k
 // (cycles/m).

@@ -28,6 +28,7 @@
 #include "fft.h"
 #include "loader.h"
 #include "segy_writer.h"
+#include "processing.h"
 
 namespace {
 
@@ -345,11 +346,67 @@ void benchSpectral() {
     }
 }
 
+// Processing kernels per trace / per panel, single-threaded (PARAGON-sized
+// traces: 2501 samples at 4 ms) -- "segybench processing".
+static void benchProcessing() {
+    using Clock = std::chrono::steady_clock;
+    auto seconds = [](Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); };
+    std::mt19937 rng(3);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    const size_t ns = 2501;
+    std::vector<float> trace(ns);
+    for (float& v : trace) v = g(rng);
+    const int reps = 2000;
+    auto perTrace = [&](const char* name, auto&& fn) {
+        auto t = Clock::now();
+        for (int r = 0; r < reps; ++r) {
+            std::vector<float> x = trace;
+            fn(x);
+        }
+        std::printf("  %-28s %8.1f us/trace\n", name, seconds(t) / reps * 1e6);
+    };
+    perTrace("envelope", [](std::vector<float>& x) { segy::envelope(x); });
+    perTrace("instantaneous frequency", [](std::vector<float>& x) { segy::instantaneousFrequency(x, 4000.0); });
+    perTrace("spectral whitening", [](std::vector<float>& x) { segy::spectralWhitening(x, 4000.0, {}); });
+    perTrace("deconvolution", [](std::vector<float>& x) { segy::predictiveDeconvolution(x, 4000.0, {}); });
+    perTrace("ormsby", [](std::vector<float>& x) { segy::ormsbyFilter(x, 4000.0, {}); });
+    segy::FkFilterParams fk;
+    fk.traceSpacing = 6.25;
+    std::vector<std::vector<float>> panel(128, trace);
+    for (auto& tr : panel) for (float& v : tr) v = g(rng);
+    auto t = Clock::now();
+    const segy::FkFilterPlan plan = segy::makeFkFilterPlan(128, ns, 4000.0, fk);
+    std::printf("  %-28s %8.1f ms\n", "f-k plan", seconds(t) * 1e3);
+    t = Clock::now();
+    const int panels = 50;
+    for (int r = 0; r < panels; ++r) {
+        auto copy = panel;
+        segy::fkFilterPanel(copy, plan);
+    }
+    std::printf("  %-28s %8.1f ms/panel (%.1f us/trace with 50%% overlap)\n", "f-k panel (128 traces)",
+                seconds(t) / panels * 1e3, seconds(t) / panels * 1e6 / 64.0);
+    segy::ThreadPool pool;
+    const int many = 512;
+    t = Clock::now();
+    pool.parallelFor(size_t(many), 1, [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i) {
+            auto copy = panel;
+            segy::fkFilterPanel(copy, plan);
+        }
+    });
+    std::printf("  %-28s %8.2f ms/panel effective (%u threads)\n", "f-k panel, parallel", seconds(t) / many * 1e3,
+                std::thread::hardware_concurrency());
+}
+
 int main(int argc, char** argv) {
     std::printf("SEG-Y native rewrite -- microbenchmarks\n");
     std::printf("AVX2 available: %s\n", segy::cpuSupportsAvx2() ? "yes" : "no");
     std::printf("hardware_concurrency: %u\n", std::thread::hardware_concurrency());
 
+    if (argc > 1 && std::string(argv[1]) == "processing") {
+        benchProcessing();
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "spectral") {
         benchSpectral();
         return 0;

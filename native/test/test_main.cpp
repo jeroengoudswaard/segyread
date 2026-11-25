@@ -995,7 +995,7 @@ void testWiggleEnvelopeMatchesBruteForceMinMax() {
     const segy::WiggleTrace& tr = layout.traces.front();
     CHECK(int(tr.linePoints.size()) == plotHeight * 2);
 
-    float clip = std::max(std::fabs(fx.pyramid.globalMin), std::fabs(fx.pyramid.globalMax));
+    float clip = segy::autoClip(fx.pyramid);
     float halfLane = float(plotWidth) / 2.0f; // exactly 1 selected trace
     double sampleSpan = view.sampleEnd - view.sampleStart;
     for (int y = 0; y < plotHeight; ++y) {
@@ -2190,6 +2190,18 @@ void testPhaseScan() {
     CHECK_NEAR(rr.kurtosis[120], double(rot.size()) * s4 / (s2 * s2), 1e-3 * rr.kurtosis[120]);
 }
 
+void testMutes() {
+    std::vector<float> x = {0, 0, 0, 1, -2, 0, 3, 0, 0};
+    const segy::LiveRange r = segy::liveRange(x.data(), x.size());
+    CHECK(r.first == 3 && r.last == 6);
+    std::vector<float> y(9, 5.0f);
+    segy::applyMute(y.data(), y.size(), r);
+    CHECK(y[2] == 0.0f && y[3] == 5.0f && y[5] == 5.0f && y[6] == 5.0f && y[7] == 0.0f);
+    std::vector<float> dead(5, 0.0f), z(5, 1.0f);
+    segy::applyMute(z.data(), z.size(), segy::liveRange(dead.data(), dead.size()));
+    CHECK(z == dead);
+}
+
 void testEffectiveClip() {
     segy::ManualClip none;
     segy::ManualClip v = segy::effectiveClip(none, 1500.0f, 4500.0f, nullptr);
@@ -2348,6 +2360,21 @@ void testProcessing() {
     segy::fkFilterPanel(flat2, 4000.0, band);
     segy::fkFilterPanel(dipping2, 4000.0, band);
     CHECK(energy(flat2) / flatBefore < 0.05);
+    // The planned (packed, cached-weight) path matches the direct one.
+    {
+        auto direct = panelWith(1.0 / 1300.0), planned = direct;
+        segy::fkFilterPanel(direct, 4000.0, fk);
+        const segy::FkFilterPlan plan = segy::makeFkFilterPlan(planned.size(), planned[0].size(), 4000.0, fk);
+        segy::fkFilterPanel(planned, plan);
+        double maxDiff = 0.0, peak = 0.0;
+        for (size_t x = 0; x < direct.size(); ++x) {
+            for (size_t i = 0; i < direct[x].size(); ++i) {
+                maxDiff = std::max(maxDiff, double(std::fabs(direct[x][i] - planned[x][i])));
+                peak = std::max(peak, double(std::fabs(direct[x][i])));
+            }
+        }
+        CHECK(peak > 0.0 && maxDiff / peak < 1e-4);
+    }
     CHECK(energy(dipping2) / dipBefore > 0.9);
     CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 1000.0, band), 1.0, 1e-12);
     CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 600.0, band), 0.0, 1e-12); // below 800 x 0.8
@@ -2647,6 +2674,7 @@ int main() {
     testDepthConversion();
     testProcessing();
     testEffectiveClip();
+    testMutes();
     testBandpassShapes();
     testPhaseScan();
     testSosFiltFiltMatchesScipy();

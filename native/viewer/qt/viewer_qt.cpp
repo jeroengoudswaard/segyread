@@ -223,7 +223,7 @@ SelectionBox* activeBoxMut(AppState& app) {
     return &app.selectionBoxes[size_t(app.activeBoxIndex)];
 }
 
-// Resolves a Histogram/Spectrum dialog's Full View/Selection radio into an
+// Resolves a Histogram/Spectrum dialog's Visible Data/Selection radio into an
 // actual trace/sample range plus the color its plot should draw in (white
 // for Full View, the active box's own color for Selection) -- shared by
 // computeAndShowHistogram/computeAndShowSpectrum so the two don't
@@ -234,8 +234,20 @@ struct AnalysisSource {
     QColor color;
 };
 AnalysisSource resolveAnalysisSource(const AppState& app, bool useSelection) {
-    AnalysisSource src{0, app.foreground->traceCount, 0, app.foreground->binHeader.samplesPerTrace,
+    // Without a box: the visible data, like every other analysis.
+    const int64_t traceCount = app.foreground->traceCount;
+    const int32_t sampleCount = app.foreground->binHeader.samplesPerTrace;
+    AnalysisSource src{std::clamp<int64_t>(int64_t(std::floor(app.view.traceStart)), 0, traceCount),
+                       std::clamp<int64_t>(int64_t(std::ceil(app.view.traceEnd)), 0, traceCount),
+                       std::clamp<int32_t>(int32_t(std::floor(app.view.sampleStart)), 0, sampleCount),
+                       std::clamp<int32_t>(int32_t(std::ceil(app.view.sampleEnd)), 0, sampleCount),
                        tc(QColor(Qt::white))};
+    if (src.traceEnd <= src.traceStart || src.sampleEnd <= src.sampleStart) {
+        src.traceStart = 0;
+        src.traceEnd = traceCount;
+        src.sampleStart = 0;
+        src.sampleEnd = sampleCount;
+    }
     if (!useSelection) return src;
     const SelectionBox* box = activeBox(app);
     if (!box || !box->complete) return src;
@@ -825,7 +837,7 @@ protected:
             double trace = traceStart_ + fraction * (traceEnd_ - traceStart_);
             painter.drawLine(x, plot.bottom(), x, plot.bottom() + 4);
             // Whole trace numbers (not 1.508e+04), as wide as they need.
-            const QString text = QString::number(qlonglong(std::llround(trace)));
+            const QString text = QString::number(qlonglong(std::llround(trace)) + 1); // 1-based for users
             const int tw = QFontMetrics(axisFont).horizontalAdvance(text) + 2;
             if (i == 0) {
                 painter.drawText(QRect(plot.left(), plot.bottom() + 3, tw, 15), Qt::AlignLeft | Qt::AlignVCenter, text);
@@ -986,13 +998,29 @@ void AmplitudeScaleWidget::paintEvent(QPaintEvent*) {
     // Signed labels with a real minus sign (U+2212); "+" only around a zero centre.
     // Whole numbers from 10 up, three significant digits below (small
     // amplitudes, e.g. after integration, would otherwise all read "0").
-    auto signedLabel = [](float value, bool plusSign) {
+    // Whatever does not fit the narrow column drops digits, then becomes
+    // 4.5k / 1.2M, so a label is never cut off.
+    const QFontMetrics labelMetrics(painter.font());
+    const int labelRoom = w - (barX + barW + kPad) - 2;
+    auto signedLabel = [&](float value, bool plusSign) {
         const double magnitude = std::fabs(double(value));
-        QString digits = magnitude >= 10.0 || magnitude == 0.0 ? QString::number(std::lround(magnitude))
-                                                               : QString::number(magnitude, 'g', 3);
-        if (digits == "0") return QString("0");
-        if (value < 0.0f) return QString(QChar(0x2212)) + digits;
-        return (plusSign ? QString("+") : QString()) + digits;
+        const QString sign = value < 0.0f ? QString(QChar(0x2212)) : plusSign ? QString("+") : QString();
+        auto fits = [&](const QString& text) { return labelMetrics.horizontalAdvance(text) <= labelRoom; };
+        if (magnitude == 0.0) return QString("0");
+        QStringList candidates;
+        if (magnitude >= 10.0) candidates << QString::number(std::lround(magnitude));
+        for (int digits = 3; digits >= 1; --digits) candidates << QString::number(magnitude, 'g', digits);
+        if (magnitude >= 1000.0) {
+            const bool mega = magnitude >= 1e6;
+            const double scaled = magnitude / (mega ? 1e6 : 1e3);
+            for (int digits = 3; digits >= 1; --digits) candidates << QString::number(scaled, 'g', digits) + (mega ? "M" : "k");
+        }
+        for (const QString& digits : candidates) {
+            if (digits.contains('e')) continue;
+            if (digits == "0") return QString("0");
+            if (fits(sign + digits)) return sign + digits;
+        }
+        return sign + candidates.last();
     };
     const bool zeroCentre = center_ == 0.0f;
     QString topLabel = signedLabel(center_ + posClip_, zeroCentre);
@@ -1271,7 +1299,7 @@ void ClipDialog::showEvent(QShowEvent* event) {
     const float dataMin = app_.foreground->pyramid.globalMin, dataMax = app_.foreground->pyramid.globalMax;
     segy::ManualClip clip = segy::effectiveClip(app_.display.manualClip, dataMin, dataMax, nullptr);
     if (!clip.enabled) {
-        const float rawClip = std::max(std::fabs(dataMin), std::fabs(dataMax));
+        const float rawClip = segy::autoClip(app_.foreground->pyramid);
         clip = segy::ManualClip{true, rawClip, rawClip, 0.0f};
     }
     float low = 0.0f, high = 1.0f;
@@ -1301,7 +1329,7 @@ HistogramDialog::HistogramDialog(AppState& app, QWidget* parent) : QDialog(paren
 
     QGroupBox* rangeGroup = new QGroupBox("Range");
     QHBoxLayout* rangeLayout = new QHBoxLayout(rangeGroup);
-    fullViewRadio_ = new QRadioButton("Full View");
+    fullViewRadio_ = new QRadioButton("Visible Data");
     selectionRadio_ = new QRadioButton("Selection");
     fullViewRadio_->setChecked(true);
     QButtonGroup* rangeButtons = new QButtonGroup(this);
@@ -1312,7 +1340,7 @@ HistogramDialog::HistogramDialog(AppState& app, QWidget* parent) : QDialog(paren
     layout->addWidget(rangeGroup);
 
     QHBoxLayout* binsLayout = new QHBoxLayout();
-    binsLayout->addWidget(new QLabel("Number of Bins:"));
+    binsLayout->addWidget(new QLabel("Number of Bins"));
     binsSpinBox_ = new QSpinBox();
     binsSpinBox_->setRange(2, 500);
     binsSpinBox_->setValue(app_.histogram.numBins);
@@ -1334,12 +1362,12 @@ HistogramDialog::HistogramDialog(AppState& app, QWidget* parent) : QDialog(paren
     layout->addWidget(clipGroup);
 
     QHBoxLayout* minMaxLayout = new QHBoxLayout();
-    minMaxLayout->addWidget(new QLabel("Min:"));
+    minMaxLayout->addWidget(new QLabel("Min"));
     minValueSpin_ = new QDoubleSpinBox();
     minValueSpin_->setRange(-1e9, 1e9);
     minValueSpin_->setDecimals(2);
     minMaxLayout->addWidget(minValueSpin_);
-    minMaxLayout->addWidget(new QLabel("Max:"));
+    minMaxLayout->addWidget(new QLabel("Max"));
     maxValueSpin_ = new QDoubleSpinBox();
     maxValueSpin_->setRange(-1e9, 1e9);
     maxValueSpin_->setDecimals(2);
@@ -1425,7 +1453,7 @@ SpectrumDialog::SpectrumDialog(AppState& app, QWidget* parent) : QDialog(parent)
 
     QGroupBox* rangeGroup = new QGroupBox("Range");
     QHBoxLayout* rangeLayout = new QHBoxLayout(rangeGroup);
-    fullViewRadio_ = new QRadioButton("Full View");
+    fullViewRadio_ = new QRadioButton("Visible Data");
     selectionRadio_ = new QRadioButton("Selection");
     fullViewRadio_->setChecked(true);
     QButtonGroup* rangeButtons = new QButtonGroup(this);
@@ -1460,7 +1488,7 @@ SpectrumDialog::SpectrumDialog(AppState& app, QWidget* parent) : QDialog(parent)
     updateUserValueEnabled();
 
     QHBoxLayout* smoothLayout = new QHBoxLayout();
-    smoothLayout->addWidget(new QLabel("Smooth (points):"));
+    smoothLayout->addWidget(new QLabel("Smooth (points)"));
     smoothCombo_ = new QComboBox();
     for (int points : kSpectrumSmoothPoints) smoothCombo_->addItem(QString::number(points), points);
     smoothLayout->addWidget(smoothCombo_);
@@ -1596,7 +1624,7 @@ DisplayParametersDialog::DisplayParametersDialog(AppState& app, QWidget* parent)
     leftColumn->addLayout(styleGroupsLayout);
 
     QHBoxLayout* blendingLayout = new QHBoxLayout();
-    blendingLayout->addWidget(new QLabel("Variable Density Blending:"));
+    blendingLayout->addWidget(new QLabel("Variable Density Blending"));
     blendingSpin_ = new QDoubleSpinBox();
     blendingSpin_->setRange(0.0, 100.0);
     blendingLayout->addWidget(blendingSpin_);
@@ -1840,19 +1868,19 @@ CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QHBoxLayout* aRow = new QHBoxLayout();
-    aRow->addWidget(new QLabel("Dataset A:"));
+    aRow->addWidget(new QLabel("Dataset A"));
     datasetACombo_ = new QComboBox();
     aRow->addWidget(datasetACombo_, 1);
     layout->addLayout(aRow);
 
     QHBoxLayout* bRow = new QHBoxLayout();
-    bRow->addWidget(new QLabel("Dataset B:"));
+    bRow->addWidget(new QLabel("Dataset B"));
     datasetBCombo_ = new QComboBox();
     bRow->addWidget(datasetBCombo_, 1);
     layout->addLayout(bRow);
 
     QHBoxLayout* opRow = new QHBoxLayout();
-    opRow->addWidget(new QLabel("Operation:"));
+    opRow->addWidget(new QLabel("Operation"));
     addRadio_ = new QRadioButton("Add");
     subtractRadio_ = new QRadioButton("Subtract");
     crossRadio_ = new QRadioButton("Cross-correlate");
@@ -1869,7 +1897,7 @@ CalculatorDialog::CalculatorDialog(QWidget* parent) : QDialog(parent) {
     layout->addLayout(opRow);
 
     QHBoxLayout* nameRow = new QHBoxLayout();
-    nameRow->addWidget(new QLabel("Output Name:"));
+    nameRow->addWidget(new QLabel("Output Name"));
     outputNameEdit_ = new QLineEdit();
     nameRow->addWidget(outputNameEdit_, 1);
     layout->addLayout(nameRow);
@@ -2140,7 +2168,7 @@ SaveSegyDialog::SaveSegyDialog(QWidget* parent) : QDialog(parent) {
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QHBoxLayout* fileRow = new QHBoxLayout();
-    fileRow->addWidget(new QLabel("Save As:"));
+    fileRow->addWidget(new QLabel("Save As"));
     fileNameEdit_ = new QLineEdit();
     fileRow->addWidget(fileNameEdit_, 1);
     QPushButton* browseButton = new QPushButton("Browse...");
@@ -2152,7 +2180,7 @@ SaveSegyDialog::SaveSegyDialog(QWidget* parent) : QDialog(parent) {
     datasetSummaryLabel_->setStyleSheet(themed("color: #9a9ca3;"));
     layout->addWidget(datasetSummaryLabel_);
 
-    layout->addWidget(new QLabel("EBCDIC Text Header Preview:"));
+    layout->addWidget(new QLabel("EBCDIC Text Header Preview"));
     ebcdicPreview_ = new QPlainTextEdit();
     ebcdicPreview_->setReadOnly(true);
     ebcdicPreview_->setLineWrapMode(QPlainTextEdit::NoWrap);
@@ -4575,21 +4603,21 @@ SegyOpenDialog::SegyOpenDialog(QWidget* parent) : QDialog(parent) {
 
     QVBoxLayout* layout = new QVBoxLayout(this);
 
-    QLabel* loadOptionsLabel = new QLabel("Load Options:");
+    QLabel* loadOptionsLabel = new QLabel("Load Options");
     loadOptionsLabel->setStyleSheet(themed("font-style: italic; color: #9a9ca3;"));
     layout->addWidget(loadOptionsLabel);
 
     QHBoxLayout* rangeRow = new QHBoxLayout();
     rangeCombo_ = new QComboBox();
     rangeCombo_->addItem("traceno");
-    rangeRow->addWidget(new QLabel("Range:"));
+    rangeRow->addWidget(new QLabel("Range"));
     rangeRow->addWidget(rangeCombo_);
-    rangeRow->addWidget(new QLabel("Min:"));
+    rangeRow->addWidget(new QLabel("Min"));
     minSpin_ = new QSpinBox();
     minSpin_->setRange(1, 1000000);
     minSpin_->setValue(1);
     rangeRow->addWidget(minSpin_);
-    rangeRow->addWidget(new QLabel("Max (0 = all):"));
+    rangeRow->addWidget(new QLabel("Max (0 = all)"));
     maxSpin_ = new QSpinBox();
     maxSpin_->setRange(0, 1000000);
     maxSpin_->setValue(0);
@@ -4614,7 +4642,7 @@ SegyOpenDialog::SegyOpenDialog(QWidget* parent) : QDialog(parent) {
         "loaded file was left at.");
     layout->addWidget(keepPrevClipCheck_);
 
-    QLabel* browseLabel = new QLabel("Open Seismic File:");
+    QLabel* browseLabel = new QLabel("Open Seismic File");
     browseLabel->setStyleSheet(themed("font-style: italic; color: #9a9ca3; margin-top: 8px;"));
     layout->addWidget(browseLabel);
 
@@ -4724,7 +4752,7 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QHBoxLayout* toolbarRow = new QHBoxLayout();
-    toolbarRow->addWidget(new QLabel("Toolbar Position:"));
+    toolbarRow->addWidget(new QLabel("Toolbar Position"));
     toolbarPositionCombo_ = new QComboBox();
     toolbarPositionCombo_->addItem("Left", int(ToolbarPosition::Left));
     toolbarPositionCombo_->addItem("Top", int(ToolbarPosition::Top));
@@ -4780,7 +4808,9 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
         grid->addWidget(heading, row, 0, blockRows, 1, Qt::AlignTop | Qt::AlignLeft);
         for (size_t k = i; k < end; ++k) {
             QCheckBox* check = new QCheckBox(toolbarItems[k].label);
-            check->setChecked(!initial.hiddenToolbarItems.contains(toolbarItems[k].id));
+            check->setChecked(toolbarItems[k].optional ? initial.shownToolbarExtras.contains(toolbarItems[k].id)
+                                                       : !initial.hiddenToolbarItems.contains(toolbarItems[k].id));
+            check->setProperty("optional", toolbarItems[k].optional);
             const int offset = int(k - i);
             grid->addWidget(check, row + offset / 2, 1 + offset % 2); // left to right, then down
             toolbarItemChecks_.push_back({toolbarItems[k].id, check});
@@ -4790,13 +4820,16 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     }
     buttonsLayout->addLayout(grid);
     QHBoxLayout* buttonsRow = new QHBoxLayout();
-    QPushButton* showAll = new QPushButton("Show All");
+    QPushButton* showAll = new QPushButton("Default Buttons");
+    showAll->setToolTip("Default Buttons: the standard set, no optional buttons");
     connect(showAll, &QPushButton::clicked, this, [this]() {
-        for (auto& entry : toolbarItemChecks_) entry.second->setChecked(true);
+        for (auto& entry : toolbarItemChecks_) entry.second->setChecked(!entry.second->property("optional").toBool());
     });
     buttonsRow->addWidget(showAll);
     buttonsRow->addStretch();
-    QLabel* buttonsHint = new QLabel("Hidden buttons stay available from the menus.");
+    QLabel* buttonsHint = new QLabel("Every button is also in a menu. Analysis, Processing, Attributes, Horizons "
+                                     "and Data buttons are optional: tick the ones you use often.");
+    buttonsHint->setWordWrap(true);
     buttonsHint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
     buttonsRow->addWidget(buttonsHint);
     buttonsLayout->addLayout(buttonsRow);
@@ -4868,7 +4901,7 @@ PreferencesDialog::PreferencesDialog(const Preferences& initial, const std::vect
     layout->addWidget(snGroup);
 
     QHBoxLayout* scaleRow = new QHBoxLayout();
-    scaleRow->addWidget(new QLabel("UI Scaling:"));
+    scaleRow->addWidget(new QLabel("UI Scaling"));
     uiScaleSpin_ = new QSpinBox();
     uiScaleSpin_->setRange(50, 300);
     uiScaleSpin_->setSingleStep(25);
@@ -4932,7 +4965,9 @@ Preferences PreferencesDialog::currentPreferences() const {
     prefs.uiScalePercent = uiScaleSpin_->value();
 #endif
     for (const auto& entry : toolbarItemChecks_) {
-        if (!entry.second->isChecked()) prefs.hiddenToolbarItems.append(entry.first);
+        const bool optional = entry.second->property("optional").toBool();
+        if (optional && entry.second->isChecked()) prefs.shownToolbarExtras.append(entry.first);
+        if (!optional && !entry.second->isChecked()) prefs.hiddenToolbarItems.append(entry.first);
     }
     segy::SigcorParams& sn = prefs.signalNoise;
     sn = initialSignalNoise_; // Skipped traces/Min correlation: MainWindow keeps the window's
@@ -5177,7 +5212,7 @@ SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(a
         }
 
         menu.addSeparator();
-        QAction* flipColorMapAction = menu.addAction("Flip Color Map");
+        QAction* flipColorMapAction = menu.addAction("Flip Colour Map");
         flipColorMapAction->setCheckable(true);
         flipColorMapAction->setChecked(app_.display.colorScaleFlipped);
         connect(flipColorMapAction, &QAction::triggered, this, [this](bool flipped) {
@@ -5188,15 +5223,7 @@ SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(a
 
         menu.addSeparator();
         QAction* clipAction = menu.addAction("Clip...");
-        connect(clipAction, &QAction::triggered, this, [this]() {
-            if (!clipDialog_) {
-                clipDialog_ = new ClipDialog(app_, this);
-                clipDialog_->setChangedCallback([this]() { notifyStateChanged(); });
-            }
-            clipDialog_->show();
-            clipDialog_->raise();
-            clipDialog_->activateWindow();
-        });
+        connect(clipAction, &QAction::triggered, this, [this]() { openClipDialog(); });
 
         QAction* lockScaleAction = menu.addAction("Lock Scale");
         lockScaleAction->setCheckable(true);
@@ -5224,6 +5251,17 @@ void SegyCanvas::setAmplitudeScale(float posClip, float negClip, bool visible, s
     amplitudeScale_->setCenter(app_.loaded ? displayedClip(app_).center : 0.0f,
                                app_.display.frequencyAxis ? "dB" : QString());
     amplitudeScale_->setVisible(visible);
+}
+
+void SegyCanvas::openClipDialog() {
+    if (!app_.loaded) return;
+    if (!clipDialog_) {
+        clipDialog_ = new ClipDialog(app_, this);
+        clipDialog_->setChangedCallback([this]() { notifyStateChanged(); });
+    }
+    clipDialog_->show();
+    clipDialog_->raise();
+    clipDialog_->activateWindow();
 }
 
 void SegyCanvas::setDatasetSlotLabels(const QString& foregroundLabel, const QString& backgroundLabel) {
@@ -6822,6 +6860,15 @@ MainWindow::MainWindow() : QMainWindow() {
     QAction* deconAction = processingMenu->addAction("D&econvolution...");
     connect(deconAction, &QAction::triggered, this, &MainWindow::openDeconvolution);
     processingMenu->addSeparator();
+    QAction* amplitudeAction = processingMenu->addAction("A&mplitude Processing...");
+    connect(amplitudeAction, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
+    QAction* integrationAction = processingMenu->addAction("&Integration...");
+    connect(integrationAction, &QAction::triggered, this, [this]() { openTraceDerivative(true); });
+    QAction* differentiationAction = processingMenu->addAction("&Differentiation...");
+    connect(differentiationAction, &QAction::triggered, this, [this]() { openTraceDerivative(false); });
+    QAction* scaleAction = processingMenu->addAction("&Scale...");
+    connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
+    processingMenu->addSeparator();
     // Attributes: no questions asked, except the rotation angle.
     QMenu* attributesMenu = processingMenu->addMenu("&Attributes");
     QAction* envelopeAction = attributesMenu->addAction("&Envelope");
@@ -6833,14 +6880,6 @@ MainWindow::MainWindow() : QMainWindow() {
     attributesMenu->addSeparator();
     QAction* rotationAction = attributesMenu->addAction("Phase &Rotation...");
     connect(rotationAction, &QAction::triggered, this, [this]() { runAttribute(3); });
-    QAction* integrationAction = processingMenu->addAction("&Integration...");
-    connect(integrationAction, &QAction::triggered, this, [this]() { openTraceDerivative(true); });
-    QAction* differentiationAction = processingMenu->addAction("&Differentiation...");
-    connect(differentiationAction, &QAction::triggered, this, [this]() { openTraceDerivative(false); });
-    QAction* scaleAction = processingMenu->addAction("&Scale...");
-    connect(scaleAction, &QAction::triggered, this, &MainWindow::openTraceScale);
-    QAction* amplitudeAction = processingMenu->addAction("A&mplitude Processing...");
-    connect(amplitudeAction, &QAction::triggered, this, &MainWindow::openAmplitudeProcessingDialog);
     processingMenu->addSeparator();
     QAction* timeDepthAction = processingMenu->addAction("&Time-Depth Conversion...");
     connect(timeDepthAction, &QAction::triggered, this, &MainWindow::openTimeDepthConversion);
@@ -7258,6 +7297,110 @@ MainWindow::MainWindow() : QMainWindow() {
         refreshToolChrome();
     });
 
+    // Optional buttons: off until switched on in File > Preferences >
+    // Toolbar Buttons, each doing exactly what its menu item does. The
+    // default toolbar stays lean; these cover quick, repeated needs.
+    toolbarSeparators_.push_back(toolbar->addSeparator());
+    struct ExtraButton {
+        QString id, label, tip;
+        QStringList paths;
+        std::function<void()> run;
+    };
+    auto whenLoaded = [this](std::function<void()> run) {
+        return [this, run]() {
+            if (!activePanel_->app.loaded) {
+                flashStatusMessage("No data selected");
+                return;
+            }
+            run();
+        };
+    };
+    const std::vector<ExtraButton> extras = {
+        {"open", "Open", "Open: a SEG-Y file",
+         {"M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2"},
+         [this]() { openFile(); }},
+        {"saveSegy", "Save As SEG-Y", "Save As SEG-Y: the active panel's dataset to a file",
+         {"M6 4h10l4 4v10a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2v-12a2 2 0 0 1 2 -2", "M12 14m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0",
+          "M14 4l0 4l-6 0l0 -4"},
+         [this]() { openSaveSegyDialog(); }},
+        {"textHeader", "Text Header", "Text Header: the EBCDIC header",
+         {"M14 3v4a1 1 0 0 0 1 1h4", "M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2", "M9 17h6",
+          "M9 13h6"},
+         [this]() { ebcdicHeaderAction_->trigger(); }},
+        {"binaryHeader", "Binary Header", "Binary Header: the 400-byte file header",
+         {"M14 3v4a1 1 0 0 0 1 1h4", "M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2",
+          "M9 12h1v5", "M14 12h1v5"},
+         [this]() { binaryHeaderAction_->trigger(); }},
+        {"headerRanges", "Trace Header Ranges", "Trace Header Ranges: min and max of every header field",
+         {"M4 5h16v14h-16z", "M4 10h16", "M10 5v14"}, whenLoaded([this]() { openTraceHeaderRanges(); })},
+        {"traceInspector", "Trace Inspector", "Trace Inspector: every header value of one trace",
+         {"M8 3v18", "M15 15m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0", "M17.2 17.2l3 3"},
+         whenLoaded([this]() { openTraceInspector(); })},
+        {"clip", "Clip", "Clip: the amplitudes at the two ends of the colour scale",
+         {"M3 6h18", "M3 18h18", "M3 12l3 -6h4l4 12h4l3 -6"}, whenLoaded([this]() { activePanel_->canvas->openClipDialog(); })},
+        {"signalNoise", "Signal/Noise", "Signal/Noise: signal and noise spectra of the view",
+         {"M3 12h3l2 -6l3 12l3 -9l2 3h5"}, whenLoaded([this]() { computeAndShowSignalNoise(activePanel_); })},
+        {"fkDisplay", "f-k Display", "f-k Display: frequency against wavenumber of the view",
+         {"M12 20l-8 -16", "M12 20l8 -16", "M12 20v-16", "M4 20h16"}, [this]() { computeAndShowFk(activePanel_); }},
+        {"phaseEstimate", "Phase Estimate", "Phase Estimate: the rotation that makes the data simplest",
+         {"M12 12m-8 0a8 8 0 1 0 16 0a8 8 0 1 0 -16 0", "M12 12l5 -5", "M12 12h8"},
+         [this]() { computeAndShowPhaseEstimate(activePanel_); }},
+        {"bandpass", "Bandpass Filter", "Bandpass Filter: Butterworth or trapezoid", {"M3 19l5 -12h8l5 12", "M3 19h18"},
+         [this]() { openBandpassDialog(); }},
+        {"fkFilter", "f-k Filter", "f-k Filter: pass or reject a velocity range", {"M4 4h16l-6 8v6l-4 2v-8z"},
+         [this]() { openFkFilter(); }},
+        {"whitening", "Spectral Whitening", "Spectral Whitening: a flat spectrum between two frequencies",
+         {"M5 18v-10", "M9 18v-10", "M13 18v-10", "M17 18v-10", "M3 18h18"}, [this]() { openSpectralWhitening(); }},
+        {"decon", "Deconvolution", "Deconvolution: gapped or spiking", {"M3 18h7l2 -14l2 14h7"},
+         [this]() { openDeconvolution(); }},
+        {"amplitudeProcessing", "Amplitude Processing", "Amplitude Processing: gain curve and AGC into a new dataset",
+         {"M3 20l18 -14", "M3 20h18", "M17 20v-7"}, [this]() { openAmplitudeProcessingDialog(); }},
+        {"envelope", "Envelope", "Envelope: the amplitude of the complex trace",
+         {"M3 7c6 -3 12 -3 18 0", "M3 17c6 3 12 3 18 0", "M3 12c1.5 -4 3 -4 4.5 0s3 4 4.5 0s3 -4 4.5 0s3 4 4.5 0"},
+         [this]() { runAttribute(0); }},
+        {"instPhase", "Instantaneous Phase", "Instantaneous Phase: the phase of the complex trace",
+         {"M3 18l6 -12v12l6 -12v12l6 -12"}, [this]() { runAttribute(1); }},
+        {"instFrequency", "Instantaneous Frequency", "Instantaneous Frequency: the phase's rate of change",
+         {"M3 12c1.5 -7 3 -7 4 0s2 7 3 0s1.5 -7 2.3 0s1.3 7 2 0s1 -7 1.6 0s0.8 7 1.4 0s0.6 -7 1.2 0s0.5 7 1 0"},
+         [this]() { runAttribute(2); }},
+        {"phaseRotation", "Phase Rotation", "Phase Rotation: rotate the phase by a constant angle",
+         {"M20 11a8 8 0 1 0 -2.3 5.7", "M20 4v7h-7"}, [this]() { runAttribute(3); }},
+        {"calculator", "Calculator", "Calculator: add, subtract or cross-correlate two datasets",
+         {"M6 3h12v18h-12z", "M9 7h6", "M9 12h1", "M14 12h1", "M9 16h1", "M14 16h1"},
+         [this]() { openCalculatorDialog(); }},
+        {"timeDepth", "Time-Depth Conversion", "Time-Depth Conversion: with a velocity dataset",
+         {"M8 3v18", "M8 6h4", "M8 10h3", "M8 14h4", "M8 18h3", "M17 5v14", "M14 16l3 3l3 -3"},
+         [this]() { openTimeDepthConversion(); }},
+        {"seabed", "Auto-pick Seabed", "Auto-pick Seabed: the first strong reflection on every trace",
+         {"M3 13c3 -3 6 -3 9 0s6 3 9 0", "M3 19h18", "M7 8v1", "M12 8v1", "M17 8v1"},
+         whenLoaded([this]() { autoPickSeabed(activePanel_); })},
+        {"horizonManager", "Horizon Manager", "Horizon Manager: show, colour, rename and delete horizons",
+         {"M4 8l8 -4l8 4l-8 4z", "M4 12l8 4l8 -4", "M4 16l8 4l8 -4"}, [this]() { openHorizonManager(); }},
+    };
+    std::vector<ToolbarItem> extraItems;
+    for (const ExtraButton& extra : extras) {
+        QAction* action = toolbar->addAction(iconFromPaths(extra.paths), extra.label);
+        action->setToolTip(extra.tip);
+        connect(action, &QAction::triggered, this, extra.run);
+        extraItems.push_back({extra.id, extra.label, 5, {action}, true});
+        extraToolbarActions_.push_back(action);
+    }
+    // Reverse Polarity: a toggle, synced to the active panel.
+    reversePolarityAction_ = toolbar->addAction(iconFromPaths({"M3 12c1.5 -6 3 -6 4.5 0s3 6 4.5 0", "M18 4v7",
+                                                               "M15.5 6.5l2.5 -2.5l2.5 2.5", "M18 20v-7",
+                                                               "M15.5 17.5l2.5 2.5l2.5 -2.5"}),
+                                                "Reverse Polarity");
+    reversePolarityAction_->setCheckable(true);
+    reversePolarityAction_->setToolTip("Reverse Polarity: show every sample with the opposite sign");
+    connect(reversePolarityAction_, &QAction::triggered, this, [this](bool on) {
+        for (Panel* p : targetPanels()) {
+            p->app.display.reversePolarity = on;
+            p->canvas->update();
+        }
+    });
+    extraItems.push_back({"reversePolarity", "Reverse Polarity", 5, {reversePolarityAction_}, true});
+    extraToolbarActions_.push_back(reversePolarityAction_);
+
     // Pushes everything after it to the toolbar's far end (right when
     // horizontal, bottom when vertical -- Qt lays a QToolBar's widgets out
     // along whichever axis matches its current orientation) -- just the
@@ -7288,6 +7431,8 @@ MainWindow::MainWindow() : QMainWindow() {
         splitViewAction_,   lockAction_, lockViewAction_,
         sidebarToggleAction_,
     };
+    toolbarOverflowCandidates_.insert(toolbarOverflowCandidates_.end() - 1, extraToolbarActions_.begin(),
+                                      extraToolbarActions_.end());
     // A QToolButton parented to toolbar_ but deliberately NOT added via
     // toolbar->addWidget() -- it's positioned manually in
     // updateToolbarOverflow() instead, fused to the bottom/right edge of
@@ -7348,8 +7493,10 @@ MainWindow::MainWindow() : QMainWindow() {
         {"splitView", "Split View", 4, {splitViewAction_}},
         {"lock", "Lock Panels", 4, {lockAction_}},
         {"lockView", "Lock View", 4, {lockViewAction_}},
-        {"sidebar", "Sidebar Toggle", 5, {sidebarToggleAction_}},
     };
+    // Group 5: the optional buttons; group 6 is past the spacer.
+    toolbarItems_.insert(toolbarItems_.end(), extraItems.begin(), extraItems.end());
+    toolbarItems_.push_back({"sidebar", "Sidebar Toggle", 6, {sidebarToggleAction_}});
 
     // Right-clicking the toolbar does nothing by itself: which buttons
     // show is set only in Edit > Preferences (the user's call -- a button's
@@ -7408,7 +7555,7 @@ MainWindow::MainWindow() : QMainWindow() {
     viewMenu->addSeparator();
     QMenu* gainMenu = viewMenu->addMenu("&Gain");
     QAction* gainUpMenuAction = gainMenu->addAction("&Increase (+3 dB)");
-    gainUpMenuAction->setShortcut(QKeySequence(Qt::Key_Plus));
+    gainUpMenuAction->setShortcuts({QKeySequence(Qt::Key_Plus), QKeySequence(Qt::Key_Equal)});
     connect(gainUpMenuAction, &QAction::triggered, this,
             [this]() { setGainDb(std::clamp(app_->display.gainDb + 3.0, -6.0, 24.0)); });
     QAction* gainDownMenuAction = gainMenu->addAction("&Decrease (-3 dB)");
@@ -7421,6 +7568,9 @@ MainWindow::MainWindow() : QMainWindow() {
     addMenuMirror(viewMenu, agcAction_, "&AGC");
     QAction* agcSettingsAction = viewMenu->addAction("AGC &Window and Level...");
     connect(agcSettingsAction, &QAction::triggered, this, &MainWindow::openAgcSettings);
+    QAction* clipMenuAction = viewMenu->addAction("&Clip...");
+    connect(clipMenuAction, &QAction::triggered, this, [this]() { activePanel_->canvas->openClipDialog(); });
+    addMenuMirror(viewMenu, reversePolarityAction_, "&Reverse Polarity");
     addMenuMirror(viewMenu, gainDetailAction_, "Display &Parameters...");
     viewMenu->addSeparator();
     // Rebuilt on every open, from whichever panel is active right then.
@@ -7637,10 +7787,14 @@ bool MainWindow::isToolbarActionWanted(QAction* action) const {
     if ((action == gainUpAction_ || action == gainDownAction_) && !vertical) return false;
     for (const ToolbarItem& item : toolbarItems_) {
         if (std::find(item.actions.begin(), item.actions.end(), action) != item.actions.end()) {
-            return !prefs_.hiddenToolbarItems.contains(item.id);
+            return isToolbarItemShown(item);
         }
     }
     return true;
+}
+
+bool MainWindow::isToolbarItemShown(const ToolbarItem& item) const {
+    return item.optional ? prefs_.shownToolbarExtras.contains(item.id) : !prefs_.hiddenToolbarItems.contains(item.id);
 }
 
 void MainWindow::applyToolbarCustomization() {
@@ -7658,7 +7812,7 @@ void MainWindow::applyToolbarCustomization() {
     const int lastSeparatedGroup = int(toolbarSeparators_.size());
     auto groupHasShownItem = [this](int group) {
         for (const ToolbarItem& item : toolbarItems_) {
-            if (item.group == group && !prefs_.hiddenToolbarItems.contains(item.id)) return true;
+            if (item.group == group && isToolbarItemShown(item)) return true;
         }
         return false;
     };
@@ -7750,6 +7904,8 @@ void MainWindow::loadPreferences() {
     }
     prefs_.hiddenToolbarItems = settings.value("toolbarHiddenItems").toStringList();
     prefs_.hiddenToolbarItems.removeAll(QString()); // an empty list can read back as {""}
+    prefs_.shownToolbarExtras = settings.value("toolbarShownExtras").toStringList();
+    prefs_.shownToolbarExtras.removeAll(QString());
     segy::SigcorParams& sn = prefs_.signalNoise;
     const segy::SigcorParams defaults;
     // sigcor/*: the SPECTR/STNDRD reference conventions. The older
@@ -7773,6 +7929,7 @@ void MainWindow::savePreferences() {
     settings.setValue("uiScalePercent", prefs_.uiScalePercent);
     settings.setValue("datasetLabelPosition", int(datasetLabelPosition_));
     settings.setValue("toolbarHiddenItems", prefs_.hiddenToolbarItems);
+    settings.setValue("toolbarShownExtras", prefs_.shownToolbarExtras);
     const segy::SigcorParams& sn = prefs_.signalNoise;
     settings.remove("signalNoise"); // the pre-reference keys, see loadPreferences
     settings.setValue("sigcor/option", sn.option == segy::SigcorOption::Autcor ? "AUTCOR" : "SPECTR");
@@ -8070,6 +8227,7 @@ void MainWindow::setAmplitudeProcessing(const segy::AmplitudeProcessing& process
 
 void MainWindow::refreshAmplitudeProcessingControls() {
     agcAction_->setChecked(app_->display.processing.agcEnabled);
+    if (reversePolarityAction_) reversePolarityAction_->setChecked(app_->display.reversePolarity);
 }
 
 void MainWindow::openAgcSettings() {
@@ -8448,8 +8606,7 @@ void MainWindow::refreshAmplitudeScale() {
         // included. Guarded on `loaded`: foreground is null before a load.
         float posClip = 1.0f, negClip = 1.0f;
         if (p->app.loaded) {
-            float rawClip = std::max(std::fabs(p->app.foreground->pyramid.globalMin),
-                                     std::fabs(p->app.foreground->pyramid.globalMax));
+            float rawClip = segy::autoClip(p->app.foreground->pyramid);
             segy::displayClipPosNeg(rawClip, p->app.display.gainDb, displayedClip(p->app),
                                     &p->app.display.processing, &posClip, &negClip);
         }
@@ -8459,8 +8616,7 @@ void MainWindow::refreshAmplitudeScale() {
             // Octave panels follow the main display's clip live (without
             // AGC/computed gain, which the bands don't get).
             float bandPos = 1.0f, bandNeg = 1.0f;
-            const float rawClip = std::max(std::fabs(p->app.foreground->pyramid.globalMin),
-                                           std::fabs(p->app.foreground->pyramid.globalMax));
+            const float rawClip = segy::autoClip(p->app.foreground->pyramid);
             segy::displayClipPosNeg(rawClip, p->app.display.gainDb, displayedClip(p->app), nullptr, &bandPos, &bandNeg);
             octaveBandDialog_->setMainClip(bandPos, bandNeg);
         }
@@ -8781,8 +8937,10 @@ void MainWindow::runBandpass(AppState& source, const BandpassRequest& request, c
                     out.samples.resize(size_t(samplesPerTrace));
                     segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
                                         ds->binHeader.formatCode);
+                    const segy::LiveRange live = segy::liveRange(out.samples.data(), out.samples.size());
                     if (trapezoid) segy::ormsbyFilter(out.samples, sampleIntervalUs, ormsby);
                     else segy::sosFiltFilt(sos, out.samples, -1, padding);
+                    segy::applyMute(out.samples.data(), out.samples.size(), live);
                 },
                 backgroundTaskDone_, writeError.get());
         },
@@ -8890,7 +9048,7 @@ void MainWindow::computeAndShowOctaveBands(Panel* sourcePanel, int minFreqHz, in
     {
         // The main display's clip, exactly as the seismic renderer gets it.
         // Computed gain/AGC is not applied to the bands, so it is left out.
-        const float rawClip = std::max(std::fabs(app.foreground->pyramid.globalMin), std::fabs(app.foreground->pyramid.globalMax));
+        const float rawClip = segy::autoClip(app.foreground->pyramid);
         segy::displayClipPosNeg(rawClip, app.display.gainDb, displayedClip(app), nullptr, &result->mainClipPos,
                                 &result->mainClipNeg);
     }
@@ -9125,7 +9283,11 @@ void MainWindow::openTraceScale() {
                       });
 }
 
-constexpr int kFkFilterPanelTraces = 128; // f-k filter panel width (50% overlap)
+// f-k filter panels: 128 traces every 96 (25% overlap). The overlapping
+// 32 traces blend with sin^2 / cos^2 ramps (they add up to 1); the middle
+// 64 traces of a panel are used as they are.
+constexpr int kFkFilterPanelTraces = 128;
+constexpr int kFkFilterPanelHop = 96;
 
 namespace {
 // One field of a processing dialog.
@@ -9364,7 +9526,7 @@ void MainWindow::openFkFilter() {
                                      "between Min and Max velocity; Max none = no upper limit, which includes flat "
                                      "events. Reject 0 to 1500 m/s removes steep dips: ground roll, steep noise, "
                                      "diffraction tails. The range is kept or removed in full; the taper lies "
-                                     "outside it. Along consecutive traces in panels of %1 traces with 50% overlap. "
+                                     "outside it. Along consecutive traces in panels of %1 traces with 25% overlap. "
                                      "Trace spacing %2.")
                                  .arg(kFkFilterPanelTraces)
                                  .arg(estimated > 0.0 ? QString("from the coordinates: %1 m").arg(compactNumber(estimated))
@@ -9404,14 +9566,15 @@ void MainWindow::openFkFilter() {
     runBackgroundTask(
         QString("f-k Filter: %1").arg(QString::fromStdString(ds->name)),
         [this, ds, p, samplesPerTrace, textHeader, outPath, outcome]() {
-            // Panels of N traces every N/2, weighted by sin^2 across the panel
-            // (two overlapping weights add up to 1); each output chunk adds
-            // the panels that touch it.
-            const int64_t n = kFkFilterPanelTraces, hop = n / 2;
+            // Panels of N traces every `hop`, blended across their overlap
+            // (see kFkFilterPanelHop); each output chunk adds the panels
+            // that touch it.
+            const int64_t n = kFkFilterPanelTraces, hop = kFkFilterPanelHop;
             const int64_t traceCount = ds->traceCount;
             const double intervalUs = ds->binHeader.sampleIntervalUs;
             backgroundTaskTotal_ = traceCount;
             segy::ThreadPool pool;
+            const segy::FkFilterPlan plan = segy::makeFkFilterPlan(size_t(n), size_t(samplesPerTrace), intervalUs, p);
             auto decode = [&](int64_t t, float* out) {
                 const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
                 segy::decodeSamples(base + segy::kTraceHeaderSize, out, size_t(samplesPerTrace), ds->binHeader.formatCode);
@@ -9432,34 +9595,55 @@ void MainWindow::openFkFilter() {
                         const int64_t start = (pid - 1) * hop;
                         if (start < end && start + n > begin && start < traceCount) panelIds.push_back(pid);
                     }
-                    std::vector<std::vector<std::vector<float>>> results(panelIds.size());
-                    pool.parallelFor(panelIds.size(), 1, [&](size_t b, size_t e) {
-                        for (size_t i = b; i < e; ++i) {
-                            const int64_t start = (panelIds[i] - 1) * hop;
-                            std::vector<std::vector<float>> panelTraces(size_t(n), std::vector<float>(size_t(samplesPerTrace), 0.0f));
-                            for (int64_t k = 0; k < n; ++k) {
-                                const int64_t t = start + k;
-                                if (t >= 0 && t < traceCount) decode(t, panelTraces[size_t(k)].data());
+                    // Even panels never overlap each other, nor do odd ones: each
+                    // parity runs fully in parallel and adds straight into the
+                    // chunk, no stored panel results.
+                    const double pi = 3.14159265358979323846;
+                    std::vector<float> taper(static_cast<size_t>(n));
+                    const int64_t ramp = n - hop;
+                    for (int64_t k = 0; k < n; ++k) {
+                        double w = 1.0;
+                        if (k < ramp) w = std::pow(std::sin(0.5 * pi * (double(k) + 0.5) / double(ramp)), 2.0);
+                        else if (k >= hop) w = std::pow(std::cos(0.5 * pi * (double(k - hop) + 0.5) / double(ramp)), 2.0);
+                        taper[size_t(k)] = float(w);
+                    }
+                    for (int parity = 0; parity < 2; ++parity) {
+                        std::vector<int64_t> ids;
+                        for (int64_t pid : panelIds) if (pid % 2 == parity) ids.push_back(pid);
+                        pool.parallelFor(ids.size(), 1, [&](size_t b, size_t e) {
+                            std::vector<std::vector<float>> panelTraces(static_cast<size_t>(n), std::vector<float>(static_cast<size_t>(samplesPerTrace)));
+                            for (size_t i = b; i < e; ++i) {
+                                const int64_t start = (ids[i] - 1) * hop;
+                                for (int64_t k = 0; k < n; ++k) {
+                                    const int64_t t = start + k;
+                                    if (t >= 0 && t < traceCount) decode(t, panelTraces[size_t(k)].data());
+                                    else std::fill(panelTraces[size_t(k)].begin(), panelTraces[size_t(k)].end(), 0.0f);
+                                }
+                                segy::fkFilterPanel(panelTraces, plan);
+                                for (int64_t k = 0; k < n; ++k) {
+                                    const int64_t t = start + k;
+                                    if (t < begin || t >= end) continue;
+                                    const float w = taper[size_t(k)];
+                                    float* dst = chunk[size_t(t - begin)].samples.data();
+                                    const float* src = panelTraces[size_t(k)].data();
+                                    for (int sIdx = 0; sIdx < samplesPerTrace; ++sIdx) dst[sIdx] += w * src[sIdx];
+                                }
                             }
-                            segy::fkFilterPanel(panelTraces, intervalUs, p);
-                            results[i] = std::move(panelTraces);
+                        });
+                    }
+                    // The input's mutes stay: f-k filtering smears energy into a
+                    // muted water column, which AGC would then show at full scale.
+                    pool.parallelFor(size_t(end - begin), 256, [&](size_t b, size_t e) {
+                        std::vector<float> input(static_cast<size_t>(samplesPerTrace));
+                        for (size_t i = b; i < e; ++i) {
+                            decode(begin + int64_t(i), input.data());
+                            segy::WriteTrace& out = chunk[i];
+                            segy::applyMute(out.samples.data(), out.samples.size(), segy::liveRange(input.data(), input.size()));
                         }
                     });
-                    const double pi = 3.14159265358979323846;
-                    for (size_t i = 0; i < panelIds.size(); ++i) {
-                        const int64_t start = (panelIds[i] - 1) * hop;
-                        for (int64_t k = 0; k < n; ++k) {
-                            const int64_t t = start + k;
-                            if (t < begin || t >= end) continue;
-                            const float w = float(std::pow(std::sin(pi * (double(k) + 0.5) / double(n)), 2.0));
-                            std::vector<float>& dst = chunk[size_t(t - begin)].samples;
-                            const std::vector<float>& src = results[i][size_t(k)];
-                            for (int s = 0; s < samplesPerTrace; ++s) dst[size_t(s)] += w * src[size_t(s)];
-                        }
-                    }
                     backgroundTaskDone_ = end;
                 },
-                &outcome->error, 4096);
+                &outcome->error, 8192);
         },
         [this, panel, outPath, history, outcome]() {
             if (!outcome->ok) {
@@ -9511,7 +9695,10 @@ void MainWindow::runTraceTransform(Panel* panel, const QString& title, const QSt
                     out.samples.resize(size_t(samplesPerTrace));
                     segy::decodeSamples(traceBase + segy::kTraceHeaderSize, out.samples.data(), size_t(samplesPerTrace),
                                         ds->binHeader.formatCode);
+                    // Mutes (a water column, a top mute) stay as they were.
+                    const segy::LiveRange live = segy::liveRange(out.samples.data(), out.samples.size());
                     transform(out.samples, intervalUs);
+                    segy::applyMute(out.samples.data(), out.samples.size(), live);
                 },
                 backgroundTaskDone_, writeError.get());
         },
@@ -9595,16 +9782,37 @@ void MainWindow::openPreferencesDialog() {
         // Buttons section (finer than the toolbar's own separators,
         // which lump analysis, headers and panel controls together).
         auto categoryFor = [](const QString& id) -> QString {
-            if (id == "zoom" || id == "mooz") return "Zoom";
-            if (id == "pan" || id == "boxSelect" || id == "pick") return "Tools";
-            if (id == "seismicMode" || id == "flipHorizontal" || id == "idents") return "Display";
-            if (id == "displayParameters" || id == "gain" || id == "agc") return "Amplitude";
-            if (id == "spectrum" || id == "histogram" || id == "octaveBands" || id == "autocorrelation" || id == "xf")
-                return "Analysis";
-            if (id == "textHeader" || id == "binaryHeader") return "Headers";
-            return "Panels"; // splitView, lock, sidebar
+            static const QStringList zoom = {"mooz", "fullView"};
+            static const QStringList tools = {"pan", "boxSelect", "pick"};
+            static const QStringList display = {"seismicMode", "flipHorizontal", "idents", "clip", "reversePolarity"};
+            static const QStringList amplitude = {"displayParameters", "gain", "agc"};
+            static const QStringList analysis = {"spectrum", "histogram", "octaveBands", "autocorrelation", "xf",
+                                                 "signalNoise", "fkDisplay", "phaseEstimate"};
+            static const QStringList processing = {"bandpass", "fkFilter", "whitening", "decon", "amplitudeProcessing",
+                                                   "calculator", "timeDepth"};
+            static const QStringList attributes = {"envelope", "instPhase", "instFrequency", "phaseRotation"};
+            static const QStringList horizons = {"seabed", "horizonManager"};
+            static const QStringList data = {"open", "saveSegy", "textHeader", "binaryHeader", "headerRanges",
+                                             "traceInspector"};
+            if (zoom.contains(id)) return "Zoom";
+            if (tools.contains(id)) return "Tools";
+            if (display.contains(id)) return "Display";
+            if (amplitude.contains(id)) return "Amplitude";
+            if (analysis.contains(id)) return "Analysis";
+            if (processing.contains(id)) return "Processing";
+            if (attributes.contains(id)) return "Attributes";
+            if (horizons.contains(id)) return "Horizons";
+            if (data.contains(id)) return "Data";
+            return "Panels"; // splitView, lock, lockView, sidebar
         };
-        for (const ToolbarItem& item : toolbarItems_) items.push_back({item.id, item.label, categoryFor(item.id)});
+        static const QStringList order = {"Data",       "Zoom",     "Tools",      "Display",  "Amplitude",
+                                          "Analysis",   "Processing", "Attributes", "Horizons", "Panels"};
+        for (const ToolbarItem& item : toolbarItems_) {
+            items.push_back({item.id, item.label, categoryFor(item.id), item.optional});
+        }
+        std::stable_sort(items.begin(), items.end(), [](const ToolbarItemInfo& a, const ToolbarItemInfo& b) {
+            return order.indexOf(a.category) < order.indexOf(b.category);
+        });
         preferencesDialog_ = new PreferencesDialog(prefs_, items, this);
         preferencesDialog_->setAppliedCallback([this](const Preferences& newPrefs) {
             // Skipped traces and Min correlation are edited in the Signal/Noise window, not here.
@@ -10343,7 +10551,10 @@ void MainWindow::computeAndShowFk(Panel* sourcePanel) {
             const int64_t t0 = src.t0, t1 = src.t1, n = t1 - t0;
             std::vector<int32_t> ffid(static_cast<size_t>(n)), cdp(static_cast<size_t>(n)), offset(static_cast<size_t>(n));
             std::vector<double> xs(static_cast<size_t>(n)), ys(static_cast<size_t>(n));
-            for (int64_t i = 0; i < n; ++i) {
+            // In parallel: on a big view this touches every page of the file.
+            segy::ThreadPool headerPool;
+            headerPool.parallelFor(size_t(n), 4096, [&](size_t begin, size_t end) {
+            for (int64_t i = int64_t(begin); i < int64_t(end); ++i) {
                 const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + size_t(t0 + i) * ds->traceStrideBytes;
                 const segy::TraceHeader th = segy::parseTraceHeader(base);
                 ffid[size_t(i)] = th.fieldRecord;
@@ -10356,6 +10567,7 @@ void MainWindow::computeAndShowFk(Panel* sourcePanel) {
                 xs[size_t(i)] = double(cdpXY ? th.cdpX : th.x) * scale;
                 ys[size_t(i)] = double(cdpXY ? th.cdpY : th.y) * scale;
             }
+            });
 
             // Panels: gathers of the chosen ident, or sliding panels.
             auto plausibleGathers = [&](const std::vector<int32_t>& keys, std::vector<segy::FkPanel>& panels) {
@@ -12524,6 +12736,11 @@ public:
 } // namespace
 
 int main(int argc, char** argv) {
+    // Numbers read the same everywhere (spin boxes included): "0.30", not
+    // the system locale's "0,30" next to labels that use a dot.
+    QLocale c = QLocale::c();
+    c.setNumberOptions(QLocale::OmitGroupSeparator);
+    QLocale::setDefault(c);
     // WSLg defaults Qt to its native-Wayland platform plugin (WAYLAND_DISPLAY
     // is set), and that path has confirmed bugs for this app under WSLg
     // specifically: window transparency (background bleeding through

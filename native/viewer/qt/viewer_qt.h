@@ -216,8 +216,10 @@ struct Preferences {
     // a changed value takes effect on next launch, not live.
     double uiScalePercent = 100.0;
     // Toolbar buttons the user switched off (MainWindow::ToolbarItem ids),
-    // edited only in Edit > Preferences > Toolbar Buttons.
+    // and optional buttons (off until chosen) the user switched on; both
+    // edited only in File > Preferences > Toolbar Buttons.
     QStringList hiddenToolbarItems;
+    QStringList shownToolbarExtras;
     // Analysis > Signal/Noise (SIGCOR) parameters, edited in the
     // Signal/Noise window itself (persisted here). Defaults are the user's own SIPMAP deck:
     // NSKIP=3 IRANSK=2 SPECTR TCROSS=BASIC SHMAX=30 CCMIN=0.3, cosine-squared
@@ -230,6 +232,7 @@ struct ToolbarItemInfo {
     QString id;
     QString label;
     QString category; // Preferences groups consecutive items of one category under one heading
+    bool optional = false; // off until the user ticks it
 };
 
 // One loaded SEG-Y dataset's data -- kept alive independent of which
@@ -1522,6 +1525,8 @@ public:
     // display uses this).
     void startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory = {},
                       std::function<void(std::shared_ptr<Dataset>)> onLoaded = {});
+    // The Clip dialog for this panel (legend right-click, View > Clip...).
+    void openClipDialog();
 
     // Fires once per successful load, right after the new Dataset becomes
     // this panel's Foreground -- MainWindow uses it to register the
@@ -2040,7 +2045,11 @@ private:
         QString label; // shown in the customize menus
         int group;     // separator group, 0..kToolbarSeparatorGroups (last = after the spacer)
         std::vector<QAction*> actions;
+        bool optional = false; // off until switched on in Preferences
     };
+    bool isToolbarItemShown(const ToolbarItem& item) const;
+    QAction* reversePolarityAction_ = nullptr;
+    std::vector<QAction*> extraToolbarActions_;
     std::vector<ToolbarItem> toolbarItems_;
     // toolbarSeparators_[g] sits between group g and group g+1; shown only
     // while group g and some later (pre-spacer) group both have a shown

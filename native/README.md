@@ -3454,6 +3454,61 @@ gain and AGC).
   over the whole colour scale; the Bandpass, f-k, Deconvolution, Amplitude
   Processing and AGC dialogs; the Phase Estimate window.
 
+### Third round: optional toolbar buttons, consistency, mutes, robust clip, speed
+
+- **Optional toolbar buttons.** The default toolbar is unchanged. 24 more
+  buttons exist, off until ticked in File > Preferences > Toolbar Buttons
+  (grouped Data, Display, Analysis, Processing, Attributes, Horizons):
+  Open, Save As SEG-Y, Text/Binary Header, Trace Header Ranges, Trace
+  Inspector, Clip, Reverse Polarity, Signal/Noise, f-k Display, Phase
+  Estimate, Bandpass, f-k Filter, Whitening, Deconvolution, Amplitude
+  Processing, Calculator, Time-Depth, Envelope, Instantaneous Phase and
+  Frequency, Phase Rotation, Auto-pick Seabed, Horizon Manager. Each does
+  exactly what its menu item does (`ExtraButton` table in the toolbar
+  construction; icons from SVG path data, `iconFromPaths`). Persisted in
+  `toolbarShownExtras` next to `toolbarHiddenItems`
+  (`ToolbarItem::optional`, `isToolbarItemShown`), so adding buttons later
+  never surprises existing users. "Default Buttons" resets to the standard
+  set. They sit in their own group before the spacer and overflow like
+  the rest. Clip and Reverse Polarity also got View menu items (Clip was
+  only on the legend's right-click; Reverse Polarity only in Display
+  Parameters).
+- **Consistency.** One number format (`QLocale::c()` without group
+  separators, set in `main`: spin boxes read "0.30" like the labels);
+  Spectrum and Histogram use Visible Data (or the selection box) like
+  every other analysis, instead of the whole file; band and autocorrelation
+  trace axes are 1-based; "Colour" everywhere; 18 labels lost their
+  trailing colon; `=` raises the gain too (no Shift on a US keyboard);
+  Processing reads filters, then amplitude/trace math, then Attributes,
+  then Time-Depth.
+- **Mutes stay muted.** `segy::liveRange` / `applyMute`: leading and
+  trailing exact zeros of the input trace (a water column, a top mute) are
+  zero again after every processing step (all trace transforms, Bandpass,
+  the f-k Filter). Without it the f-k filter and whitening smeared energy
+  into PARAGON's muted water column, which AGC then showed at full scale.
+- **Robust default clip.** `Pyramid::robustClip`: the 99th percentile of
+  the finest level's 4x4 block peaks (zero blocks left out, at most 1M
+  blocks sampled, a few ms at load); `segy::autoClip` uses it (capped at
+  the absolute maximum) everywhere the max-abs clip was used: renderer,
+  wiggles, legend, Clip dialog, octave bands. PARAGON opens at +-1.9
+  instead of +-10, readable without AGC. The legend's labels shrink to fit
+  their 46 px column (fewer digits, then 4.5k / 1.2M) instead of being
+  cut off.
+- **Speed (6 GB, 603k traces).** f-k display 4.5 -> 1.5 s (the header
+  scan in parallel); envelope and attributes 21 -> 12 s (the analytic
+  signal pads by half the trace, not to twice its length: 4096 instead of
+  8192 points for 2501 samples; the Hilbert kernel is below 1e-3 beyond
+  the gap); f-k Filter 62 -> 25 s (`FkFilterPlan`: the weight table once
+  per run instead of a division and a cosine per cell per panel; two real
+  traces per complex FFT both ways; columns with all-one or all-zero
+  weights skipped; even and odd panels in parallel straight into the
+  output; panels of 128 every 96 traces with sin^2/cos^2 ramps over the 32
+  overlapping traces instead of 50 % overlap). The Ormsby filter mirrors a
+  quarter of the trace (at least 64 samples) instead of all of it.
+  `segybench processing` times the kernels per trace. Tests: the planned
+  f-k path matches the direct one (< 1e-4), mutes, robust clip in the
+  wiggle test.
+
 ### UX pass: one zoom, fewer menus, two themes
 
 A review of every window, aiming for less: nothing shown twice, nothing

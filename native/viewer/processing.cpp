@@ -19,9 +19,30 @@ double rms(const std::vector<float>& trace) {
 
 } // namespace
 
+LiveRange liveRange(const float* samples, size_t count) {
+    LiveRange r;
+    size_t first = 0;
+    while (first < count && samples[first] == 0.0f) ++first;
+    if (first == count) return r; // dead
+    size_t last = count - 1;
+    while (last > first && samples[last] == 0.0f) --last;
+    r.first = first;
+    r.last = last;
+    return r;
+}
+
+void applyMute(float* samples, size_t count, const LiveRange& range) {
+    if (range.first > range.last) {
+        std::fill(samples, samples + count, 0.0f);
+        return;
+    }
+    std::fill(samples, samples + std::min(range.first, count), 0.0f);
+    if (range.last + 1 < count) std::fill(samples + range.last + 1, samples + count, 0.0f);
+}
+
 std::vector<std::complex<float>> analyticSignal(const std::vector<float>& trace) {
     const size_t n = trace.size();
-    std::vector<std::complex<float>> spectrum(nextPowerOfTwo(std::max<size_t>(2, 2 * n)));
+    std::vector<std::complex<float>> spectrum(nextPowerOfTwo(std::max<size_t>(2, n + std::max<size_t>(n / 2, 64))));
     for (size_t i = 0; i < n; ++i) spectrum[i] = trace[i];
     fft(spectrum);
     // Keep DC and Nyquist, double the positive frequencies, zero the negative ones.
@@ -210,7 +231,7 @@ double ormsbyWeight(double frequencyHz, const OrmsbyParams& p) {
 void ormsbyFilter(std::vector<float>& trace, double sampleIntervalUs, const OrmsbyParams& params) {
     const size_t n = trace.size();
     if (n < 2 || sampleIntervalUs <= 0.0) return;
-    const size_t pad = n - 1;
+    const size_t pad = std::min(n - 1, std::max<size_t>(64, n / 4));
     // [mirror of x[pad..1] | x | mirror of x[n-2..n-1-pad]], then zeros.
     std::vector<std::complex<float>> spectrum(nextPowerOfTwo(n + 2 * pad));
     for (size_t i = 0; i < pad; ++i) spectrum[i] = trace[pad - i];
@@ -346,6 +367,100 @@ double fkFilterWeight(double frequencyHz, double wavenumberPerM, const FkFilterP
         inside = v >= edge ? 0.0 : 0.5 + 0.5 * std::cos(kPi * (v - hi) / (edge - hi));
     }
     return params.pass ? inside : 1.0 - inside;
+}
+
+FkFilterPlan makeFkFilterPlan(size_t traces, size_t samples, double sampleIntervalUs, const FkFilterParams& params) {
+    FkFilterPlan plan;
+    plan.traces = traces;
+    plan.samples = samples;
+    if (traces < 2 || samples == 0 || sampleIntervalUs <= 0.0 || params.traceSpacing <= 0.0) return plan;
+    plan.nt = nextPowerOfTwo(samples);
+    plan.nk = nextPowerOfTwo(2 * traces);
+    const size_t nf = plan.nt / 2 + 1, nk = plan.nk;
+    const double dt = sampleIntervalUs * 1e-6;
+    plan.weights.resize(nf * nk);
+    plan.columnKind.resize(nf);
+    for (size_t j = 0; j < nf; ++j) {
+        const double f = double(j) / (double(plan.nt) * dt);
+        bool ones = true, zeros = true;
+        for (size_t m = 0; m < nk; ++m) {
+            const double k = (m <= nk / 2 ? double(m) : double(m) - double(nk)) / (double(nk) * params.traceSpacing);
+            const float w = float(fkFilterWeight(f, k, params));
+            plan.weights[j * nk + m] = w;
+            ones = ones && w == 1.0f;
+            zeros = zeros && w == 0.0f;
+        }
+        plan.columnKind[j] = ones ? 1 : zeros ? 2 : 0;
+    }
+    return plan;
+}
+
+void fkFilterPanel(std::vector<std::vector<float>>& traces, const FkFilterPlan& plan) {
+    const size_t nx = traces.size();
+    if (plan.nt == 0 || nx != plan.traces || traces[0].size() != plan.samples) return;
+    const size_t ns = plan.samples, nt = plan.nt, nk = plan.nk, nf = nt / 2 + 1;
+    // Half spectra (0..Nyquist) per trace, two traces per complex FFT.
+    std::vector<std::complex<float>> half(nx * nf);
+    std::vector<std::complex<float>> buffer(nt);
+    for (size_t x = 0; x < nx; x += 2) {
+        const bool pair = x + 1 < nx;
+        std::fill(buffer.begin(), buffer.end(), std::complex<float>(0.0f));
+        for (size_t i = 0; i < ns; ++i) buffer[i] = {traces[x][i], pair ? traces[x + 1][i] : 0.0f};
+        fft(buffer);
+        for (size_t j = 0; j < nf; ++j) {
+            const std::complex<float> z = buffer[j], zc = std::conj(buffer[(nt - j) % nt]);
+            half[x * nf + j] = 0.5f * (z + zc);
+            if (pair) half[(x + 1) * nf + j] = std::complex<float>(0.0f, -0.5f) * (z - zc);
+        }
+    }
+    // Per frequency: FFT across traces, weight, inverse. Eight neighbouring
+    // frequencies are gathered per pass: one cache line per trace instead
+    // of one miss per trace and frequency (rows are nf values apart).
+    constexpr size_t kBlock = 8;
+    std::vector<std::vector<std::complex<float>>> columns(kBlock, std::vector<std::complex<float>>(nk));
+    for (size_t j0 = 0; j0 < nf; j0 += kBlock) {
+        const size_t count = std::min(kBlock, nf - j0);
+        for (size_t b = 0; b < count; ++b) std::fill(columns[b].begin(), columns[b].end(), std::complex<float>(0.0f));
+        for (size_t x = 0; x < nx; ++x) {
+            const std::complex<float>* row = half.data() + x * nf + j0;
+            for (size_t b = 0; b < count; ++b) columns[b][x] = row[b];
+        }
+        for (size_t b = 0; b < count; ++b) {
+            const size_t j = j0 + b;
+            std::vector<std::complex<float>>& column = columns[b];
+            if (plan.columnKind[j] == 1) continue;
+            if (plan.columnKind[j] == 2) {
+                std::fill(column.begin(), column.end(), std::complex<float>(0.0f));
+                continue;
+            }
+            fft(column);
+            const float* w = plan.weights.data() + j * nk;
+            for (size_t m = 0; m < nk; ++m) column[m] *= w[m];
+            ifft(column);
+        }
+        for (size_t x = 0; x < nx; ++x) {
+            std::complex<float>* row = half.data() + x * nf + j0;
+            for (size_t b = 0; b < count; ++b) row[b] = columns[b][x];
+        }
+    }
+    // Back to time, two traces per inverse FFT: Y = Ya + i Yb with each
+    // extended Hermitian, so the real part is trace a and the imaginary b.
+    for (size_t x = 0; x < nx; x += 2) {
+        const bool pair = x + 1 < nx;
+        for (size_t j = 0; j < nf; ++j) {
+            const std::complex<float> a = half[x * nf + j];
+            const std::complex<float> b = pair ? half[(x + 1) * nf + j] : std::complex<float>(0.0f);
+            buffer[j] = a + std::complex<float>(0.0f, 1.0f) * b;
+            if (j > 0 && j < nt / 2) buffer[nt - j] = std::conj(a) + std::complex<float>(0.0f, 1.0f) * std::conj(b);
+        }
+        // Nyquist and DC of a real signal are real: drop any imaginary residue
+        // so it does not leak into the other trace.
+        ifft(buffer);
+        for (size_t i = 0; i < ns; ++i) {
+            traces[x][i] = buffer[i].real();
+            if (pair) traces[x + 1][i] = buffer[i].imag();
+        }
+    }
 }
 
 void fkFilterPanel(std::vector<std::vector<float>>& traces, double sampleIntervalUs, const FkFilterParams& params) {

@@ -15,6 +15,8 @@
 // pyramid is kept resident). Coarser levels are cheap block-of-blocks
 // reductions of the level below and are built in a single pass.
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 #include <functional>
@@ -45,7 +47,19 @@ struct Pyramid {
     int samplesPerTrace = 0;
     float globalMin = 0.0f;
     float globalMax = 0.0f;
+    // The 99th percentile of the finest level's block peaks (|min|, |max|
+    // of each 4x4 block), all-zero blocks (mutes, dead traces) left out;
+    // 0 when there are too few live blocks. One spike no longer washes out
+    // the whole display the way the absolute maximum did.
+    float robustClip = 0.0f;
 };
+
+// The amplitude the display maps to the ends of the colour scale before
+// gain: robustClip, or the absolute maximum when there is none.
+inline float autoClip(const Pyramid& pyramid) {
+    const float peak = std::max(std::fabs(pyramid.globalMin), std::fabs(pyramid.globalMax));
+    return pyramid.robustClip > 0.0f ? std::min(pyramid.robustClip, peak) : peak;
+}
 
 struct BuildParams {
     const uint8_t* fileBase = nullptr;

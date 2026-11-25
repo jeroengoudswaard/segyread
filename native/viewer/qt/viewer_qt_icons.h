@@ -36,6 +36,9 @@ QIcon iconList();
 QIcon iconIdents();
 QIcon iconAgc();
 QIcon iconAutocorrelation();
+// A 24x24 stroked icon from SVG path data alone (Tabler style: stroke 2,
+// round caps), e.g. "M3 12h18". Used by the optional toolbar buttons.
+QIcon iconFromPaths(const QStringList& paths);
 
 // Box-select cursor: a plain arrow with a small rectangle badge, matching
 // "a pointer with a little rectangle."

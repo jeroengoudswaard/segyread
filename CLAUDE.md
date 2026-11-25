@@ -119,8 +119,19 @@ the MSVC runtime DLLs (`vcruntime140.dll`, `vcruntime140_1.dll`,
 | Flatten (whole file, streamed) | 7.9 s |
 | Auto-pick seabed | 0.9 s |
 | Trace Header Ranges | 3.0 s (cold headers) |
-| f-k, full view | 1.8 s |
-| Signal/Noise | 1.1 s (old implementation, 2000 pairs; the SIGCOR reference port of 2026-11-25 is not yet re-measured: up to 20 000 pairs, parallel) |
+| f-k display, full view | 1.5 s (header scan in parallel; was 4.5 s) |
+| Signal/Noise (SIGCOR port) | 0.7 s |
+| Phase Estimate, full view | 0.05 s (~4M samples, every Nth trace) |
+| Spectrum / Histogram / Autocorrelation | < 0.1 s (visible data) |
+| Octave Bands | 0.09 s + 0.18 s drawing on the UI thread |
+| Envelope / attributes (whole file, write + reload) | 12 s + 7 s reload (was 21 s) |
+| Spectral Whitening / Deconvolution (whole file) | 15 s / 18 s (I/O bound: 6 GB in, 6 GB out) |
+| f-k Filter (whole file) | 25 s (was 62 s: weight table, packed FFTs, 25 % overlap) |
+
+Per-trace kernels (single thread, 2501 samples): `segybench processing`
+— envelope 89 us, instantaneous frequency 181 us, whitening 125 us, decon
+141 us, Ormsby 81 us, f-k 225 us per trace (14.5 ms per 128-trace panel,
+2.6 ms effective on 16 threads: memory-bound).
 
 Signal/Noise follows the user's MATLAB reference `sigcor_spectr_stndrd.m`
 (see the README section); keep `testSigcorAgainstReference` passing when
@@ -132,22 +143,17 @@ non-modal, the hook couldn't accept it), Calculator, Time-Depth.
 ## Open observations (to do / could be better)
 
 **Inconsistencies left in the UI**
-- Decimal separators are mixed: spin boxes use the system locale ("0,30")
-  while labels use a dot ("0.30"). Pick one (probably `QLocale::c()` for
-  numbers everywhere).
-- "Full View" in the Spectrum/Histogram parameters means the whole dataset,
-  whereas the other analyses use the visible view. Unify (view or box).
-- Autocorrelation and Octave Bands trace axes are still 0-based; Octave
-  Bands' x-axis end labels are clipped ("1508" for 15081).
-- "Colour" and "Color" are both used. Pick one.
+- (Fixed 2026-11-25: one number format, `QLocale::c()`, set in `main`;
+  Spectrum/Histogram use Visible Data or the box like every other
+  analysis; band/autocorrelation trace axes are 1-based; "Colour"
+  everywhere; labels without colons; `=` also raises the gain.)
 - Custom-painted text uses several pixel sizes (10–12 px) next to the
   system font; a small type scale would tidy this.
 - Parameter dialogs use OK/Apply/Cancel, result windows use Recompute;
   fine, but the Display Parameters dialog is still bound to the panel it
   was first opened from (known limitation).
 - Theme switching needs a restart (icons and inline styles are built once).
-- Toolbar buttons can be hidden but not reordered.
-- The gain shortcut `+` needs Shift on a US keyboard.
+- Toolbar buttons can be hidden or (optional ones) added, not reordered.
 
 **Functional gaps in what exists**
 - The Background dataset slot can be chosen but is not drawn (velocity as

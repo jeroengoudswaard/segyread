@@ -151,7 +151,7 @@ void renderExactPath(const RenderContext& ctx, const ViewRange& v, uint32_t* pix
         }
     });
 
-    float rawClip = std::max(std::fabs(ctx.pyramid->globalMin), std::fabs(ctx.pyramid->globalMax));
+    float rawClip = autoClip(*ctx.pyramid);
     float clipPos, clipNeg;
     displayClipPosNeg(rawClip, gainDb, manualClip, processing, &clipPos, &clipNeg);
     const float colorScaleDirection = colorScaleFlipped ? -1.0f : 1.0f;

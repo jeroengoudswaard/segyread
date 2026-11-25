@@ -59,7 +59,7 @@ WiggleLayout computeWiggleLayout(const RenderContext& ctx, const ViewRange& view
     // the average trace-to-trace spacing at 0 dB, and switching display
     // modes doesn't change how "loud" the data looks.
     float rawClip = 0.0f;
-    if (ctx.pyramid) rawClip = std::max(std::fabs(ctx.pyramid->globalMin), std::fabs(ctx.pyramid->globalMax));
+    if (ctx.pyramid) rawClip = autoClip(*ctx.pyramid);
     if (rawClip <= 0.0f) rawClip = 1.0f;
     const bool processingOn = processing && processing->active();
     if (processingOn) rawClip = processedBaseClip(rawClip, *processing);

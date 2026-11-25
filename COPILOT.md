@@ -76,3 +76,8 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 44. **f-k range, pass or reject** *Status: done (2026-11-25).* **Decon type** (gapped or spiking) *done (2026-11-25).*
 
 45. **Amplitude processing as processing** — Processing > Amplitude Processing writes a dataset; the AGC button stays display-only (window and level on right-click). *Status: done (2026-11-25).*
+
+46. **Optional toolbar buttons** — a minimal default toolbar, plus buttons the user can add for quick needs. *Status: done (2026-11-25) — 24 optional buttons in Preferences > Toolbar Buttons.*
+
+47. **Zippiness pass on processing** — *done (2026-11-25): f-k filter 62 -> 25 s, attributes 21 -> 12 s, f-k display 4.5 -> 1.5 s on the 6 GB file; mutes preserved; robust default clip.*
+
