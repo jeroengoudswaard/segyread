@@ -172,14 +172,21 @@ non-modal, the hook couldn't accept it), Calculator, Time-Depth.
 3. **Axes and output**: x-axis by shotpoint / CDP / distance, km scale bar,
    export to PNG/PDF at a fixed scale (traces/cm, cm/s).
 4. **Draw the Background dataset** (velocity colour behind wiggles).
-5. **Attributes**: envelope, instantaneous phase/frequency, phase rotation.
-6. **Simple processing**: top mute, f-k filter (the f-k display exists),
-   spectral whitening/shaping (COPILOT item 12), predictive deconvolution.
+5. ~~Attributes~~ (done, Processing > Attributes) — next: sweetness, RMS
+   amplitude in a window, and a one-sided colour scale for envelope and
+   instantaneous frequency (they are shown with the bipolar map now).
+6. **Simple processing**: top mute, spectral shaping (COPILOT item 12).
+   Done: f-k filter, spectral whitening, predictive deconvolution — all
+   with one whole-trace design window; time-variant windows, f-k polygons
+   and gather-aware f-k panels are the obvious next steps.
 7. **Interpretation**: fault sticks, undo while picking, a ruler for
    distance, dip and apparent velocity (COPILOT item 8).
 8. **Sessions**: remember open datasets, horizons and views between runs.
 9. **Header math**: set header values from a formula.
 10. Batch / command-line conversion (lower priority).
+
+Phase: COPILOT item 41 holds ideas for a statistical (Ockham's razor)
+phase estimate; nothing decided yet.
 
 Also still open from `COPILOT.md`: 3 (processing ideas), 4 (cut/copy/paste
 on the selection box — the Edit menu was removed until this exists), 5

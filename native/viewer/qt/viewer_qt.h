@@ -24,6 +24,7 @@
 
 #include "analysis.h"
 #include "horizons.h"
+#include "processing.h"
 #include "segy_select.h"
 #include "trace_header_defs.h"
 #include "iirfilter.h"
@@ -2128,6 +2129,16 @@ private:
     double lastIntegrationDb_ = 6.0;
     double lastDifferentiationDb_ = 6.0;
     double lastScaleFactor_ = 1.0;
+    // Filters, deconvolution and attributes (Processing menu); the last
+    // values are the next defaults.
+    segy::WhiteningParams lastWhitening_;
+    segy::DeconParams lastDecon_;
+    segy::FkFilterParams lastFk_;
+    double lastRotationDegrees_ = 90.0;
+    void openSpectralWhitening();
+    void openDeconvolution();
+    void openFkFilter();
+    void runAttribute(int which); // 0 envelope, 1 inst. phase, 2 inst. frequency, 3 phase rotation
     void openSaveSegyDialog();
     void openOctaveBandDialog();
 

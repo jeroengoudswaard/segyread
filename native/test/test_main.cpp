@@ -34,6 +34,7 @@
 #include "trace_header_defs.h"
 #include "horizons.h"
 #include "depth_conversion.h"
+#include "processing.h"
 #include <complex>
 
 namespace {
@@ -1825,6 +1826,128 @@ void testDepthConversion() {
     CHECK_NEAR(v[1], 2000.0, 1e-3);
 }
 
+void testProcessing() {
+    const double kPi = 3.14159265358979323846;
+    auto ricker = [kPi](double t, double f) {
+        const double a = kPi * f * t;
+        return (1.0 - 2.0 * a * a) * std::exp(-a * a);
+    };
+    // Complex trace of a 20 Hz cosine (4 ms, 1000 samples, tapered ends
+    // excluded): envelope 1, phase = 2 pi f t, frequency 20 Hz.
+    const int n = 1000;
+    const double dt = 0.004, f0 = 20.0;
+    std::vector<float> cosine(n);
+    for (int i = 0; i < n; ++i) cosine[size_t(i)] = float(std::cos(2.0 * kPi * f0 * i * dt));
+    std::vector<float> env = cosine, phase = cosine, freq = cosine;
+    segy::envelope(env);
+    segy::instantaneousPhase(phase);
+    segy::instantaneousFrequency(freq, 4000.0);
+    double worstEnv = 0.0, worstPhase = 0.0, worstFreq = 0.0;
+    for (int i = 100; i < n - 100; ++i) {
+        worstEnv = std::max(worstEnv, std::fabs(env[size_t(i)] - 1.0));
+        double expected = std::fmod(360.0 * f0 * i * dt + 180.0, 360.0) - 180.0;
+        double diff = std::fabs(phase[size_t(i)] - expected);
+        worstPhase = std::max(worstPhase, std::min(diff, 360.0 - diff));
+        worstFreq = std::max(worstFreq, std::fabs(freq[size_t(i)] - f0));
+    }
+    CHECK(worstEnv < 0.01);
+    CHECK(worstPhase < 1.0);
+    CHECK(worstFreq < 0.3);
+    // Phase rotation: +90 degrees turns cos into -sin; 180 flips polarity.
+    std::vector<float> rotated = cosine;
+    segy::phaseRotate(rotated, 90.0);
+    double worstRot = 0.0;
+    for (int i = 100; i < n - 100; ++i) {
+        worstRot = std::max(worstRot, std::fabs(rotated[size_t(i)] + std::sin(2.0 * kPi * f0 * i * dt)));
+    }
+    CHECK(worstRot < 0.01);
+    std::vector<float> flipped = cosine;
+    segy::phaseRotate(flipped, 180.0);
+    CHECK_NEAR(flipped[500], -cosine[500], 0.01);
+
+    // Levinson against a hand-checked 3x3 Toeplitz system.
+    std::vector<double> a = segy::levinsonSolve({4.0, 1.0, 0.5}, {1.0, 2.0, 3.0});
+    // R a = g, R = [[4,1,.5],[1,4,1],[.5,1,4]]
+    CHECK_NEAR(4.0 * a[0] + 1.0 * a[1] + 0.5 * a[2], 1.0, 1e-9);
+    CHECK_NEAR(1.0 * a[0] + 4.0 * a[1] + 1.0 * a[2], 2.0, 1e-9);
+    CHECK_NEAR(0.5 * a[0] + 1.0 * a[1] + 4.0 * a[2], 3.0, 1e-9);
+
+    // Spiking decon of an AR(1) trace x(t) = s(t) + 0.8 x(t-1) gives back s.
+    std::mt19937 rng(11);
+    std::normal_distribution<double> g(0.0, 1.0);
+    std::vector<float> s(4000), x(4000);
+    for (size_t i = 0; i < s.size(); ++i) {
+        s[i] = float(g(rng));
+        x[i] = s[i] + (i > 0 ? 0.8f * x[i - 1] : 0.0f);
+    }
+    segy::DeconParams spiking;
+    spiking.operatorMs = 20.0;
+    spiking.gapMs = 4.0; // one sample
+    spiking.whiteNoisePercent = 0.0;
+    std::vector<float> y = x;
+    segy::predictiveDeconvolution(y, 4000.0, spiking);
+    double sy = 0.0, ss = 0.0, yy = 0.0;
+    for (size_t i = 10; i < s.size(); ++i) {
+        sy += double(s[i]) * y[i];
+        ss += double(s[i]) * s[i];
+        yy += double(y[i]) * y[i];
+    }
+    CHECK(sy / std::sqrt(ss * yy) > 0.99);
+
+    // Whitening flattens a sloping spectrum inside the band: a ricker (peak
+    // ~25 Hz) whitened over 10-60 Hz has nearly equal amplitude at 15 and 50 Hz.
+    std::vector<float> wavelet(1024, 0.0f);
+    for (int i = 0; i < 1024; ++i) wavelet[size_t(i)] = float(ricker((i - 512) * dt, 25.0));
+    segy::WhiteningParams whitening;
+    whitening.lowHz = 10.0;
+    whitening.highHz = 60.0;
+    whitening.smoothingHz = 5.0;
+    std::vector<float> white = wavelet;
+    segy::spectralWhitening(white, 4000.0, whitening);
+    auto amplitudeAt = [&](const std::vector<float>& tr, double hz) {
+        double re = 0.0, im = 0.0;
+        for (size_t i = 0; i < tr.size(); ++i) {
+            re += tr[i] * std::cos(2.0 * kPi * hz * i * dt);
+            im -= tr[i] * std::sin(2.0 * kPi * hz * i * dt);
+        }
+        return std::sqrt(re * re + im * im);
+    };
+    const double before = amplitudeAt(wavelet, 50.0) / amplitudeAt(wavelet, 15.0);
+    const double after = amplitudeAt(white, 50.0) / amplitudeAt(white, 15.0);
+    CHECK(before < 0.6);
+    CHECK(after > 0.8 && after < 1.25);
+    CHECK(amplitudeAt(white, 110.0) < 0.05 * amplitudeAt(white, 30.0)); // outside the band: gone
+
+    // f-k filter: a flat event passes, a 1000 m/s dip is removed (10 m
+    // traces, reject below 1500 m/s; 15 Hz so the dip is not aliased).
+    const int traces = 64, samples = 256;
+    auto panelWith = [&](double slowness) { // s/m
+        std::vector<std::vector<float>> panel(traces, std::vector<float>(samples));
+        for (int t = 0; t < traces; ++t) {
+            for (int i = 0; i < samples; ++i) {
+                panel[size_t(t)][size_t(i)] = float(ricker((i - 128) * dt - slowness * 10.0 * (t - 32), 15.0));
+            }
+        }
+        return panel;
+    };
+    auto energy = [](const std::vector<std::vector<float>>& panel) {
+        double e = 0.0;
+        for (const auto& tr : panel) for (float v : tr) e += double(v) * v;
+        return e;
+    };
+    segy::FkFilterParams fk;
+    fk.velocity = 1500.0;
+    fk.traceSpacing = 10.0;
+    auto flat = panelWith(0.0), dipping = panelWith(1.0 / 1000.0);
+    const double flatBefore = energy(flat), dipBefore = energy(dipping);
+    segy::fkFilterPanel(flat, 4000.0, fk);
+    segy::fkFilterPanel(dipping, 4000.0, fk);
+    CHECK(energy(flat) / flatBefore > 0.95);
+    CHECK(energy(dipping) / dipBefore < 0.05);
+    CHECK_NEAR(segy::fkFilterWeight(30.0, 0.0, fk), 1.0, 1e-12);
+    CHECK_NEAR(segy::fkFilterWeight(30.0, 30.0 / 1000.0, fk), 0.0, 1e-12); // 1000 m/s, below the taper
+}
+
 void testHorizons() {
     section("Horizons: snap to event, seabed auto-pick with outlier repair, point-to-point picks, flatten");
     const double pi = 3.14159265358979323846;
@@ -2116,6 +2239,7 @@ int main() {
     testCrossCorrelationAndSidePeak();
     testHorizons();
     testDepthConversion();
+    testProcessing();
     testSosFiltFiltMatchesScipy();
     testSosFiltFiltPaddingTypesMatchScipy();
     testDesignButterworthBand();

@@ -6677,6 +6677,24 @@ MainWindow::MainWindow() : QMainWindow() {
     processingMenu->addSeparator();
     QAction* bandpassAction = processingMenu->addAction("&Bandpass Filter...");
     connect(bandpassAction, &QAction::triggered, this, &MainWindow::openBandpassDialog);
+    QAction* fkFilterAction = processingMenu->addAction("&f-k Filter...");
+    connect(fkFilterAction, &QAction::triggered, this, &MainWindow::openFkFilter);
+    QAction* whiteningAction = processingMenu->addAction("Spectral &Whitening...");
+    connect(whiteningAction, &QAction::triggered, this, &MainWindow::openSpectralWhitening);
+    QAction* deconAction = processingMenu->addAction("D&econvolution...");
+    connect(deconAction, &QAction::triggered, this, &MainWindow::openDeconvolution);
+    processingMenu->addSeparator();
+    // Attributes: no questions asked, except the rotation angle.
+    QMenu* attributesMenu = processingMenu->addMenu("&Attributes");
+    QAction* envelopeAction = attributesMenu->addAction("&Envelope");
+    connect(envelopeAction, &QAction::triggered, this, [this]() { runAttribute(0); });
+    QAction* phaseAction = attributesMenu->addAction("Instantaneous &Phase");
+    connect(phaseAction, &QAction::triggered, this, [this]() { runAttribute(1); });
+    QAction* frequencyAction = attributesMenu->addAction("Instantaneous &Frequency");
+    connect(frequencyAction, &QAction::triggered, this, [this]() { runAttribute(2); });
+    attributesMenu->addSeparator();
+    QAction* rotationAction = attributesMenu->addAction("Phase &Rotation...");
+    connect(rotationAction, &QAction::triggered, this, [this]() { runAttribute(3); });
     QAction* integrationAction = processingMenu->addAction("&Integration...");
     connect(integrationAction, &QAction::triggered, this, [this]() { openTraceDerivative(true); });
     QAction* differentiationAction = processingMenu->addAction("&Differentiation...");
@@ -8924,6 +8942,302 @@ void MainWindow::openTraceScale() {
                           const float f = float(factor);
                           for (float& v : trace) v *= f;
                       });
+}
+
+constexpr int kFkFilterPanelTraces = 128; // f-k filter panel width (50% overlap)
+
+namespace {
+// One field of a processing dialog.
+struct ProcessingField {
+    QString label;
+    double minimum, maximum, step;
+    int decimals;
+    QString suffix;
+    double* value;
+};
+
+// The processing dialogs' shared shape: a few numbers, an output name, a
+// one-paragraph explanation, OK/Cancel. Returns false on Cancel.
+bool askProcessingValues(QWidget* parent, const QString& title, const QString& explanation,
+                         const std::vector<ProcessingField>& fields, QString& outputName) {
+    QDialog dialog(parent);
+    dialog.setWindowTitle(title);
+    QVBoxLayout* layout = new QVBoxLayout(&dialog);
+    QGridLayout* grid = new QGridLayout();
+    grid->setHorizontalSpacing(10);
+    grid->setVerticalSpacing(8);
+    std::vector<QDoubleSpinBox*> spins;
+    int row = 0;
+    for (const ProcessingField& field : fields) {
+        QDoubleSpinBox* spin = new QDoubleSpinBox();
+        spin->setRange(field.minimum, field.maximum);
+        spin->setSingleStep(field.step);
+        spin->setDecimals(field.decimals);
+        spin->setSuffix(field.suffix);
+        spin->setValue(*field.value);
+        grid->addWidget(new QLabel(field.label), row, 0);
+        grid->addWidget(spin, row++, 1);
+        spins.push_back(spin);
+    }
+    QLineEdit* name = new QLineEdit(outputName);
+    grid->addWidget(new QLabel("Output name"), row, 0);
+    grid->addWidget(name, row, 1);
+    layout->addLayout(grid);
+    QLabel* hint = new QLabel(explanation);
+    hint->setWordWrap(true);
+    hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
+    layout->addWidget(hint);
+    QHBoxLayout* buttons = new QHBoxLayout();
+    buttons->addStretch();
+    QPushButton* ok = new QPushButton("OK");
+    QPushButton* cancel = new QPushButton("Cancel");
+    ok->setDefault(true);
+    buttons->addWidget(ok);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+    QObject::connect(ok, &QPushButton::clicked, &dialog, [&]() {
+        if (!name->text().trimmed().isEmpty()) dialog.accept();
+    });
+    QObject::connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    dialog.resize(440, dialog.sizeHint().height());
+    if (dialog.exec() != QDialog::Accepted) return false;
+    for (size_t i = 0; i < fields.size(); ++i) *fields[i].value = spins[i]->value();
+    outputName = name->text().trimmed();
+    return true;
+}
+
+// Median distance (m) between consecutive traces' CDP X/Y (or source X/Y)
+// over the first 500 traces; 0 when the headers have no coordinates.
+double estimateTraceSpacing(const Dataset& ds) {
+    std::vector<double> steps;
+    const int64_t count = std::min<int64_t>(ds.traceCount, 501);
+    double px = 0.0, py = 0.0;
+    for (int64_t t = 0; t < count; ++t) {
+        const segy::TraceHeader th =
+            segy::parseTraceHeader(ds.file.data() + segy::kHeaderTotalSize + size_t(t) * ds.traceStrideBytes);
+        const double scale = th.coordinateScalar < 0 ? 1.0 / -th.coordinateScalar
+                             : th.coordinateScalar > 0 ? double(th.coordinateScalar)
+                                                       : 1.0;
+        const bool useCdp = th.cdpX != 0 || th.cdpY != 0;
+        const double x = (useCdp ? th.cdpX : th.x) * scale, y = (useCdp ? th.cdpY : th.y) * scale;
+        if (t > 0) {
+            const double d = std::hypot(x - px, y - py);
+            if (d > 0.0) steps.push_back(d);
+        }
+        px = x;
+        py = y;
+    }
+    if (steps.empty()) return 0.0;
+    std::nth_element(steps.begin(), steps.begin() + std::ptrdiff_t(steps.size() / 2), steps.end());
+    return steps[steps.size() / 2];
+}
+
+// The processing guards shared by every dialog: data loaded, not x-f.
+bool processingReady(MainWindow* window, Panel* panel, const std::function<void(const QString&)>& flash) {
+    (void)window;
+    if (!panel->app.loaded) {
+        flash("No data selected");
+        return false;
+    }
+    if (panel->app.xf.active) {
+        flash("Not available on an x-f display");
+        return false;
+    }
+    return true;
+}
+} // namespace
+
+void MainWindow::openSpectralWhitening() {
+    Panel* panel = activePanel_;
+    if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
+    segy::WhiteningParams p = lastWhitening_;
+    QString name = QString::fromStdString(panel->app.foreground->filePath.stem().string()) + "_whiten";
+    if (!askProcessingValues(this, "Spectral Whitening",
+                             "Each trace's amplitude spectrum is divided by its own running average (the smoothing "
+                             "width), so every frequency between From and To gets the same strength; the phase is "
+                             "kept, outside the band it is tapered off, and the trace keeps its RMS.",
+                             {{"From", 0.0, 1000.0, 1.0, 1, " Hz", &p.lowHz},
+                              {"To", 1.0, 1000.0, 1.0, 1, " Hz", &p.highHz},
+                              {"Smoothing", 1.0, 100.0, 1.0, 1, " Hz", &p.smoothingHz}},
+                             name)) {
+        return;
+    }
+    if (p.highHz <= p.lowHz) {
+        QMessageBox::warning(this, "Spectral Whitening", "To must be above From.");
+        return;
+    }
+    lastWhitening_ = p;
+    runTraceTransform(panel, "Spectral Whitening", name,
+                      QString("SPECTRAL WHITENING %1-%2 HZ, SMOOTHING %3 HZ")
+                          .arg(compactNumber(p.lowHz), compactNumber(p.highHz), compactNumber(p.smoothingHz)),
+                      [p](std::vector<float>& trace, double intervalUs) { segy::spectralWhitening(trace, intervalUs, p); });
+}
+
+void MainWindow::openDeconvolution() {
+    Panel* panel = activePanel_;
+    if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
+    segy::DeconParams p = lastDecon_;
+    const double dtMs = panel->app.foreground->binHeader.sampleIntervalUs / 1000.0;
+    QString name = QString::fromStdString(panel->app.foreground->filePath.stem().string()) + "_decon";
+    if (!askProcessingValues(this, "Deconvolution",
+                             QString("Predictive (Wiener) deconvolution, designed per trace on the whole trace. It "
+                                     "removes what can be predicted from the gap on: reverberations and short-period "
+                                     "multiples. A gap of one sample (%1 ms) is spiking deconvolution, which whitens. "
+                                     "White noise stabilises the filter.")
+                                 .arg(compactNumber(dtMs)),
+                             {{"Operator length", 2.0 * dtMs, 2000.0, 10.0, 1, " ms", &p.operatorMs},
+                              {"Prediction gap", dtMs, 1000.0, dtMs, 1, " ms", &p.gapMs},
+                              {"White noise", 0.0, 50.0, 0.1, 2, " %", &p.whiteNoisePercent}},
+                             name)) {
+        return;
+    }
+    lastDecon_ = p;
+    runTraceTransform(panel, "Deconvolution", name,
+                      QString("PREDICTIVE DECONVOLUTION, OPERATOR %1 MS, GAP %2 MS, WHITE NOISE %3%")
+                          .arg(compactNumber(p.operatorMs), compactNumber(p.gapMs), compactNumber(p.whiteNoisePercent)),
+                      [p](std::vector<float>& trace, double intervalUs) {
+                          segy::predictiveDeconvolution(trace, intervalUs, p);
+                      });
+}
+
+void MainWindow::runAttribute(int which) {
+    Panel* panel = activePanel_;
+    if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
+    const QString source = QString::fromStdString(panel->app.foreground->filePath.stem().string());
+    if (which == 3) { // phase rotation: the one attribute with a parameter
+        double degrees = lastRotationDegrees_;
+        QString name = source + "_rot";
+        if (!askProcessingValues(this, "Phase Rotation",
+                                 "Adds this angle to the phase of every frequency (x cos a - H[x] sin a, with H the "
+                                 "Hilbert transform). 180 flips the polarity; 90 turns a zero-phase wavelet "
+                                 "antisymmetric.",
+                                 {{"Angle", -180.0, 180.0, 5.0, 1, QString::fromUtf8(" \xc2\xb0"), &degrees}}, name)) {
+            return;
+        }
+        lastRotationDegrees_ = degrees;
+        runTraceTransform(panel, "Phase Rotation", name, QString("PHASE ROTATION %1 DEGREES").arg(compactNumber(degrees)),
+                          [degrees](std::vector<float>& trace, double) { segy::phaseRotate(trace, degrees); });
+        return;
+    }
+    static const char* kNames[] = {"Envelope", "Instantaneous Phase", "Instantaneous Frequency"};
+    static const char* kSuffix[] = {"_env", "_iphase", "_ifreq"};
+    runTraceTransform(panel, kNames[which], source + kSuffix[which],
+                      QString("ATTRIBUTE: %1%2")
+                          .arg(QString(kNames[which]).toUpper())
+                          .arg(which == 1 ? " (DEGREES)" : which == 2 ? " (HZ)" : ""),
+                      [which](std::vector<float>& trace, double intervalUs) {
+                          if (which == 0) segy::envelope(trace);
+                          else if (which == 1) segy::instantaneousPhase(trace);
+                          else segy::instantaneousFrequency(trace, intervalUs);
+                      });
+}
+
+void MainWindow::openFkFilter() {
+    Panel* panel = activePanel_;
+    if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
+    std::shared_ptr<Dataset> ds = panel->app.foreground;
+    segy::FkFilterParams p = lastFk_;
+    const double estimated = estimateTraceSpacing(*ds);
+    if (estimated > 0.0) p.traceSpacing = estimated;
+    QString name = QString::fromStdString(ds->filePath.stem().string()) + "_fk";
+    if (!askProcessingValues(this, "f-k Filter",
+                             QString("Removes events whose apparent velocity is below the cut (steep dips: ground "
+                                     "roll, steep noise, diffraction tails), along consecutive traces in panels of %1 "
+                                     "traces with 50% overlap. Flat events always pass. The taper ramps from (1 - "
+                                     "taper) x velocity up to the velocity. Trace spacing %2.")
+                                 .arg(kFkFilterPanelTraces)
+                                 .arg(estimated > 0.0 ? QString("from the coordinates: %1 m").arg(compactNumber(estimated))
+                                                      : QString("not in the headers: please check")),
+                             {{"Remove below", 10.0, 100000.0, 100.0, 0, " m/s", &p.velocity},
+                              {"Taper", 0.0, 90.0, 5.0, 0, " %", &p.taperPercent},
+                              {"Trace spacing", 0.01, 100000.0, 0.5, 2, " m", &p.traceSpacing}},
+                             name)) {
+        return;
+    }
+    lastFk_ = p;
+    std::vector<std::string> history = ds->processingHistory;
+    history.push_back(QString("F-K FILTER: REMOVE BELOW %1 M/S, TAPER %2%, DX %3 M, PANELS %4 TRACES")
+                          .arg(compactNumber(p.velocity), compactNumber(p.taperPercent), compactNumber(p.traceSpacing))
+                          .arg(kFkFilterPanelTraces)
+                          .toStdString());
+    const int samplesPerTrace = ds->binHeader.samplesPerTrace;
+    QStringList inputBlocks;
+    inputBlocks << QString("FILE: %1  TRACES: %2").arg(QString::fromStdString(ds->name)).arg(ds->traceCount);
+    const QString textHeader = buildSegyTextHeader(inputBlocks, history, name, ds->traceCount, samplesPerTrace,
+                                                   ds->binHeader.sampleIntervalUs);
+    const std::filesystem::path outPath = scratchSegyPath(name);
+    struct Outcome {
+        bool ok = false;
+        std::string error;
+    };
+    auto outcome = std::make_shared<Outcome>();
+    runBackgroundTask(
+        QString("f-k Filter: %1").arg(QString::fromStdString(ds->name)),
+        [this, ds, p, samplesPerTrace, textHeader, outPath, outcome]() {
+            // Panels of N traces every N/2, weighted by sin^2 across the panel
+            // (two overlapping weights add up to 1); each output chunk adds
+            // the panels that touch it.
+            const int64_t n = kFkFilterPanelTraces, hop = n / 2;
+            const int64_t traceCount = ds->traceCount;
+            const double intervalUs = ds->binHeader.sampleIntervalUs;
+            backgroundTaskTotal_ = traceCount;
+            segy::ThreadPool pool;
+            auto decode = [&](int64_t t, float* out) {
+                const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                segy::decodeSamples(base + segy::kTraceHeaderSize, out, size_t(samplesPerTrace), ds->binHeader.formatCode);
+            };
+            outcome->ok = segy::writeSegyFileChunked(
+                outPath, textHeader.toStdString(), ds->binHeader, traceCount,
+                [&](int64_t begin, int64_t end, std::vector<segy::WriteTrace>& chunk) {
+                    for (int64_t t = begin; t < end; ++t) {
+                        segy::WriteTrace& out = chunk[size_t(t - begin)];
+                        const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + size_t(t) * ds->traceStrideBytes;
+                        out.headerBytes.assign(base, base + segy::kTraceHeaderSize);
+                        out.samples.assign(size_t(samplesPerTrace), 0.0f);
+                    }
+                    // Panel p covers traces [(p - 1) hop, (p - 1) hop + n).
+                    const int64_t pFirst = begin / hop - 1, pLast = end / hop + 1;
+                    std::vector<int64_t> panelIds;
+                    for (int64_t pid = std::max<int64_t>(0, pFirst); pid <= pLast; ++pid) {
+                        const int64_t start = (pid - 1) * hop;
+                        if (start < end && start + n > begin && start < traceCount) panelIds.push_back(pid);
+                    }
+                    std::vector<std::vector<std::vector<float>>> results(panelIds.size());
+                    pool.parallelFor(panelIds.size(), 1, [&](size_t b, size_t e) {
+                        for (size_t i = b; i < e; ++i) {
+                            const int64_t start = (panelIds[i] - 1) * hop;
+                            std::vector<std::vector<float>> panelTraces(size_t(n), std::vector<float>(size_t(samplesPerTrace), 0.0f));
+                            for (int64_t k = 0; k < n; ++k) {
+                                const int64_t t = start + k;
+                                if (t >= 0 && t < traceCount) decode(t, panelTraces[size_t(k)].data());
+                            }
+                            segy::fkFilterPanel(panelTraces, intervalUs, p);
+                            results[i] = std::move(panelTraces);
+                        }
+                    });
+                    const double pi = 3.14159265358979323846;
+                    for (size_t i = 0; i < panelIds.size(); ++i) {
+                        const int64_t start = (panelIds[i] - 1) * hop;
+                        for (int64_t k = 0; k < n; ++k) {
+                            const int64_t t = start + k;
+                            if (t < begin || t >= end) continue;
+                            const float w = float(std::pow(std::sin(pi * (double(k) + 0.5) / double(n)), 2.0));
+                            std::vector<float>& dst = chunk[size_t(t - begin)].samples;
+                            const std::vector<float>& src = results[i][size_t(k)];
+                            for (int s = 0; s < samplesPerTrace; ++s) dst[size_t(s)] += w * src[size_t(s)];
+                        }
+                    }
+                    backgroundTaskDone_ = end;
+                },
+                &outcome->error, 4096);
+        },
+        [this, panel, outPath, history, outcome]() {
+            if (!outcome->ok) {
+                QMessageBox::warning(this, "f-k Filter", QString::fromStdString(outcome->error));
+                return;
+            }
+            panel->canvas->startLoading(outPath, history);
+        });
 }
 
 void MainWindow::runTraceTransform(Panel* panel, const QString& title, const QString& outputName,

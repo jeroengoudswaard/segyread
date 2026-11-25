@@ -3263,6 +3263,57 @@ The core is `viewer/depth_conversion.h/.cpp` (Qt-free, tested):
   right. The depth axis reads "Depth (m)". Converting back to time gives
   the original section.
 
+### Filters, deconvolution and attributes (Processing menu)
+
+Each one writes a new dataset (streamed, see the performance pass) into
+the active panel, so they cascade. The core is `viewer/processing.h/.cpp`
+(Qt-free, tested); the dialogs share one shape (`askProcessingValues`: a
+few numbers, an output name, one paragraph of explanation) and remember
+the last values. Menu: Processing > Bandpass Filter..., **f-k Filter...**,
+**Spectral Whitening...**, **Deconvolution...**, then **Attributes >**
+Envelope / Instantaneous Phase / Instantaneous Frequency / Phase
+Rotation..., then Integration, Differentiation, Scale, Time-Depth.
+
+- **f-k Filter** (remove below a velocity): along consecutive traces, in
+  panels of 128 traces every 64, each panel 2D-FFT'd (time to the next
+  power of two, traces to twice their count), weighted, inverted, and
+  added with a sin^2 weight across the panel (two overlapping weights sum
+  to 1). Weight 1 for apparent velocities |f|/|k| at or above the cut (and
+  for k = 0, flat events), 0 below (1 - taper) x cut, a cosine in between.
+  The trace spacing defaults to the median distance between consecutive
+  CDP X/Y (or source X/Y) over the first 500 traces, scaled by bytes
+  71-72; the dialog says whether it came from the headers. The output is
+  built per 4096-trace chunk from the panels touching it.
+- **Spectral Whitening**: per trace, the amplitude spectrum divided by its
+  own running average (Smoothing wide), phase kept, cosine ramps one
+  smoothing width wide outside From..To, RMS restored. Dead traces stay
+  dead.
+- **Deconvolution**: predictive (Wiener) on the whole trace: the
+  autocorrelation to gap + operator, prewhitened by White noise, solved
+  with Levinson's recursion (`levinsonSolve`), and
+  y(t) = x(t) - sum a_k x(t - gap - k). Defaults 160 ms operator, 24 ms
+  gap, 0.1 %; a gap of one sample is spiking deconvolution.
+- **Attributes** from the analytic signal x + iH[x] (FFT, padded to twice
+  the next power of two so the Hilbert transform does not wrap):
+  envelope |x + iH|; instantaneous phase atan2(H, x) in degrees;
+  instantaneous frequency from the angle of a[t+1] conj(a[t-1]) summed
+  over 5 samples (exact for a pure tone, weighted by the envelope squared
+  so it does not spike in quiet zones), clamped 0..Nyquist; phase
+  rotation x cos(a) - H sin(a) (the only one with a question).
+- **Tests**: a 20 Hz cosine gives envelope 1 (+-0.01), phase 2 pi f t
+  (+-1 degree), 20 Hz (+-0.3); +90 degrees turns cos into -sin, 180 flips
+  it; Levinson against a 3x3 system; spiking decon recovers the white
+  series under an AR(1) trace (correlation > 0.99); whitening a 25 Hz
+  ricker over 10-60 Hz makes 50 Hz within 20 % of 15 Hz and removes 110 Hz;
+  the f-k filter keeps > 95 % of a flat event and < 5 % of a 1000 m/s dip
+  (cut 1500 m/s, 10 m traces).
+- **Speed** (PARAGON, 15082 x 2501, 16 threads): f-k 1.6 s, whitening
+  0.4 s, decon 0.4 s, attributes 0.5-0.65 s. Checked by screenshot.
+- Simplifications, on purpose: one design window (the whole trace) for
+  decon and whitening; the f-k filter treats the file as one sequence of
+  traces (sort prestack data into gathers first, and note that a panel can
+  straddle two gathers); only a reject-below-velocity fan, no polygons.
+
 ### UX pass: one zoom, fewer menus, two themes
 
 A review of every window, aiming for less: nothing shown twice, nothing
