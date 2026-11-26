@@ -142,6 +142,21 @@ non-modal, the hook couldn't accept it), Calculator, Time-Depth.
 
 ## Open observations (to do / could be better)
 
+**Next up (status 2026-11-26; everything else requested is done and pushed)**
+- **Failing test:** `segytest` reports 1 failure in 88,412 checks:
+  `test_main.cpp:1694`, Signal/Noise "both paths covered" (accepted 45,
+  low-correlation 0). It comes from commit `7e8ada2` and fails on that
+  commit alone too. Probable cause: `std::normal_distribution` gives
+  different noise on MSVC. Fix: seed a fixed sequence the test controls.
+- **Reverse Polarity sync:** ticking it in Display Parameters updates the
+  display but not the optional Reverse Polarity toolbar toggle
+  (`reversePolarityAction_`).
+- **Slow spots on the 6 GB file:** loading a whole-file result back in
+  takes 5–9 s; drawing Octave Bands stalls the UI for about 0.18 s;
+  Bandpass, Calculator and Time-Depth are not yet timed (see above).
+- Recommended order: the two small fixes first, then the Basemap (item 1
+  under "Missing" below).
+
 **Inconsistencies left in the UI**
 - (Fixed 2026-11-25: one number format, `QLocale::c()`, set in `main`;
   Spectrum/Histogram use Visible Data or the box like every other
