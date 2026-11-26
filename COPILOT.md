@@ -81,3 +81,43 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 47. **Zippiness pass on processing** — *done (2026-11-25): f-k filter 62 -> 25 s, attributes 21 -> 12 s, f-k display 4.5 -> 1.5 s on the 6 GB file; mutes preserved; robust default clip.*
 
+
+## Round of 2026-11-26 (user list 1-17)
+
+48. **Swap Foreground and Background** (list item 1). *Decided: one action swaps the two datasets of the active panel.* *Status: done (2026-11-26).*
+
+49. **Curtain comparison** (list item 2) — with a Background dataset set, the Background is drawn left of a vertical divider and the Foreground right of it; drag the divider like a curtain to pull the Foreground over the Background. *Status: done (2026-11-26).*
+
+50. **f-k display: say what Auto chose** (list item 3). *Status: done (2026-11-26).*
+
+51. **Auto-pick Seabed only in the Horizon Manager** (list item 4). *Status: done (2026-11-26).*
+
+52. **Dataset names**: Foreground/Background boxes show the start and end of a long name with "..." in the middle; hovering shows the full name (list item 5). *Status: done (2026-11-26).*
+
+53. **Octave Bands window**: normal minimise/maximise buttons (list item 6). *Status: done (2026-11-26).*
+
+54. **Signal/Noise details**: rows closer together (list item 7). *Status: done (2026-11-26).*
+
+55. **Open with analysis** (list item 8) — scan the file before reading it: which headers hold what, read a subselection (trace range + every Nth, and min/max/step on header keys), override the trace-header byte mapping, save and load the mapping as a template. Rename "Shell V2.1" to "SEG-Y v2.1". *Status: done (2026-11-26).*
+
+56. **Autocorrelation** (list items 9-11): remove the spectrum option; the auto lag threshold is the user's (default 0.3); measure a lag with a measuring tool. *Status: done (2026-11-26).*
+
+57. **Scale bar** (list item 12) — black/white bar of about 5-10 % of the plot width, rounded to a nice number (100, 200, 500, 1000 ...), m switching to km from 10 000 m; bottom right, top right when the dataset names are bottom right. Also in the autocorrelation window. *Decided: trace spacing from CDP X/Y; without coordinates the user types a trace spacing.* *Status: done (2026-11-26).*
+
+58. **Recompute turns orange** when a setting in a result window changed (list item 13). *Status: done (2026-11-26).*
+
+59. **Cross-correlation** as an analysis next to the autocorrelation (list item 14). *Status: done (2026-11-26).*
+
+60. **Spectra to CSV and back** (list item 15): save the spectrum and the Signal/Noise spectra as CSV; load a saved spectrum into the spectrum window. *Status: done (2026-11-26).*
+
+61. **Spectrum manager** (list item 16): each spectrum (box) is listed and can be switched on/off. *Status: done (2026-11-26).*
+
+62. **Peak frequency** in the spectrum's right-hand bar (list item 17). *Status: done (2026-11-26).*
+
+## From the comparison with Ewoud's segy_reader (2026-11-26)
+
+63. **Ewoud, easy group** — field types per header field (2I/4I/unsigned/IEEE/IBM/8-byte, own byte order); a trace-header mapping saved and loaded as a template; header positions read from the text header as a proposal; header scan with your own fields, Copy table and an "out of date" note; rev 2 data start and extended text headers; files with an undecodable sample format still show their headers; raw binary header view; scroll bars on the seismic; a notes list ("never guess without saying so"). Built together with item 55. *Status: done (2026-11-26).*
+
+64. **Ewoud, medium (later)** — little-endian files with "retry with the other byte order"; colour maps from `.cmap` files (Petrel seismic, Earth model, Turbo...); x-axis by a header (CDP, shotpoint); PNG export at a fixed size; Basemap from a point scan of source/receiver/midpoint X/Y coloured by a header; overlay curve from a header expression (whitelist parser, no eval; could feed header math).
+
+65. **Ewoud, optional** — 3D bin grid from the text header (corners, bin size, azimuth, derived 4th corner) and fold maps per cell. Outside the 2D scope for now; the user likes them, so kept as options.

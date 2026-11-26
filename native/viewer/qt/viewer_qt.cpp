@@ -93,8 +93,22 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QSysInfo>
+#include <QScrollBar>
+#include <QClipboard>
+#include <QTabWidget>
+#include <climits>
+#include <cstring>
 
 namespace segyqt {
+
+// Qt 5 (Rocky/RHEL 8) and Qt 6: a mouse event's position.
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+inline QPointF eventPos(const QMouseEvent* e) { return e->localPos(); }
+inline QPointF eventGlobalPos(const QMouseEvent* e) { return e->screenPos(); }
+#else
+inline QPointF eventPos(const QMouseEvent* e) { return e->position(); }
+inline QPointF eventGlobalPos(const QMouseEvent* e) { return e->globalPosition(); }
+#endif
 
 namespace {
 QFile* perfFile() {
@@ -430,19 +444,110 @@ void addButtonRow(QDialog* dialog, QVBoxLayout* layout,
     layout->addLayout(row);
 }
 
+// Every result window's Recompute: orange when the settings (or the data)
+// differ from what is on screen, plain when it is up to date.
+void styleRecomputeButton(QPushButton* button, bool useful) {
+    if (!button) return;
+    button->setStyleSheet(themed(useful ? "QPushButton { background: #e8905a; color: #1e1f22; border: 1px solid #e8905a; }"
+                                          "QPushButton:hover { background: #f0a06c; }"
+                                        : QString()));
+    button->setToolTip(useful ? "Recompute: the settings or the data changed" : "Recompute: up to date");
+}
+
 // Shared by SegyCanvas::makeRenderContext() and MainWindow's
 // compute-and-show Histogram/Spectrum methods -- same fields either way,
 // so kept in one place rather than two copies drifting apart.
-segy::RenderContext makeRenderContextFor(AppState& app) {
+// Median distance between neighbouring traces over the first 500, from
+// CDP X/Y (or source X/Y) with the coordinate scalar; 0 without coordinates.
+double estimateTraceSpacing(const Dataset& ds) {
+    std::vector<double> steps;
+    const int64_t count = std::min<int64_t>(ds.traceCount, 501);
+    double px = 0.0, py = 0.0;
+    for (int64_t t = 0; t < count; ++t) {
+        const segy::TraceHeader th =
+            segy::parseTraceHeader(ds.file.data() + segy::kHeaderTotalSize + size_t(t) * ds.traceStrideBytes);
+        const double scale = th.coordinateScalar < 0 ? 1.0 / -th.coordinateScalar
+                             : th.coordinateScalar > 0 ? double(th.coordinateScalar)
+                                                       : 1.0;
+        const bool useCdp = th.cdpX != 0 || th.cdpY != 0;
+        const double x = (useCdp ? th.cdpX : th.x) * scale, y = (useCdp ? th.cdpY : th.y) * scale;
+        if (t > 0) {
+            const double d = std::hypot(x - px, y - py);
+            if (d > 0.0) steps.push_back(d);
+        }
+        px = x;
+        py = y;
+    }
+    if (steps.empty()) return 0.0;
+    std::nth_element(steps.begin(), steps.begin() + std::ptrdiff_t(steps.size() / 2), steps.end());
+    return steps[steps.size() / 2];
+}
+
+// The dataset's trace spacing (m), looked up once (500 headers) and cached;
+// a typed value (View > Trace Spacing) wins. 0 = unknown.
+double traceSpacingOf(Dataset& ds) {
+    if (ds.traceSpacingM < 0.0) ds.traceSpacingM = ds.traceCount > 1 ? estimateTraceSpacing(ds) : 0.0;
+    return ds.traceSpacingM;
+}
+
+// Scale bar: alternating black and white segments over at least 5 % of the
+// plot width, rounded up to a nice length (1, 2 or 5 x 10^n m); metres up
+// to 10 000 m, km from there. In the bottom right corner of `plot`, or the
+// top right when `top`.
+void drawScaleBar(QPainter& painter, const QRect& plot, double metresAcross, bool top) {
+    if (!(metresAcross > 0.0) || plot.width() < 120 || plot.height() < 60) return;
+    const double target = 0.05 * metresAcross;
+    const double decade = std::pow(10.0, std::floor(std::log10(target)));
+    double length = decade;
+    for (double m : {1.0, 2.0, 5.0, 10.0}) {
+        if (m * decade >= target - 1e-9) {
+            length = m * decade;
+            break;
+        }
+    }
+    const int barPx = int(std::lround(length / metresAcross * plot.width()));
+    if (barPx < 20 || barPx > plot.width() / 2) return;
+    const bool km = length >= 10000.0;
+    const QString label = km ? QString("%1 km").arg(length / 1000.0, 0, 'g', 6) : QString("%1 m").arg(length, 0, 'g', 6);
+    QFont font = painter.font();
+    font.setPixelSize(11);
+    const QFontMetrics fm(font);
+    const int barH = 6, pad = 6;
+    const int boxW = barPx + 2 * pad + fm.horizontalAdvance(label) / 2 + 4;
+    const int boxH = barH + fm.height() + 3 * pad / 2 + 2;
+    const int x0 = plot.right() - boxW - 8;
+    const int y0 = top ? plot.top() + 8 : plot.bottom() - boxH - 8;
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.fillRect(QRect(x0, y0, boxW, boxH), QColor(255, 255, 255, 215));
+    const int bx = x0 + pad, by = y0 + pad;
+    constexpr int kSegments = 4;
+    for (int i = 0; i < kSegments; ++i) {
+        const int a = bx + barPx * i / kSegments, b = bx + barPx * (i + 1) / kSegments;
+        painter.fillRect(QRect(a, by, b - a, barH), i % 2 == 0 ? Qt::black : Qt::white);
+    }
+    painter.setPen(QPen(Qt::black, 1));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRect(QRect(bx, by, barPx, barH));
+    painter.setFont(font);
+    const int ty = by + barH + 2;
+    painter.drawText(QRect(bx - 10, ty, 20, fm.height()), Qt::AlignHCenter | Qt::AlignTop, "0");
+    painter.drawText(QRect(bx + barPx - 60, ty, 120, fm.height()), Qt::AlignHCenter | Qt::AlignTop, label);
+    painter.restore();
+}
+
+segy::RenderContext makeRenderContextFor(const Dataset& ds, segy::ThreadPool& pool) {
     segy::RenderContext ctx;
-    ctx.file = &app.foreground->file;
-    ctx.pyramid = &app.foreground->pyramid;
-    ctx.binHeader = app.foreground->binHeader;
-    ctx.traceCount = app.foreground->traceCount;
-    ctx.traceStrideBytes = app.foreground->traceStrideBytes;
-    ctx.pool = &app.pool;
+    ctx.file = &ds.file;
+    ctx.pyramid = &ds.pyramid;
+    ctx.binHeader = ds.binHeader;
+    ctx.traceCount = ds.traceCount;
+    ctx.traceStrideBytes = ds.traceStrideBytes;
+    ctx.pool = &pool;
     return ctx;
 }
+
+segy::RenderContext makeRenderContextFor(AppState& app) { return makeRenderContextFor(*app.foreground, app.pool); }
 
 // Variable-area wiggle fill as horizontal pixel spans: per pixel row, the
 // trace's furthest excursion on each side of its baseline (from every line
@@ -811,6 +916,12 @@ public:
         update();
     }
 
+    // Metres across the whole trace axis, for a scale bar (0: none).
+    void setScaleBarMetres(double metres) {
+        scaleBarMetres_ = metres;
+        update();
+    }
+
     // "Time (ms)" by default; the autocorrelogram uses "Lag (ms)".
     void setVerticalTitle(const QString& title) {
         verticalTitle_ = title;
@@ -899,6 +1010,7 @@ protected:
         }
         painter.setFont(font());
         painter.drawText(QRect(plot.left(), plot.bottom() + 18, plot.width(), 16), Qt::AlignCenter, "Trace");
+        if (scaleBarMetres_ > 0.0) drawScaleBar(painter, plot, scaleBarMetres_, false);
         painter.save();
         painter.translate(10, plot.center().y());
         painter.rotate(-90);
@@ -934,6 +1046,7 @@ protected:
 private:
     std::shared_ptr<const OctaveBandData> data_;
     QString verticalTitle_ = "Time (ms)";
+    double scaleBarMetres_ = 0.0;
     float clip_ = 0.0f;
     float clipNeg_ = 0.0f;
     QImage raster_; // rasterized at plotRect() size x devicePixelRatio
@@ -1193,7 +1306,7 @@ void ClipHistogramWidget::paintEvent(QPaintEvent*) {
     maxPercent = std::max(1.0f, maxPercent * 1.15f);
 
     painter.setPen(Qt::NoPen);
-    painter.setBrush(kAccentColor);
+    painter.setBrush(QColor(kAccentColor));
     float barSlot = float(chart.width()) / float(numBins);
     for (int i = 0; i < numBins; ++i) {
         float barH = result_.percentOfTotal[size_t(i)] / maxPercent * chart.height();
@@ -2158,6 +2271,9 @@ void SaveSegyDialog::browseForFile() {
 OctaveBandDialog::OctaveBandDialog(QWidget* parent) : QDialog(parent) {
     setWindowTitle("Octave Band Display");
     setModal(false);
+    // A result window: minimise and maximise like the main window.
+    setWindowFlags(Qt::Window | Qt::WindowTitleHint | Qt::WindowSystemMenuHint | Qt::WindowMinMaxButtonsHint |
+                   Qt::WindowCloseButtonHint);
 
     QVBoxLayout* layout = new QVBoxLayout(this);
 
@@ -2180,9 +2296,12 @@ OctaveBandDialog::OctaveBandDialog(QWidget* parent) : QDialog(parent) {
     }
     minFreqCombo_->setCurrentText("2 Hz");
     maxFreqCombo_->setCurrentText("128 Hz");
-    QPushButton* applyButton = new QPushButton("Recompute");
-    connect(applyButton, &QPushButton::clicked, this, [this]() { emitApply(); });
-    toolbarRow->addWidget(applyButton);
+    recomputeButton_ = new QPushButton("Recompute");
+    connect(recomputeButton_, &QPushButton::clicked, this, [this]() { emitApply(); });
+    toolbarRow->addWidget(recomputeButton_);
+    for (QComboBox* combo : {minFreqCombo_, maxFreqCombo_}) {
+        connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { refreshRecompute(); });
+    }
     toolbarRow->addSpacing(16);
     toolbarRow->addWidget(new QLabel("Scale"));
     scaleCombo_ = new QComboBox();
@@ -2372,6 +2491,13 @@ public:
         peakLag_ = lagSamples;
         update();
     }
+    // Measure mode: clicks measure a delta-t (off: a click does nothing).
+    void setMeasureMode(bool on) {
+        measureMode_ = on;
+        measureCount_ = 0;
+        setCursor(on ? Qt::CrossCursor : Qt::ArrowCursor);
+        update();
+    }
     // Box mode: a vertical drag selects a lag range (ms) for Zoom.
     void setBoxMode(bool on) {
         boxMode_ = on;
@@ -2400,8 +2526,8 @@ protected:
     void mousePressEvent(QMouseEvent* event) override {
         if (event->button() != Qt::LeftButton || average_.size() < 2) return;
         dragging_ = true;
-        dragA_ = dragB_ = lagMsAt(event->position().y());
-        pressY_ = event->position().y();
+        dragA_ = dragB_ = lagMsAt(eventPos(event).y());
+        pressY_ = eventPos(event).y();
         update();
     }
     void mouseDoubleClickEvent(QMouseEvent* event) override {
@@ -2423,14 +2549,14 @@ protected:
     }
     void mouseMoveEvent(QMouseEvent* event) override {
         if (!dragging_) return;
-        dragB_ = lagMsAt(event->position().y());
+        dragB_ = lagMsAt(eventPos(event).y());
         update();
     }
     void mouseReleaseEvent(QMouseEvent* event) override {
         if (!dragging_ || event->button() != Qt::LeftButton) return;
         dragging_ = false;
-        if (std::fabs(event->position().y() - pressY_) < 5.0) {
-            measureAt(dragA_);
+        if (std::fabs(eventPos(event).y() - pressY_) < 5.0) {
+            if (measureMode_) measureAt(dragA_);
         } else if (onLagBox) {
             onLagBox(std::min(dragA_, dragB_), std::max(dragA_, dragB_));
         }
@@ -2513,6 +2639,7 @@ private:
     double pressY_ = 0.0;
     double peakLag_ = std::nan("");
     bool boxMode_ = false;
+    bool measureMode_ = false;
     bool dragging_ = false;
     double dragA_ = 0.0, dragB_ = 0.0;
     double measure_[2] = {0.0, 0.0};
@@ -2524,6 +2651,8 @@ private:
 AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelation) : QDialog(parent) {
     setWindowTitle(crossCorrelation ? "Cross-correlation" : "Autocorrelation");
     setModal(false);
+    setWindowFlags(Qt::Window | Qt::WindowTitleHint | Qt::WindowSystemMenuHint | Qt::WindowMinMaxButtonsHint |
+                   Qt::WindowCloseButtonHint);
     QVBoxLayout* layout = new QVBoxLayout(this);
 
     QHBoxLayout* toolbarRow = new QHBoxLayout();
@@ -2543,9 +2672,23 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelat
     toolbarRow->addWidget(minLagSpin_);
     toolbarRow->addWidget(new QLabel("+lag"));
     toolbarRow->addWidget(maxLagSpin_);
-    QPushButton* applyButton = new QPushButton("Recompute");
-    toolbarRow->addWidget(applyButton);
+    recomputeButton_ = new QPushButton("Recompute");
+    toolbarRow->addWidget(recomputeButton_);
     toolbarRow->addSpacing(12);
+    toolbarRow->addWidget(new QLabel("Peak threshold"));
+    thresholdSpin_ = new QDoubleSpinBox();
+    thresholdSpin_->setRange(0.05, 0.95);
+    thresholdSpin_->setSingleStep(0.05);
+    thresholdSpin_->setDecimals(2);
+    thresholdSpin_->setValue(0.3);
+    thresholdSpin_->setToolTip("Peak threshold: peak-to-peak is the nearest side peak of the average at or above this "
+                               "correlation");
+    toolbarRow->addWidget(thresholdSpin_);
+    measureButton_ = new QPushButton(QString("Measure %1t").arg(QChar(0x0394)));
+    measureButton_->setCheckable(true);
+    measureButton_->setToolTip(QString("Measure %1t: click two lags on the average curve; a third click starts again")
+                                   .arg(QChar(0x0394)));
+    toolbarRow->addWidget(measureButton_);
     QToolBar* zoomBar = new QToolBar(this);
     zoomBar->setVisible(false); // zoom is a gesture now (drag / double-click)
     zoomBar->setIconSize(QSize(18, 18));
@@ -2557,9 +2700,6 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelat
     boxAction_->setCheckable(true);
     boxAction_->setToolTip("Drag on the average curve to select a lag range");
     toolbarRow->addWidget(zoomBar);
-    spectrumCheck_ = new QCheckBox("Spectrum");
-    spectrumCheck_->setToolTip("Power spectrum of the average, below the plots");
-    toolbarRow->addWidget(spectrumCheck_);
     toolbarRow->addStretch();
     layout->addLayout(toolbarRow);
 
@@ -2573,7 +2713,12 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelat
     infoRow->addWidget(infoLabel_, 1);
     layout->addLayout(infoRow);
 
-    connect(applyButton, &QPushButton::clicked, this, [this]() { applyWindow(minLagSpin_->value(), maxLagSpin_->value()); });
+    connect(recomputeButton_, &QPushButton::clicked, this,
+            [this]() { applyWindow(minLagSpin_->value(), maxLagSpin_->value()); });
+    for (QDoubleSpinBox* spin : {minLagSpin_, maxLagSpin_}) {
+        connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) { refreshRecompute(); });
+    }
+    connect(thresholdSpin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) { refreshPeak(); });
     // Enter in a lag field recomputes too -- but only for a real edit
     // while the window is open. editingFinished also fires when the field
     // loses focus because the window is closing; recomputing then re-opened
@@ -2597,14 +2742,11 @@ AutocorrelationDialog::AutocorrelationDialog(QWidget* parent, bool crossCorrelat
     plots->addWidget(panelPlot, 3);
     plots->addWidget(averagePlot, 1);
     layout->addLayout(plots, 3);
-    auto* spectrum = new DbCurveChart();
-    spectrum->setTitle("Power spectrum of the average (dB) vs. Frequency (Hz)");
-    spectrum->setEmptyText("Apply to compute");
-    spectrum->setMinimumHeight(200);
-    spectrum->setVisible(false);
-    spectrumChart_ = spectrum;
-    layout->addWidget(spectrum, 2);
-    connect(spectrumCheck_, &QCheckBox::toggled, this, [spectrum](bool on) { spectrum->setVisible(on); });
+    connect(measureButton_, &QPushButton::toggled, this, [this, averagePlot](bool on) {
+        averagePlot->setMeasureMode(on);
+        if (!on) infoLabel_->setText(QString());
+        else infoLabel_->setText(QString("Click a lag on the average curve to start measuring %1t").arg(QChar(0x0394)));
+    });
 
     averagePlot->onLagBox = [this](double fromMs, double toMs) {
         hasLagBox_ = true;
@@ -2671,36 +2813,67 @@ void AutocorrelationDialog::setResult(const AutocorrelationResult& result) {
     panelPlot->setClip(1.0f); // normalized: an autocorrelation is exactly 1 at lag 0
     panelPlot->setAxisRange(result.traceStart, result.traceEnd, result.minLagSamples, result.maxLagSamples,
                             result.sampleIntervalUs);
+    panelPlot->setScaleBarMetres(result.traceSpacingM > 0.0
+                                     ? (result.traceEnd - result.traceStart + 1.0) * result.traceSpacingM
+                                     : 0.0);
     auto* averagePlot = static_cast<AutocorrelationAverageWidget*>(averagePlot_);
     averagePlot->setAverage(result.average, result.minLagSamples, result.maxLagSamples, result.sampleIntervalUs);
-    averagePlot->setPeak(result.peakLagSamples);
+    if (measureButton_->isChecked()) averagePlot->setMeasureMode(true);
     const double dtMs = result.sampleIntervalUs / 1000.0;
     lastAppliedMin_ = minLagSpin_->value();
     lastAppliedMax_ = maxLagSpin_->value();
-    peakLabel_->setText(std::isnan(result.peakLagSamples)
-                            ? QString("Peak-to-peak: no side peak %1 0.5").arg(QChar(0x2265))
-                            : QString("Peak-to-peak: %1 ms (r = %2)")
-                                  .arg(std::fabs(result.peakLagSamples) * dtMs, 0, 'f', 1)
-                                  .arg(double(result.peakValue), 0, 'f', 2));
+    lastAverage_ = result.average;
+    lastMinLag_ = result.minLagSamples;
+    lastIntervalUs_ = result.sampleIntervalUs;
+    refreshPeak();
+    refreshRecompute();
     infoLabel_->setText(QString("%1%2 traces, lags %3 to +%4 ms%5")
                             .arg(result.description.isEmpty() ? QString() : result.description + " | ")
                             .arg(result.traceCount)
                             .arg(result.minLagSamples * dtMs, 0, 'f', 0)
                             .arg(result.maxLagSamples * dtMs, 0, 'f', 0)
                             .arg(result.description.isEmpty() ? QString(", 1 at lag 0") : QString()));
-    DbCurve curve;
-    curve.name = "Power";
-    curve.color = QColor(0x39, 0x87, 0xe5);
-    curve.db = result.spectrumDb;
-    static_cast<DbCurveChart*>(spectrumChart_)->setCurves(result.spectrumHz, {curve});
+}
+
+// Peak-to-peak from the average on screen: the nearest side peak at or
+// above the threshold (changing the threshold needs no recompute).
+void AutocorrelationDialog::refreshPeak() {
+    auto* averagePlot = static_cast<AutocorrelationAverageWidget*>(averagePlot_);
+    const double threshold = thresholdSpin_->value();
+    const double lag = lastAverage_.empty() ? std::nan("")
+                                            : segy::nearestSidePeakLag(lastAverage_, lastMinLag_, float(threshold));
+    averagePlot->setPeak(lag);
+    if (lastAverage_.empty()) {
+        peakLabel_->clear();
+        return;
+    }
+    if (std::isnan(lag)) {
+        peakLabel_->setText(QString("Peak-to-peak: no side peak %1 %2").arg(QChar(0x2265)).arg(threshold, 0, 'f', 2));
+        return;
+    }
+    const int idx = std::clamp(int(std::lround(lag)) - lastMinLag_, 0, int(lastAverage_.size()) - 1);
+    peakLabel_->setText(QString("Peak-to-peak: %1 ms (r = %2)")
+                            .arg(std::fabs(lag) * lastIntervalUs_ / 1000.0, 0, 'f', 1)
+                            .arg(double(lastAverage_[size_t(idx)]), 0, 'f', 2));
+}
+
+void AutocorrelationDialog::refreshRecompute() {
+    styleRecomputeButton(recomputeButton_, minLagSpin_->value() != lastAppliedMin_ || maxLagSpin_->value() != lastAppliedMax_);
 }
 
 void AutocorrelationDialog::setApplyCallback(std::function<void(double, double)> callback) { onApply_ = std::move(callback); }
 
 void OctaveBandDialog::emitApply() {
     if (!onApply_ || sourceCombo_->count() == 0) return;
-    onApply_(sourceCombo_->currentData().toInt(), minFreqCombo_->currentData().toInt(),
-             maxFreqCombo_->currentData().toInt());
+    appliedMinHz_ = minFreqCombo_->currentData().toInt();
+    appliedMaxHz_ = maxFreqCombo_->currentData().toInt();
+    refreshRecompute();
+    onApply_(sourceCombo_->currentData().toInt(), appliedMinHz_, appliedMaxHz_);
+}
+
+void OctaveBandDialog::refreshRecompute() {
+    styleRecomputeButton(recomputeButton_, minFreqCombo_->currentData().toInt() != appliedMinHz_ ||
+                                               maxFreqCombo_->currentData().toInt() != appliedMaxHz_);
 }
 
 namespace {
@@ -3072,14 +3245,14 @@ QPointF ZoomableChart::pixelAt(double x, double y) const {
 }
 
 bool ZoomableChart::handleBoxPress(QMouseEvent* event) {
-    if (event->button() != Qt::LeftButton || !boxMode_ || !chartRect().contains(event->position().toPoint())) return false;
+    if (event->button() != Qt::LeftButton || !boxMode_ || !chartRect().contains(eventPos(event).toPoint())) return false;
     for (ZoomableChart* chart : peers()) {
         if (chart != this && chart->hasBox_) {
             chart->hasBox_ = false;
             chart->update();
         }
     }
-    boxA_ = boxB_ = dataAt(event->position());
+    boxA_ = boxB_ = dataAt(eventPos(event));
     draggingBox_ = true;
     hasBox_ = false;
     update();
@@ -3090,7 +3263,7 @@ bool ZoomableChart::handleBoxPress(QMouseEvent* event) {
 bool ZoomableChart::handleBoxMove(QMouseEvent* event) {
     if (!draggingBox_) return false;
     const QRect chart = chartRect();
-    const QPointF pos = event->position();
+    const QPointF pos = eventPos(event);
     boxB_ = dataAt(QPointF(std::clamp(pos.x(), double(chart.left()), double(chart.right())),
                            std::clamp(pos.y(), double(chart.top()), double(chart.bottom()))));
     update();
@@ -3113,7 +3286,7 @@ bool ZoomableChart::handleBoxRelease(QMouseEvent* event) {
 }
 
 void ZoomableChart::mouseDoubleClickEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton && chartRect().contains(event->position().toPoint())) unzoom();
+    if (event->button() == Qt::LeftButton && chartRect().contains(eventPos(event).toPoint())) unzoom();
 }
 
 void ZoomableChart::wheelEvent(QWheelEvent* event) {
@@ -3378,7 +3551,7 @@ void DbCurveChart::paintEvent(QPaintEvent*) {
 void DbCurveChart::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::RightButton) {
         if (frequencyHz_.size() >= 2) {
-            showAxisMenu(event->globalPosition().toPoint(), xLabel_, yLabel_, 1, 1);
+            showAxisMenu(eventGlobalPos(event).toPoint(), xLabel_, yLabel_, 1, 1);
         }
         return;
     }
@@ -3390,7 +3563,7 @@ void DbCurveChart::mouseReleaseEvent(QMouseEvent* event) { handleBoxRelease(even
 void DbCurveChart::mouseMoveEvent(QMouseEvent* event) {
     if (handleBoxMove(event)) return;
     const QRect chart = chartRect();
-    const QPointF pos = event->position();
+    const QPointF pos = eventPos(event);
     if (!crosshairEnabled_ || frequencyHz_.size() < 2 || frequencyHz_.back() <= 0.0f || !chart.contains(pos.toPoint())) {
         if (hoverIndex_ >= 0) {
             hoverIndex_ = -1;
@@ -3457,7 +3630,13 @@ QWidget* readoutValueRow(QWidget* swatch, const QString& caption, QLabel*& value
     rowLayout->setContentsMargins(0, 0, 0, 0);
     rowLayout->setSpacing(6);
     if (swatch) rowLayout->addWidget(swatch);
-    QLabel* captionLabel = new QLabel(caption);
+    QLabel* captionLabel = new QLabel();
+    // Long names (spectra of a box in a long dataset name) keep their start
+    // and end; the whole name is the tooltip.
+    const int room = swatch ? 96 : 120;
+    const QString shown = captionLabel->fontMetrics().elidedText(caption, Qt::ElideMiddle, room);
+    captionLabel->setText(shown);
+    if (shown != caption) captionLabel->setToolTip(caption);
     captionLabel->setStyleSheet(themed("color: #9a9ca3;"));
     rowLayout->addWidget(captionLabel);
     rowLayout->addStretch();
@@ -3500,6 +3679,16 @@ CurveReadoutPanel::CurveReadoutPanel(QWidget* parent) : QWidget(parent) {
     rowsLayout->setContentsMargins(0, 0, 0, 0);
     rowsLayout->setSpacing(8);
     layout->addWidget(curveRows_);
+    layout->addSpacing(12);
+    peakCaption_ = readoutSectionLabel("PEAK");
+    layout->addWidget(peakCaption_);
+    peakRows_ = new QWidget;
+    QVBoxLayout* peakLayout = new QVBoxLayout(peakRows_);
+    peakLayout->setContentsMargins(0, 0, 0, 0);
+    peakLayout->setSpacing(8);
+    layout->addWidget(peakRows_);
+    peakCaption_->hide();
+    peakRows_->hide();
     layout->addStretch();
     QLabel* hint = new QLabel("Hover over the chart to read values.");
     hint->setWordWrap(true);
@@ -3524,6 +3713,77 @@ void CurveReadoutPanel::syncRows(const DbCurveChart& chart) {
     }
     for (size_t i = 0; i < curves.size(); ++i) rows_[i].first->setVisible(curves[i].visible);
     showValues(chart, -1, 0.0);
+    syncPeaks(chart);
+}
+
+void CurveReadoutPanel::setPeakSectionVisible(bool visible) {
+    peakVisible_ = visible;
+    peakCaption_->setVisible(visible);
+    peakRows_->setVisible(visible);
+}
+
+void CurveReadoutPanel::syncPeaks(const DbCurveChart& chart) {
+    if (!peakVisible_) return;
+    const std::vector<DbCurve>& curves = chart.curves();
+    const std::vector<float>& freqs = chart.frequencies();
+    if (peakRowsList_.size() != curves.size()) {
+        for (auto& row : peakRowsList_) delete row.first;
+        peakRowsList_.clear();
+        for (const DbCurve& curve : curves) {
+            QLabel* swatch = new QLabel;
+            swatch->setPixmap(curveSwatch(curve.color, curve.dashed));
+            QLabel* value = nullptr;
+            QWidget* row = readoutValueRow(swatch, curve.name, value);
+            peakRows_->layout()->addWidget(row);
+            peakRowsList_.push_back({row, value});
+        }
+    }
+    for (size_t i = 0; i < curves.size(); ++i) {
+        const DbCurve& curve = curves[i];
+        int best = -1;
+        for (size_t k = 0; k < curve.db.size() && k < freqs.size(); ++k) {
+            if (std::isfinite(curve.db[k]) && (best < 0 || curve.db[k] > curve.db[size_t(best)])) best = int(k);
+        }
+        peakRowsList_[i].first->setVisible(curve.visible);
+        peakRowsList_[i].second->setText(best < 0 ? "--" : QString("%1 Hz").arg(double(freqs[size_t(best)]), 0, 'f', 1));
+    }
+}
+
+bool saveCurvesCsv(QWidget* parent, const DbCurveChart& chart, const QString& suggestedName) {
+    const std::vector<float>& freqs = chart.frequencies();
+    std::vector<const DbCurve*> shown;
+    for (const DbCurve& curve : chart.curves()) {
+        if (curve.visible) shown.push_back(&curve);
+    }
+    if (freqs.empty() || shown.empty()) {
+        QMessageBox::information(parent, "Save as CSV", "No curves to save.");
+        return false;
+    }
+    const QString path = QFileDialog::getSaveFileName(parent, "Save as CSV", QDir::homePath() + "/" + suggestedName + ".csv",
+                                                      "CSV files (*.csv)");
+    if (path.isEmpty()) return false;
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        QMessageBox::warning(parent, "Save as CSV", "Could not write " + path);
+        return false;
+    }
+    QTextStream out(&file);
+    auto quoted = [](QString text) {
+        text.replace('"', "\"\"");
+        return "\"" + text + "\"";
+    };
+    out << "Frequency (Hz)";
+    for (const DbCurve* curve : shown) out << "," << quoted(curve->name + " (dB)");
+    out << "\n";
+    for (size_t k = 0; k < freqs.size(); ++k) {
+        out << QString::number(double(freqs[k]), 'f', 4);
+        for (const DbCurve* curve : shown) {
+            out << ",";
+            if (k < curve->db.size() && std::isfinite(curve->db[k])) out << QString::number(double(curve->db[k]), 'f', 3);
+        }
+        out << "\n";
+    }
+    return true;
 }
 
 void CurveReadoutPanel::showValues(const DbCurveChart& chart, int frequencyIndex, double cursorDb) {
@@ -3551,8 +3811,9 @@ SpectrumPlotWidget::SpectrumPlotWidget(QWidget* parent) : QWidget(parent) {
     chart_ = new DbCurveChart(this);
     chart_->setEmptyText("No data yet -- open a file, then click Apply or OK in Spectrum Parameters.");
     readout_ = new CurveReadoutPanel(this);
+    readout_->setPeakSectionVisible(true);
     chart_->setHoverCallback([this](int index, double cursorDb) { readout_->showValues(*chart_, index, cursorDb); });
-    layout->addWidget(buildResultWindowMenuBar(
+    QMenuBar* menuBar = buildResultWindowMenuBar(
         this, [this](bool checked) { chart_->setGridLinesVisible(checked); },
         [this]() {
             if (onParameters_) onParameters_();
@@ -3560,8 +3821,22 @@ SpectrumPlotWidget::SpectrumPlotWidget(QWidget* parent) : QWidget(parent) {
         [this](bool checked) {
             chart_->setCrosshairEnabled(checked);
             readout_->setVisible(checked);
-        }));
-    layout->addWidget(buildChartZoomToolbar(chart_, this));
+        });
+    QMenu* spectraMenu = menuBar->addMenu("&Spectra");
+    QAction* managerAction = spectraMenu->addAction("Spectrum &Manager");
+    connect(managerAction, &QAction::triggered, this, [this]() { openManager(); });
+    spectraMenu->addSeparator();
+    QAction* saveAction = spectraMenu->addAction("&Save as CSV...");
+    connect(saveAction, &QAction::triggered, this, [this]() { saveCurvesCsv(this, *chart_, "spectrum"); });
+    QAction* loadAction = spectraMenu->addAction("&Load Spectrum...");
+    connect(loadAction, &QAction::triggered, this, [this]() { loadCsv(); });
+    layout->addWidget(menuBar);
+    QToolBar* zoomBar = buildChartZoomToolbar(chart_, this);
+    zoomBar->addSeparator();
+    QAction* managerButton = zoomBar->addAction("Spectra");
+    managerButton->setToolTip("Spectra: switch spectra on and off, remove, save or load them");
+    connect(managerButton, &QAction::triggered, this, [this]() { openManager(); });
+    layout->addWidget(zoomBar);
     QHBoxLayout* body = new QHBoxLayout();
     body->setContentsMargins(0, 0, 0, 0);
     body->setSpacing(0);
@@ -3570,13 +3845,191 @@ SpectrumPlotWidget::SpectrumPlotWidget(QWidget* parent) : QWidget(parent) {
     layout->addLayout(body, 1);
 }
 
-void SpectrumPlotWidget::setResult(const segy::SpectrumResult& result, QColor sourceColor) {
-    DbCurve curve;
-    curve.name = "Amplitude";
-    curve.color = sourceColor;
-    curve.db = result.amplitudeDb;
-    chart_->setCurves(result.frequencyHz, {curve});
+void SpectrumPlotWidget::addSpectrum(SpectrumEntry entry) {
+    if (entry.frequencyHz.size() < 2 || entry.db.size() != entry.frequencyHz.size()) return;
+    auto same = std::find_if(entries_.begin(), entries_.end(),
+                             [&](const SpectrumEntry& e) { return !entry.key.isEmpty() && e.key == entry.key; });
+    if (same != entries_.end()) {
+        entry.visible = true;
+        *same = std::move(entry);
+    } else {
+        entries_.push_back(std::move(entry));
+    }
+    rebuildChart();
+    refreshManager();
+}
+
+QColor SpectrumPlotWidget::nextColor() {
+    // Validated dark-surface categorical steps (see the Signal/Noise colours).
+    static const QColor palette[] = {QColor(0xc3, 0xc2, 0xb7), QColor(0x39, 0x87, 0xe5), QColor(0xd9, 0x59, 0x26),
+                                     QColor(0x19, 0x9e, 0x70), QColor(0xb3, 0x7f, 0xeb), QColor(0xe0, 0xb0, 0x20)};
+    return palette[colorCounter_++ % 6];
+}
+
+// All spectra on one frequency axis: up to the highest frequency of any of
+// them, at the finest step (capped at 8192 points); each is interpolated
+// linearly onto it and left empty (NaN) outside its own range.
+void SpectrumPlotWidget::rebuildChart() {
+    double fmax = 0.0, step = std::numeric_limits<double>::infinity();
+    for (const SpectrumEntry& e : entries_) {
+        fmax = std::max(fmax, double(e.frequencyHz.back()));
+        step = std::min(step, double(e.frequencyHz[1] - e.frequencyHz[0]));
+    }
+    if (entries_.empty() || !(fmax > 0.0) || !(step > 0.0)) {
+        chart_->setCurves({}, {});
+        readout_->syncRows(*chart_);
+        return;
+    }
+    const int n = std::clamp(int(std::lround(fmax / step)) + 1, 2, 8192);
+    std::vector<float> axis(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) axis[size_t(i)] = float(fmax * i / (n - 1));
+    std::vector<DbCurve> curves;
+    for (const SpectrumEntry& e : entries_) {
+        DbCurve curve;
+        curve.name = e.name;
+        curve.color = e.color;
+        curve.visible = e.visible;
+        curve.db.assign(axis.size(), std::numeric_limits<float>::quiet_NaN());
+        size_t j = 0;
+        for (size_t i = 0; i < axis.size(); ++i) {
+            const float f = axis[i];
+            if (f < e.frequencyHz.front() || f > e.frequencyHz.back()) continue;
+            while (j + 1 < e.frequencyHz.size() && e.frequencyHz[j + 1] < f) ++j;
+            if (j + 1 >= e.frequencyHz.size()) {
+                curve.db[i] = e.db.back();
+                continue;
+            }
+            const float f0 = e.frequencyHz[j], f1 = e.frequencyHz[j + 1];
+            const float w = f1 > f0 ? (f - f0) / (f1 - f0) : 0.0f;
+            const float a = e.db[j], b = e.db[j + 1];
+            curve.db[i] = std::isfinite(a) && std::isfinite(b) ? a + w * (b - a) : (w < 0.5f ? a : b);
+        }
+        curves.push_back(std::move(curve));
+    }
+    chart_->setCurves(std::move(axis), std::move(curves));
     readout_->syncRows(*chart_);
+}
+
+void SpectrumPlotWidget::openManager() {
+    if (!manager_) {
+        manager_ = new QWidget(this, Qt::Tool);
+        manager_->setWindowTitle("Spectrum Manager");
+        manager_->resize(380, 300);
+        QVBoxLayout* layout = new QVBoxLayout(manager_);
+        managerList_ = new QListWidget();
+        managerList_->setToolTip("Tick a spectrum to show it");
+        layout->addWidget(managerList_, 1);
+        connect(managerList_, &QListWidget::itemChanged, this, [this](QListWidgetItem* item) {
+            const int row = managerList_->row(item);
+            if (row < 0 || row >= int(entries_.size())) return;
+            entries_[size_t(row)].visible = item->checkState() == Qt::Checked;
+            chart_->setCurveVisible(row, entries_[size_t(row)].visible);
+            readout_->syncRows(*chart_);
+        });
+        QHBoxLayout* buttons = new QHBoxLayout();
+        QPushButton* removeButton = new QPushButton("Remove");
+        removeButton->setToolTip("Remove: drop the selected spectrum");
+        QPushButton* clearButton = new QPushButton("Remove All");
+        QPushButton* saveButton = new QPushButton("Save CSV...");
+        saveButton->setToolTip("Save CSV: the ticked spectra, one column each");
+        QPushButton* loadButton = new QPushButton("Load CSV...");
+        loadButton->setToolTip("Load CSV: a saved spectrum (frequency column, then dB columns)");
+        for (QPushButton* b : {removeButton, clearButton, saveButton, loadButton}) buttons->addWidget(b);
+        layout->addLayout(buttons);
+        connect(removeButton, &QPushButton::clicked, this, [this]() {
+            const int row = managerList_->currentRow();
+            if (row < 0 || row >= int(entries_.size())) return;
+            entries_.erase(entries_.begin() + row);
+            rebuildChart();
+            refreshManager();
+        });
+        connect(clearButton, &QPushButton::clicked, this, [this]() {
+            entries_.clear();
+            rebuildChart();
+            refreshManager();
+        });
+        connect(saveButton, &QPushButton::clicked, this, [this]() { saveCurvesCsv(manager_, *chart_, "spectrum"); });
+        connect(loadButton, &QPushButton::clicked, this, [this]() { loadCsv(); });
+    }
+    refreshManager();
+    manager_->show();
+    manager_->raise();
+    manager_->activateWindow();
+}
+
+void SpectrumPlotWidget::refreshManager() {
+    if (!managerList_) return;
+    QSignalBlocker block(managerList_);
+    managerList_->clear();
+    for (const SpectrumEntry& e : entries_) {
+        QListWidgetItem* item = new QListWidgetItem(QIcon(curveSwatch(e.color, false)), e.name);
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+        item->setCheckState(e.visible ? Qt::Checked : Qt::Unchecked);
+        managerList_->addItem(item);
+    }
+}
+
+// Reads a CSV written by Save as CSV (or any: first column frequency in
+// Hz, further columns dB; a non-numeric first row names the columns).
+void SpectrumPlotWidget::loadCsv() {
+    const QString path =
+        QFileDialog::getOpenFileName(this, "Load Spectrum", QDir::homePath(), "CSV files (*.csv);;All files (*)");
+    if (path.isEmpty()) return;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Load Spectrum", "Could not read " + path);
+        return;
+    }
+    QTextStream in(&file);
+    QStringList names;
+    std::vector<float> freqs;
+    std::vector<std::vector<float>> columns;
+    bool first = true;
+    while (!in.atEnd()) {
+        const QString line = in.readLine().trimmed();
+        if (line.isEmpty()) continue;
+        QStringList cells = line.split(QRegularExpression("[,;\t]"));
+        for (QString& c : cells) {
+            c = c.trimmed();
+            if (c.startsWith('"') && c.endsWith('"') && c.size() >= 2) c = c.mid(1, c.size() - 2);
+        }
+        bool ok = false;
+        const float f = cells[0].toFloat(&ok);
+        if (!ok) {
+            if (first) names = cells.mid(1);
+            first = false;
+            continue;
+        }
+        first = false;
+        if (columns.size() < size_t(cells.size() - 1)) columns.resize(size_t(cells.size() - 1));
+        freqs.push_back(f);
+        for (size_t c = 0; c < columns.size(); ++c) {
+            bool cellOk = false;
+            const float v = int(c) + 1 < cells.size() ? cells[int(c) + 1].toFloat(&cellOk) : 0.0f;
+            columns[c].resize(freqs.size() - 1, std::numeric_limits<float>::quiet_NaN());
+            columns[c].push_back(cellOk ? v : std::numeric_limits<float>::quiet_NaN());
+        }
+    }
+    if (freqs.size() < 2 || columns.empty() || !std::is_sorted(freqs.begin(), freqs.end())) {
+        QMessageBox::warning(this, "Load Spectrum",
+                             "No spectrum found: expected a frequency column (Hz, increasing) and dB columns.");
+        return;
+    }
+    const QString base = QFileInfo(path).completeBaseName();
+    for (size_t c = 0; c < columns.size(); ++c) {
+        columns[c].resize(freqs.size(), std::numeric_limits<float>::quiet_NaN());
+        SpectrumEntry e;
+        QString column = int(c) < names.size() ? names[int(c)] : QString("Column %1").arg(c + 2);
+        column.remove(" (dB)");
+        e.name = columns.size() == 1 ? base : base + " \xc2\xb7 " + column;
+        e.key = "file:" + path + ":" + QString::number(c);
+        e.color = nextColor();
+        e.frequencyHz = freqs;
+        e.db = std::move(columns[c]);
+        addSpectrum(std::move(e));
+    }
+    show();
+    raise();
 }
 
 void SpectrumPlotWidget::setParametersCallback(std::function<void()> callback) { onParameters_ = std::move(callback); }
@@ -3602,12 +4055,16 @@ SignalNoiseWindow::SignalNoiseWindow(QWidget* parent) : QWidget(parent, Qt::Wind
     chart_->setEmptyText("Computing...");
     readout_ = new CurveReadoutPanel(this);
     chart_->setHoverCallback([this](int index, double cursorDb) { readout_->showValues(*chart_, index, cursorDb); });
-    layout->addWidget(buildResultWindowMenuBar(
+    QMenuBar* snMenuBar = buildResultWindowMenuBar(
         this, [this](bool checked) { chart_->setGridLinesVisible(checked); }, nullptr,
         [this](bool checked) {
             chart_->setCrosshairEnabled(checked);
             readout_->setVisible(checked);
-        }));
+        });
+    QAction* snSaveAction = snMenuBar->addMenu("&Spectra")->addAction("&Save as CSV...");
+    snSaveAction->setToolTip("Save as CSV: the shown curves (trace, signal, noise, S/N) for the Spectrum window");
+    connect(snSaveAction, &QAction::triggered, this, [this]() { saveCurvesCsv(this, *chart_, "signal_noise"); });
+    layout->addWidget(snMenuBar);
 
     QWidget* header = new QWidget(this);
     header->setStyleSheet(themed("background-color: #141416;"));
@@ -3772,7 +4229,8 @@ void SignalNoiseWindow::showDetails() {
         detailsTable_->setFocusPolicy(Qt::NoFocus);
         detailsTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
         detailsTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-        detailsTable_->setStyleSheet(themed("QTableWidget { background: #1a1b1e; border: none; }"));
+        detailsTable_->setStyleSheet(
+            themed("QTableWidget { background: #1a1b1e; border: none; } QTableWidget::item { padding: 0 4px; }"));
         layout->addWidget(detailsTable_);
     }
     detailsTable_->clearSpans();
@@ -3801,7 +4259,10 @@ void SignalNoiseWindow::showDetails() {
         detailsTable_->setItem(row, 0, label);
         detailsTable_->setItem(row, 1, value);
     }
-    detailsTable_->resizeRowsToContents();
+    // Compact rows: the text height plus a little air, not Qt's default.
+    const int rowHeight = detailsTable_->fontMetrics().height() + 4;
+    detailsTable_->verticalHeader()->setMinimumSectionSize(1);
+    for (int row = 0; row < detailsTable_->rowCount(); ++row) detailsTable_->setRowHeight(row, rowHeight);
     int height = 0;
     for (int row = 0; row < detailsTable_->rowCount(); ++row) height += detailsTable_->rowHeight(row);
     detailsTable_->setMinimumHeight(height + 4);
@@ -3816,11 +4277,7 @@ void SignalNoiseWindow::setRecomputeCallback(std::function<void()> callback) { o
 void SignalNoiseWindow::setParamsEditedCallback(std::function<void()> callback) { onParamsEdited_ = std::move(callback); }
 
 void SignalNoiseWindow::setRecomputeUseful(bool useful) {
-    recomputeButton_->setStyleSheet(themed(useful ? "QPushButton { background: #e8905a; color: #1e1f22; border: 1px solid #e8905a; }"
-                                             "QPushButton:hover { background: #f0a06c; }"
-                                           : QString()));
-    recomputeButton_->setToolTip(useful ? "The data or the parameters changed: recompute"
-                                        : "Up to date with the data and parameters");
+    styleRecomputeButton(recomputeButton_, useful);
 }
 
 void SignalNoiseWindow::setWindowParams(const segy::SigcorParams& params) {
@@ -3949,7 +4406,7 @@ void FkChart::paintEvent(QPaintEvent*) {
     }
     const QRect chart = chartRect();
     if (chart.width() <= 0 || chart.height() <= 0) return;
-    if (raster_.isNull() || raster_.deviceIndependentSize().toSize() != chart.size()) rebuildRaster(chart);
+    if (raster_.isNull() || (QSizeF(raster_.size()) / raster_.devicePixelRatio()).toSize() != chart.size()) rebuildRaster(chart);
     painter.drawImage(chart.topLeft(), raster_);
 
     QFont font = axisFont();
@@ -4075,7 +4532,7 @@ void FkChart::paintEvent(QPaintEvent*) {
 void FkChart::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::RightButton) {
         if (data_.frequencies >= 2) {
-            showAxisMenu(event->globalPosition().toPoint(),
+            showAxisMenu(eventGlobalPos(event).toPoint(),
                          data_.spacingKnown ? "Wavenumber (cycles/km)" : "Wavenumber (cycles/trace)", "Frequency (Hz)",
                          data_.spacingKnown ? 2 : 4, 1);
         }
@@ -4088,7 +4545,7 @@ void FkChart::mouseReleaseEvent(QMouseEvent* event) { handleBoxRelease(event); }
 
 void FkChart::mouseMoveEvent(QMouseEvent* event) {
     if (handleBoxMove(event)) return;
-    const QPointF pos = event->position();
+    const QPointF pos = eventPos(event);
     const bool inside = data_.frequencies >= 2 && chartRect().contains(pos.toPoint());
     if (!inside) {
         if (hovering_) {
@@ -4333,6 +4790,17 @@ double FkWindow::offsetScalar() const { return offsetScalar_; }
 
 double FkWindow::cdpDistance() const { return cdpDistance_; }
 
+void FkWindow::setResolvedModes(int gatherMode, int distanceMode) {
+    static const char* gatherNames[] = {"", "FFID", "CDP", "None"};
+    static const char* distanceNames[] = {"", "Offset", "CDP"};
+    const QString g = gatherMode >= 1 && gatherMode <= 3 ? QString(" (%1)").arg(gatherNames[gatherMode]) : QString();
+    const QString d = distanceMode >= 1 && distanceMode <= 2 ? QString(" (%1)").arg(distanceNames[distanceMode]) : QString();
+    gatherCombo_->setItemText(0, "Auto" + g);
+    distanceCombo_->setItemText(0, "Auto" + d);
+    resolvedGather_ = gatherMode;
+    syncScalarField();
+}
+
 void FkWindow::proposeCdpDistance(double metres) {
     if (cdpDistanceTyped_ || !(metres > 0.0)) return;
     cdpDistance_ = metres;
@@ -4344,7 +4812,8 @@ void FkWindow::proposeCdpDistance(double metres) {
 // offset with gathers, CDP for None).
 void FkWindow::syncScalarField() {
     const int mode = distanceMode();
-    showingCdp_ = mode == 2 || (mode == 0 && gatherMode() == 3);
+    const int gather = gatherMode() == 0 ? resolvedGather_ : gatherMode(); // Auto: what it chose last time
+    showingCdp_ = mode == 2 || (mode == 0 && gather == 3);
     QSignalBlocker block(scalarSpin_);
     if (showingCdp_) {
         scalarCaption_->setText("CDP distance");
@@ -4365,11 +4834,7 @@ void FkWindow::setRecomputeCallback(std::function<void()> callback) { onRecomput
 void FkWindow::setParamsEditedCallback(std::function<void()> callback) { onParamsEdited_ = std::move(callback); }
 
 void FkWindow::setRecomputeUseful(bool useful) {
-    recomputeButton_->setStyleSheet(themed(useful ? "QPushButton { background: #e8905a; color: #1e1f22; border: 1px solid #e8905a; }"
-                                             "QPushButton:hover { background: #f0a06c; }"
-                                           : QString()));
-    recomputeButton_->setToolTip(useful ? "The data or the settings changed: recompute"
-                                        : "Up to date with the data and settings");
+    styleRecomputeButton(recomputeButton_, useful);
 }
 
 namespace {
@@ -4501,6 +4966,8 @@ void DatasetSlotWidget::setLabel(const QString& label) {
 
 void DatasetSlotWidget::setDatasetName(const QString& name) {
     datasetName_ = name;
+    // The box shows the start and end of a long name; hovering, all of it.
+    setToolTip(name.isEmpty() ? QString() : label_ + ": " + name);
     update();
 }
 
@@ -4532,7 +4999,663 @@ void DatasetSlotWidget::paintEvent(QPaintEvent*) {
     QString shown = datasetName_.isEmpty() ? QString(QChar(0x2014)) /* em dash; QChar keeps it independent of source encoding */ : datasetName_;
     QRect nameRect(4, 15, width() - 8 - 20, 16);
     painter.drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter,
-                      painter.fontMetrics().elidedText(shown, Qt::ElideRight, nameRect.width()));
+                      painter.fontMetrics().elidedText(shown, Qt::ElideMiddle, nameRect.width()));
+}
+
+void copyTableToClipboard(QTableWidget* table) {
+    if (!table) return;
+    QStringList lines;
+    QStringList head;
+    for (int c = 0; c < table->columnCount(); ++c) {
+        QTableWidgetItem* h = table->horizontalHeaderItem(c);
+        head << (h ? h->text() : QString());
+    }
+    lines << head.join('\t');
+    for (int r = 0; r < table->rowCount(); ++r) {
+        QStringList cells;
+        for (int c = 0; c < table->columnCount(); ++c) {
+            QString text;
+            if (QTableWidgetItem* item = table->item(r, c)) {
+                text = item->text();
+            } else if (QWidget* w = table->cellWidget(r, c)) {
+                if (auto* spin = qobject_cast<QSpinBox*>(w)) text = QString::number(spin->value());
+                else if (auto* combo = qobject_cast<QComboBox*>(w)) text = combo->currentText();
+            }
+            cells << text;
+        }
+        lines << cells.join('\t');
+    }
+    QApplication::clipboard()->setText(lines.join('\n'));
+}
+
+namespace {
+// Bytes per sample for every format code in the SEG-Y rev 2 table (0 =
+// unknown code). Only some of these can be decoded (isSampleFormatSupported).
+int formatCodeBytes(int code) {
+    switch (code) {
+    case 1: case 2: case 4: case 5: case 10: return 4;
+    case 3: case 11: return 2;
+    case 6: case 9: case 12: return 8;
+    case 7: case 15: return 3;
+    case 8: case 16: return 1;
+    default: return 0;
+    }
+}
+
+constexpr int kImportScanTraces = 20000; // headers read by Scan (every Nth trace)
+} // namespace
+
+ImportDialog::ImportDialog(const std::filesystem::path& path, QWidget* parent) : QDialog(parent), path_(path) {
+    setWindowTitle(QString("Open with Analysis") + QString::fromUtf8(" \xe2\x80\x94 ") +
+                   QString::fromStdString(path.filename().string()));
+    setWindowFlags(Qt::Window | Qt::WindowTitleHint | Qt::WindowSystemMenuHint | Qt::WindowMinMaxButtonsHint |
+                   Qt::WindowCloseButtonHint);
+    resize(1100, 760);
+    mapping_ = segy::standardHeaderMapping();
+    QVBoxLayout* layout = new QVBoxLayout(this);
+
+    std::string error;
+    if (!file_.open(path, &error)) {
+        openError_ = QString::fromStdString(error);
+    } else if (file_.size() < segy::kHeaderTotalSize) {
+        openError_ = "The file is shorter than the 3600-byte SEG-Y header.";
+    } else {
+        fileOk_ = true;
+    }
+    QTabWidget* tabs = new QTabWidget(this);
+    notes_ = new QListWidget(this);
+    notes_->setMaximumHeight(110);
+    notes_->setToolTip("Notes: what was found in the file, and what was assumed");
+
+    if (fileOk_) {
+        bin_ = segy::parseBinaryHeader(file_.data() + segy::kTextHeaderSize);
+        layout_ = segy::analyseLayout(file_.data(), file_.size());
+        std::string encoding;
+        textHeader_ = segy::decodeTextBlock(file_.data(), &encoding);
+        addNote(QString("Text header: %1 (read as whichever gives more letters and digits; EBCDIC on a tie)")
+                    .arg(QString::fromStdString(encoding)));
+        addNote(QString("SEG-Y revision %1.%2 \xc2\xb7 %3 samples \xc2\xb7 %4 us \xc2\xb7 format code %5")
+                    .arg(layout_.revisionMajor)
+                    .arg(layout_.revisionMinor)
+                    .arg(bin_.samplesPerTrace)
+                    .arg(bin_.sampleIntervalUs)
+                    .arg(bin_.formatCode));
+        for (const std::string& note : layout_.notes) addNote(QString::fromStdString(note));
+        const int bytes = formatCodeBytes(bin_.formatCode);
+        samplesDecodable_ = segy::isSampleFormatSupported(bin_.formatCode);
+        if (bytes == 0) {
+            addNote(QString("Unknown format code %1: the byte order may be wrong (only big-endian files are read)")
+                        .arg(bin_.formatCode));
+        } else if (!samplesDecodable_) {
+            addNote(QString("Format code %1 cannot be decoded: the headers are shown, the traces cannot be opened")
+                        .arg(bin_.formatCode));
+        }
+        if (bytes > 0 && bin_.samplesPerTrace > 0) {
+            stride_ = segy::kTraceHeaderSize + size_t(bin_.samplesPerTrace) * size_t(bytes);
+            if (layout_.dataStart < file_.size()) {
+                const uint64_t body = file_.size() - layout_.dataStart;
+                traceCount_ = int64_t(body / stride_);
+                const uint64_t rest = body % stride_;
+                if (rest >= segy::kTraceHeaderSize) {
+                    addNote(QString("The file is truncated: the last trace has only %1 of %2 bytes (not read)")
+                                .arg(rest)
+                                .arg(stride_));
+                } else if (rest > 0) {
+                    addNote(QString("%1 trailing bytes after the last trace (ignored)").arg(rest));
+                }
+            }
+        } else if (bin_.samplesPerTrace <= 0) {
+            addNote("The binary header gives no samples per trace: traces cannot be located");
+        }
+        if (!layout_.layoutSupported) {
+            addNote("Traces not readable: " + QString::fromStdString(layout_.reason) + " (the file headers are still shown)");
+        }
+        addNote(QString("%1 traces of %2 bytes from byte %3").arg(traceCount_).arg(stride_).arg(layout_.dataStart));
+    } else {
+        addNote("Could not open the file: " + openError_);
+    }
+
+    // --- Trace Headers ---
+    QWidget* headersTab = new QWidget();
+    QVBoxLayout* headersLayout = new QVBoxLayout(headersTab);
+    QHBoxLayout* headersBar = new QHBoxLayout();
+    modeCombo_ = new QComboBox();
+    for (segy::HeaderStandard s : {segy::HeaderStandard::ShellV21, segy::HeaderStandard::SegyRev1,
+                                   segy::HeaderStandard::SegyRev2}) {
+        modeCombo_->addItem(segy::headerStandardName(s), int(s));
+    }
+    modeCombo_->addItem("Mapping (this file)", 100);
+    modeCombo_->addItem("2I (raw)", 200 + int(segy::FieldType::Int16));
+    modeCombo_->addItem("4I (raw)", 200 + int(segy::FieldType::Int32));
+    modeCombo_->addItem("4F IEEE (raw)", 200 + int(segy::FieldType::Ieee32));
+    modeCombo_->addItem("4B IBM (raw)", 200 + int(segy::FieldType::Ibm32));
+    modeCombo_->setToolTip("Show: named fields of a standard, this file's mapping, or every 2 or 4 bytes as one type");
+    startSpin_ = new QSpinBox();
+    startSpin_->setRange(1, int(std::max<int64_t>(1, std::min<int64_t>(traceCount_, INT_MAX))));
+    startSpin_->setToolTip("Start trace: the first trace column (1-based)");
+    countSpin_ = new QSpinBox();
+    countSpin_->setRange(1, 50);
+    countSpin_->setValue(8);
+    countSpin_->setToolTip("Traces shown: how many trace columns");
+    skipSpin_ = new QSpinBox();
+    skipSpin_->setRange(1, 1000000);
+    skipSpin_->setValue(1);
+    skipSpin_->setToolTip("Skip: trace step between columns, and the step of < and >");
+    QPushButton* prev = new QPushButton("<");
+    QPushButton* next = new QPushButton(">");
+    prev->setFixedWidth(28);
+    next->setFixedWidth(28);
+    prev->setToolTip("Previous traces");
+    next->setToolTip("Next traces");
+    QPushButton* copyHeaders = new QPushButton("Copy Table");
+    copyHeaders->setToolTip("Copy Table: as tab-separated text, for a spreadsheet");
+    headersBar->addWidget(new QLabel("Show"));
+    headersBar->addWidget(modeCombo_);
+    headersBar->addSpacing(12);
+    headersBar->addWidget(new QLabel("Start trace"));
+    headersBar->addWidget(startSpin_);
+    headersBar->addWidget(new QLabel("Traces"));
+    headersBar->addWidget(countSpin_);
+    headersBar->addWidget(new QLabel("Skip"));
+    headersBar->addWidget(skipSpin_);
+    headersBar->addWidget(prev);
+    headersBar->addWidget(next);
+    headersBar->addStretch();
+    headersBar->addWidget(copyHeaders);
+    headersLayout->addLayout(headersBar);
+    headerTable_ = new QTableWidget();
+    headerTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    headerTable_->verticalHeader()->setDefaultSectionSize(headerTable_->fontMetrics().height() + 4);
+    headersLayout->addWidget(headerTable_, 1);
+    tabs->addTab(headersTab, "Trace Headers");
+    connect(modeCombo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { refreshHeaderTable(); });
+    for (QSpinBox* spin : {startSpin_, countSpin_, skipSpin_}) {
+        connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { refreshHeaderTable(); });
+    }
+    connect(prev, &QPushButton::clicked, this, [this]() { startSpin_->setValue(startSpin_->value() - skipSpin_->value() * countSpin_->value()); });
+    connect(next, &QPushButton::clicked, this, [this]() { startSpin_->setValue(startSpin_->value() + skipSpin_->value() * countSpin_->value()); });
+    connect(copyHeaders, &QPushButton::clicked, this, [this]() { copyTableToClipboard(headerTable_); });
+
+    // --- Mapping ---
+    QWidget* mappingTab = new QWidget();
+    QVBoxLayout* mappingLayout = new QVBoxLayout(mappingTab);
+    QLabel* mappingHint = new QLabel(
+        "Where this file keeps the fields TraceLab uses. The standard positions are only a starting point: change a "
+        "byte or type, then Scan to check the values. Nothing is scanned until you press Scan.");
+    mappingHint->setWordWrap(true);
+    mappingHint->setStyleSheet(themed("color: #9a9ca3;"));
+    mappingLayout->addWidget(mappingHint);
+    QHBoxLayout* mappingBar = new QHBoxLayout();
+    QPushButton* scanButton = new QPushButton("Scan");
+    scanButton->setToolTip(QString("Scan: min, max and steps of every field over up to %1 traces spread over the file")
+                               .arg(kImportScanTraces));
+    QPushButton* fromText = new QPushButton("From Text Header");
+    fromText->setToolTip("From Text Header: take the byte positions the text header names (integers only)");
+    QPushButton* standard = new QPushButton("Standard Positions");
+    standard->setToolTip("Standard Positions: back to SEG-Y rev 1");
+    QPushButton* loadTpl = new QPushButton("Load Template...");
+    loadTpl->setToolTip("Load Template: a saved mapping (.segymap)");
+    QPushButton* saveTpl = new QPushButton("Save Template...");
+    saveTpl->setToolTip("Save Template: this mapping, to use for similar files");
+    QPushButton* copyMapping = new QPushButton("Copy Table");
+    copyMapping->setToolTip("Copy Table: as tab-separated text, for a spreadsheet");
+    for (QPushButton* b : {scanButton, fromText, standard, loadTpl, saveTpl}) mappingBar->addWidget(b);
+    mappingBar->addStretch();
+    mappingBar->addWidget(copyMapping);
+    mappingLayout->addLayout(mappingBar);
+    scanStatus_ = new QLabel("Not scanned yet: press Scan.");
+    scanStatus_->setStyleSheet(themed("color: #e8905a;"));
+    mappingLayout->addWidget(scanStatus_);
+    mappingTable_ = new QTableWidget(0, 8);
+    mappingTable_->setHorizontalHeaderLabels({"Field", "Byte", "Type", "Order", "Min", "Max", "Steps", "Note"});
+    mappingTable_->verticalHeader()->setVisible(false);
+    mappingTable_->horizontalHeader()->setStretchLastSection(true);
+    mappingTable_->verticalHeader()->setDefaultSectionSize(mappingTable_->fontMetrics().height() + 14);
+    mappingLayout->addWidget(mappingTable_, 1);
+    tabs->addTab(mappingTab, "Mapping");
+    connect(scanButton, &QPushButton::clicked, this, [this]() { scanMapping(); });
+    connect(fromText, &QPushButton::clicked, this, [this]() { proposeFromText(); });
+    connect(standard, &QPushButton::clicked, this, [this]() {
+        mapping_ = segy::standardHeaderMapping();
+        fillMappingTable();
+        markScanOutOfDate();
+    });
+    connect(loadTpl, &QPushButton::clicked, this, [this]() { loadTemplate(); });
+    connect(saveTpl, &QPushButton::clicked, this, [this]() { saveTemplate(); });
+    connect(copyMapping, &QPushButton::clicked, this, [this]() { copyTableToClipboard(mappingTable_); });
+
+    // --- Selection ---
+    QWidget* selectionTab = new QWidget();
+    QVBoxLayout* selectionLayout = new QVBoxLayout(selectionTab);
+    QGridLayout* rangeGrid = new QGridLayout();
+    const int maxTrace = int(std::max<int64_t>(1, std::min<int64_t>(traceCount_, INT_MAX)));
+    firstSpin_ = new QSpinBox();
+    firstSpin_->setRange(1, maxTrace);
+    firstSpin_->setToolTip("First trace to read (1-based)");
+    lastSpin_ = new QSpinBox();
+    lastSpin_->setRange(1, maxTrace);
+    lastSpin_->setValue(maxTrace);
+    lastSpin_->setToolTip("Last trace to read (1-based)");
+    everySpin_ = new QSpinBox();
+    everySpin_->setRange(1, 100000);
+    everySpin_->setToolTip("Every Nth trace from the first");
+    rangeGrid->addWidget(new QLabel("Traces"), 0, 0);
+    rangeGrid->addWidget(firstSpin_, 0, 1);
+    rangeGrid->addWidget(new QLabel("to"), 0, 2);
+    rangeGrid->addWidget(lastSpin_, 0, 3);
+    rangeGrid->addWidget(new QLabel("every"), 0, 4);
+    rangeGrid->addWidget(everySpin_, 0, 5);
+    rangeGrid->setColumnStretch(6, 1);
+    selectionLayout->addLayout(rangeGrid);
+    QLabel* keysCaption = new QLabel("Header ranges (a trace is read when every range holds)");
+    keysCaption->setStyleSheet(themed("color: #9a9ca3; margin-top: 10px;"));
+    selectionLayout->addWidget(keysCaption);
+    QGridLayout* keyGrid = new QGridLayout();
+    keyGrid->addWidget(new QLabel("Header"), 0, 0);
+    keyGrid->addWidget(new QLabel("Min"), 0, 1);
+    keyGrid->addWidget(new QLabel("Max"), 0, 2);
+    keyGrid->addWidget(new QLabel("Step"), 0, 3);
+    for (int i = 0; i < 3; ++i) {
+        RangeRow row;
+        row.key = new QComboBox();
+        row.key->addItem("(none)", QString());
+        for (const segy::MappedField& f : mapping_.fields) {
+            row.key->addItem(QString::fromStdString(f.name), QString::fromStdString(f.key));
+        }
+        auto spin = [](double value) {
+            QDoubleSpinBox* s = new QDoubleSpinBox();
+            s->setRange(-1e12, 1e12);
+            s->setDecimals(2);
+            s->setValue(value);
+            return s;
+        };
+        row.min = spin(0.0);
+        row.max = spin(0.0);
+        row.step = spin(0.0);
+        row.step->setRange(0.0, 1e12);
+        row.step->setSpecialValueText("every value");
+        row.step->setToolTip("Step: keep min, min + step, ... (every value: no step)");
+        keyGrid->addWidget(row.key, i + 1, 0);
+        keyGrid->addWidget(row.min, i + 1, 1);
+        keyGrid->addWidget(row.max, i + 1, 2);
+        keyGrid->addWidget(row.step, i + 1, 3);
+        connect(row.key, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, row](int) {
+            // A new key starts from its scanned range when there is one.
+            const QString key = row.key->currentData().toString();
+            for (int r = 0; r < mappingTable_->rowCount() && !key.isEmpty(); ++r) {
+                if (mapping_.fields[size_t(r)].key != key.toStdString()) continue;
+                bool okMin = false, okMax = false;
+                const double mn = mappingTable_->item(r, 4) ? mappingTable_->item(r, 4)->text().toDouble(&okMin) : 0.0;
+                const double mx = mappingTable_->item(r, 5) ? mappingTable_->item(r, 5)->text().toDouble(&okMax) : 0.0;
+                if (okMin && okMax) {
+                    row.min->setValue(mn);
+                    row.max->setValue(mx);
+                }
+            }
+            refreshEstimate();
+        });
+        for (QDoubleSpinBox* s : {row.min, row.max, row.step}) {
+            connect(s, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double) { refreshEstimate(); });
+        }
+        rangeRows_.push_back(row);
+    }
+    keyGrid->setColumnStretch(4, 1);
+    selectionLayout->addLayout(keyGrid);
+    selectionEstimate_ = new QLabel();
+    selectionEstimate_->setStyleSheet(themed("color: #d4d4d8; margin-top: 10px;"));
+    selectionLayout->addWidget(selectionEstimate_);
+    QLabel* selectionHint = new QLabel(
+        "A selection or a changed mapping is read into a copy (float32, standard header positions) in the scratch "
+        "folder, then opened. With neither, the file is opened directly.");
+    selectionHint->setWordWrap(true);
+    selectionHint->setStyleSheet(themed("color: #9a9ca3;"));
+    selectionLayout->addWidget(selectionHint);
+    selectionLayout->addStretch();
+    tabs->addTab(selectionTab, "Selection");
+    for (QSpinBox* s : {firstSpin_, lastSpin_, everySpin_}) {
+        connect(s, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { refreshEstimate(); });
+    }
+
+    // --- File Header ---
+    QWidget* fileTab = new QWidget();
+    QHBoxLayout* fileLayout = new QHBoxLayout(fileTab);
+    QPlainTextEdit* text = new QPlainTextEdit();
+    text->setReadOnly(true);
+    text->setLineWrapMode(QPlainTextEdit::NoWrap);
+    QFont mono("Consolas");
+    mono.setStyleHint(QFont::Monospace);
+    text->setFont(mono);
+    QStringList lines;
+    for (size_t i = 0; i + 80 <= textHeader_.size(); i += 80) lines << QString::fromLatin1(textHeader_.substr(i, 80).c_str());
+    for (size_t b = 0; b < layout_.extendedText.size(); ++b) {
+        lines << QString() << QString("--- Extended text header %1 ---").arg(b + 1);
+        const std::string& block = layout_.extendedText[b];
+        for (size_t i = 0; i + 80 <= block.size(); i += 80) lines << QString::fromLatin1(block.substr(i, 80).c_str());
+    }
+    text->setPlainText(lines.join('\n'));
+    fileLayout->addWidget(text, 3);
+    BinaryHeaderWidget* binary = new BinaryHeaderWidget();
+    if (fileOk_) binary->setHeader(file_.data() + segy::kTextHeaderSize);
+    fileLayout->addWidget(binary, 2);
+    tabs->addTab(fileTab, "File Header");
+
+    layout->addWidget(tabs, 1);
+    QLabel* notesCaption = new QLabel("Notes");
+    notesCaption->setStyleSheet(themed("color: #9a9ca3;"));
+    layout->addWidget(notesCaption);
+    layout->addWidget(notes_);
+
+    QHBoxLayout* buttons = new QHBoxLayout();
+    buttons->addStretch();
+    openButton_ = new QPushButton("Open");
+    openButton_->setDefault(true);
+    QPushButton* cancel = new QPushButton("Cancel");
+    buttons->addWidget(openButton_);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+    connect(openButton_, &QPushButton::clicked, this, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
+    const bool canOpen = fileOk_ && layout_.layoutSupported && samplesDecodable_ && traceCount_ > 0;
+    openButton_->setEnabled(canOpen);
+    if (!canOpen) openButton_->setToolTip("Open: not possible for this file -- see the notes");
+
+    fillMappingTable();
+    refreshHeaderTable();
+    refreshEstimate();
+}
+
+void ImportDialog::addNote(const QString& text) { notes_->addItem(text); }
+
+const uint8_t* ImportDialog::traceHeader(int64_t trace) const {
+    if (!fileOk_ || stride_ == 0 || trace < 0 || trace >= traceCount_) return nullptr;
+    const uint64_t at = layout_.dataStart + uint64_t(trace) * stride_;
+    if (at + segy::kTraceHeaderSize > file_.size()) return nullptr;
+    return file_.data() + at;
+}
+
+void ImportDialog::refreshHeaderTable() {
+    const int mode = modeCombo_->currentData().toInt();
+    const int count = countSpin_->value(), skip = skipSpin_->value();
+    std::vector<int64_t> traces;
+    for (int i = 0; i < count; ++i) {
+        const int64_t t = int64_t(startSpin_->value() - 1) + int64_t(i) * skip;
+        if (t < traceCount_) traces.push_back(t);
+    }
+    QStringList columns;
+    for (int64_t t : traces) columns << QString("Trace %1").arg(t + 1);
+    headerTable_->clear();
+    headerTable_->setColumnCount(int(traces.size()) + 1);
+    headerTable_->setHorizontalHeaderLabels(QStringList("Bytes") + columns);
+    struct Row {
+        QString label;
+        std::function<QString(const uint8_t*)> value;
+    };
+    std::vector<Row> rows;
+    if (mode < 100) {
+        for (const segy::HeaderFieldDef& def : segy::traceHeaderDefinition(segy::HeaderStandard(mode))) {
+            QString label = QString("%1-%2").arg(def.firstByte).arg(def.firstByte + def.size - 1);
+            if (def.name && *def.name) label += QString("  %1").arg(def.name);
+            rows.push_back({label, [def](const uint8_t* h) {
+                                return QString::fromStdString(segy::formatHeaderField(h, def, true));
+                            }});
+        }
+    } else if (mode == 100) {
+        for (const segy::MappedField& f : mapping_.fields) {
+            const QString label = QString("%1-%2  %3 (%4)")
+                                      .arg(f.spec.firstByte)
+                                      .arg(f.spec.lastByte())
+                                      .arg(QString::fromStdString(f.key), segy::fieldTypeName(f.spec.type));
+            const segy::FieldSpec spec = f.spec;
+            rows.push_back({label, [spec](const uint8_t* h) { return QString::number(segy::decodeField(h, spec), 'g', 10); }});
+        }
+    } else {
+        const segy::FieldType type = segy::FieldType(mode - 200);
+        const int size = segy::fieldTypeSize(type);
+        for (int b = 1; b + size - 1 <= 240; b += size) {
+            const segy::FieldSpec spec{b, type, true};
+            rows.push_back({QString("%1-%2").arg(b).arg(b + size - 1),
+                            [spec](const uint8_t* h) { return QString::number(segy::decodeField(h, spec), 'g', 10); }});
+        }
+    }
+    headerTable_->setRowCount(int(rows.size()));
+    headerTable_->verticalHeader()->setVisible(false);
+    for (int r = 0; r < int(rows.size()); ++r) {
+        headerTable_->setItem(r, 0, new QTableWidgetItem(rows[size_t(r)].label));
+        for (int c = 0; c < int(traces.size()); ++c) {
+            const uint8_t* h = traceHeader(traces[size_t(c)]);
+            QTableWidgetItem* item = new QTableWidgetItem(h ? rows[size_t(r)].value(h) : QString("-"));
+            item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            headerTable_->setItem(r, c + 1, item);
+        }
+    }
+    headerTable_->resizeColumnsToContents();
+}
+
+void ImportDialog::fillMappingTable() {
+    QSignalBlocker block(mappingTable_);
+    mappingTable_->setRowCount(int(mapping_.fields.size()));
+    for (int r = 0; r < int(mapping_.fields.size()); ++r) {
+        const segy::MappedField& f = mapping_.fields[size_t(r)];
+        QTableWidgetItem* name = new QTableWidgetItem(QString::fromStdString(f.name));
+        name->setFlags(name->flags() & ~Qt::ItemIsEditable);
+        name->setToolTip(QString("Read by TraceLab at byte %1 (%2 bytes)").arg(f.standardByte).arg(f.standardSize));
+        mappingTable_->setItem(r, 0, name);
+        QSpinBox* byte = new QSpinBox();
+        byte->setRange(1, 240);
+        byte->setValue(f.spec.firstByte);
+        QComboBox* type = new QComboBox();
+        for (segy::FieldType t : segy::allFieldTypes()) type->addItem(segy::fieldTypeName(t), int(t));
+        type->setCurrentIndex(type->findData(int(f.spec.type)));
+        type->setToolTip("2I/4I signed, 2U/4U unsigned, 4F IEEE float, 4B IBM float, 8I/8U/8F 8 bytes");
+        QComboBox* order = new QComboBox();
+        order->addItem("BE", true);
+        order->addItem("LE", false);
+        order->setCurrentIndex(f.spec.bigEndian ? 0 : 1);
+        order->setToolTip("Byte order of this field: big-endian (the standard) or little-endian");
+        mappingTable_->setCellWidget(r, 1, byte);
+        mappingTable_->setCellWidget(r, 2, type);
+        mappingTable_->setCellWidget(r, 3, order);
+        for (int c = 4; c < 8; ++c) mappingTable_->setItem(r, c, new QTableWidgetItem());
+        byte->setMinimumWidth(70);
+        type->setMinimumWidth(70);
+        order->setMinimumWidth(64);
+        connect(byte, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) {
+            readMappingTable();
+            markScanOutOfDate();
+        });
+        for (QComboBox* combo : {type, order}) {
+            connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+                readMappingTable();
+                markScanOutOfDate();
+            });
+        }
+    }
+    mappingTable_->resizeColumnsToContents();
+}
+
+void ImportDialog::readMappingTable() {
+    for (int r = 0; r < mappingTable_->rowCount() && r < int(mapping_.fields.size()); ++r) {
+        segy::FieldSpec& spec = mapping_.fields[size_t(r)].spec;
+        spec.firstByte = static_cast<QSpinBox*>(mappingTable_->cellWidget(r, 1))->value();
+        spec.type = segy::FieldType(static_cast<QComboBox*>(mappingTable_->cellWidget(r, 2))->currentData().toInt());
+        spec.bigEndian = static_cast<QComboBox*>(mappingTable_->cellWidget(r, 3))->currentData().toBool();
+        QTableWidgetItem* note = mappingTable_->item(r, 7);
+        if (note && !spec.valid()) note->setText("Runs past byte 240");
+    }
+    if (modeCombo_->currentData().toInt() == 100) refreshHeaderTable();
+    refreshEstimate();
+}
+
+void ImportDialog::markScanOutOfDate() {
+    if (!scanCurrent_ && sampleHeaders_.empty()) return;
+    scanCurrent_ = false;
+    scanStatus_->setText("Results are out of date: press Scan to refresh them.");
+    scanStatus_->setStyleSheet(themed("color: #e8905a;"));
+}
+
+void ImportDialog::scanMapping() {
+    if (traceCount_ <= 0) return;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const int64_t step = std::max<int64_t>(1, (traceCount_ + kImportScanTraces - 1) / kImportScanTraces);
+    sampleTraces_.clear();
+    sampleHeaders_.clear();
+    for (int64_t t = 0; t < traceCount_; t += step) {
+        const uint8_t* h = traceHeader(t);
+        if (!h) break;
+        std::array<uint8_t, 240> copy;
+        std::memcpy(copy.data(), h, 240);
+        sampleTraces_.push_back(t);
+        sampleHeaders_.push_back(copy);
+    }
+    for (int r = 0; r < int(mapping_.fields.size()); ++r) {
+        const segy::FieldSpec& spec = mapping_.fields[size_t(r)].spec;
+        std::vector<double> values;
+        size_t notFinite = 0;
+        for (const auto& h : sampleHeaders_) {
+            const double v = segy::decodeField(h.data(), spec);
+            if (std::isfinite(v)) values.push_back(v);
+            else ++notFinite;
+        }
+        QString minText, maxText, stepText, note;
+        if (values.empty()) {
+            note = "no values";
+        } else {
+            std::sort(values.begin(), values.end());
+            minText = QString::number(values.front(), 'g', 10);
+            maxText = QString::number(values.back(), 'g', 10);
+            // Steps between distinct values (rounded to 6 decimals).
+            std::vector<double> distinct;
+            for (double v : values) {
+                const double rv = std::round(v * 1e6) / 1e6;
+                if (distinct.empty() || rv != distinct.back()) distinct.push_back(rv);
+            }
+            if (distinct.size() == 1) {
+                note = "single value";
+            } else {
+                double lo = std::numeric_limits<double>::infinity(), hi = 0.0;
+                for (size_t i = 1; i < distinct.size(); ++i) {
+                    const double d = distinct[i] - distinct[i - 1];
+                    lo = std::min(lo, d);
+                    hi = std::max(hi, d);
+                }
+                stepText = lo == hi ? QString::number(lo, 'g', 8)
+                                    : QString("%1 to %2").arg(QString::number(lo, 'g', 8), QString::number(hi, 'g', 8));
+                note = QString("%1 distinct").arg(distinct.size());
+            }
+            if (notFinite > 0) note += QString(", %1 not finite").arg(notFinite);
+        }
+        mappingTable_->item(r, 4)->setText(minText);
+        mappingTable_->item(r, 5)->setText(maxText);
+        mappingTable_->item(r, 6)->setText(stepText);
+        mappingTable_->item(r, 7)->setText(note);
+    }
+    mappingTable_->resizeColumnsToContents();
+    QApplication::restoreOverrideCursor();
+    scanCurrent_ = true;
+    scanStatus_->setText(step > 1 ? QString("Scanned %1 of %2 traces (every %3th).").arg(sampleHeaders_.size()).arg(traceCount_).arg(step)
+                                  : QString("Scanned all %1 traces.").arg(traceCount_));
+    scanStatus_->setStyleSheet(themed("color: #9a9ca3;"));
+    refreshEstimate();
+}
+
+segy::TraceSelection ImportDialog::selection() const {
+    segy::TraceSelection sel;
+    sel.first = firstSpin_->value() - 1;
+    sel.last = lastSpin_->value() >= traceCount_ ? -1 : lastSpin_->value() - 1;
+    sel.every = everySpin_->value();
+    for (const RangeRow& row : rangeRows_) {
+        const QString key = row.key->currentData().toString();
+        if (key.isEmpty()) continue;
+        sel.ranges.push_back({key.toStdString(), row.min->value(), row.max->value(), row.step->value()});
+    }
+    return sel;
+}
+
+bool ImportDialog::opensDirectly() const {
+    return mapping_.isStandard() && selection().isAll() && layout_.dataStart == segy::kHeaderTotalSize;
+}
+
+void ImportDialog::refreshEstimate() {
+    if (!selectionEstimate_) return;
+    const segy::TraceSelection sel = selection();
+    const int64_t last = sel.last < 0 ? traceCount_ - 1 : sel.last;
+    const int64_t byRange = last >= sel.first ? (last - sel.first) / std::max<int64_t>(1, sel.every) + 1 : 0;
+    QString text;
+    if (sel.ranges.empty()) {
+        text = QString("%1 of %2 traces").arg(byRange).arg(traceCount_);
+    } else if (sampleHeaders_.empty()) {
+        text = QString("At most %1 traces: press Scan on the Mapping tab for an estimate with the header ranges").arg(byRange);
+    } else {
+        size_t hits = 0;
+        for (size_t i = 0; i < sampleHeaders_.size(); ++i) {
+            if (segy::traceSelected(sel, sampleTraces_[i], sampleHeaders_[i].data(), mapping_)) ++hits;
+        }
+        // The sample is every Nth trace: scale its hits to the whole file.
+        const double fraction = double(hits) / double(sampleHeaders_.size());
+        text = QString("About %1 traces (from the %2 scanned)").arg(qlonglong(std::llround(fraction * double(traceCount_))))
+                   .arg(sampleHeaders_.size());
+    }
+    if (opensDirectly()) text += QString::fromUtf8(" \xc2\xb7 opened directly");
+    else text += QString::fromUtf8(" \xc2\xb7 read into a copy");
+    selectionEstimate_->setText(text);
+}
+
+void ImportDialog::proposeFromText() {
+    const std::vector<segy::FoundField> found = segy::findHeaderPositions(textHeader_);
+    if (found.empty()) {
+        addNote("From Text Header: no byte positions found in the text header");
+        return;
+    }
+    for (const segy::FoundField& f : found) {
+        addNote(QString("Text header line %1: %2 at bytes %3-%4%5")
+                    .arg(f.line)
+                    .arg(QString::fromStdString(f.name))
+                    .arg(f.firstByte)
+                    .arg(f.lastByte)
+                    .arg(f.key.empty() ? QString(" (not a field TraceLab uses)")
+                                       : QString(" -> %1").arg(QString::fromStdString(f.key))));
+    }
+    const int applied = segy::applyFoundFields(found, mapping_);
+    addNote(QString("From Text Header: %1 field(s) taken over").arg(applied));
+    notes_->scrollToBottom();
+    fillMappingTable();
+    markScanOutOfDate();
+    refreshEstimate();
+}
+
+void ImportDialog::loadTemplate() {
+    const QString file = QFileDialog::getOpenFileName(this, "Load Template", QDir::homePath(),
+                                                      "Header mapping (*.segymap);;All files (*)");
+    if (file.isEmpty()) return;
+    QFile f(file);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Load Template", "Could not read " + file);
+        return;
+    }
+    std::string error;
+    segy::HeaderMapping loaded;
+    if (!segy::headerMappingFromText(QString::fromUtf8(f.readAll()).toStdString(), loaded, &error)) {
+        QMessageBox::warning(this, "Load Template", QString::fromStdString(error));
+        return;
+    }
+    mapping_ = loaded;
+    addNote("Mapping from template " + QFileInfo(file).fileName());
+    fillMappingTable();
+    markScanOutOfDate();
+    refreshEstimate();
+}
+
+void ImportDialog::saveTemplate() {
+    readMappingTable();
+    const QString file = QFileDialog::getSaveFileName(this, "Save Template", QDir::homePath() + "/mapping.segymap",
+                                                      "Header mapping (*.segymap)");
+    if (file.isEmpty()) return;
+    QFile f(file);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        QMessageBox::warning(this, "Save Template", "Could not write " + file);
+        return;
+    }
+    f.write(QByteArray::fromStdString(segy::headerMappingToText(mapping_)));
 }
 
 SegyOpenDialog::SegyOpenDialog(QWidget* parent) : QDialog(parent) {
@@ -5033,7 +6156,33 @@ BinaryHeaderWidget::BinaryHeaderWidget(QWidget* parent) : QWidget(parent) {
     table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
     table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    // Labelled (the rev 1 fields) or Raw (every 2- and 4-byte word,
+    // unnamed): check an "unassigned" field against the raw words.
+    QHBoxLayout* bar = new QHBoxLayout();
+    QComboBox* view = new QComboBox();
+    view->addItem("Labelled");
+    view->addItem("Raw");
+    view->setToolTip("Labelled: the named fields. Raw: every 2- and 4-byte word as a signed integer, to check the "
+                     "fields the standard leaves unassigned");
+    QPushButton* copy = new QPushButton("Copy Table");
+    copy->setToolTip("Copy Table: as tab-separated text, for a spreadsheet");
+    bar->addWidget(view);
+    bar->addStretch();
+    bar->addWidget(copy);
+    layout->addLayout(bar);
     layout->addWidget(table_);
+    rawTable_ = new QTableWidget(200, 3, this);
+    rawTable_->setHorizontalHeaderLabels({"Byte", "2 bytes", "4 bytes"});
+    rawTable_->verticalHeader()->setVisible(false);
+    rawTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    rawTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    rawTable_->hide();
+    layout->addWidget(rawTable_);
+    connect(view, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        table_->setVisible(index == 0);
+        rawTable_->setVisible(index == 1);
+    });
+    connect(copy, &QPushButton::clicked, this, [this]() { copyTableToClipboard(table_->isVisible() ? table_ : rawTable_); });
     resize(560, 700);
 }
 
@@ -5053,6 +6202,13 @@ void BinaryHeaderWidget::setHeader(const uint8_t* binHeaderBase) {
         table_->setItem(row, 1, new QTableWidgetItem(QString::fromUtf8(field.description)));
         table_->setItem(row, 2, new QTableWidgetItem(valueText));
     }
+    for (int row = 0; row < 200; ++row) {
+        const int offset = row * 2;
+        rawTable_->setItem(row, 0, new QTableWidgetItem(QString::number(3201 + offset)));
+        rawTable_->setItem(row, 1, new QTableWidgetItem(QString::number(segy::readI16BE(binHeaderBase + offset))));
+        rawTable_->setItem(row, 2, new QTableWidgetItem(offset + 4 <= 400 ? QString::number(segy::readI32BE(binHeaderBase + offset))
+                                                                           : QString()));
+    }
 }
 
 SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(app) {
@@ -5070,6 +6226,16 @@ SegyCanvas::SegyCanvas(AppState& app, QWidget* parent) : QWidget(parent), app_(a
     // overlay."
     amplitudeScale_ = new AmplitudeScaleWidget(this);
     amplitudeScale_->setVisible(false);
+    hScroll_ = new QScrollBar(Qt::Horizontal, this);
+    vScroll_ = new QScrollBar(Qt::Vertical, this);
+    for (QScrollBar* bar : {hScroll_, vScroll_}) {
+        bar->hide();
+        bar->setCursor(Qt::ArrowCursor);
+    }
+    hScroll_->setToolTip("Scroll along the line");
+    vScroll_->setToolTip("Scroll in time");
+    connect(hScroll_, &QScrollBar::valueChanged, this, [this](int v) { scrollTo(true, v); });
+    connect(vScroll_, &QScrollBar::valueChanged, this, [this](int v) { scrollTo(false, v); });
 
     // Right-click the legend to change AppState::display.colorScale --
     // applies to this panel only (not Lock-aware like gain/mode), since
@@ -5253,6 +6419,56 @@ void SegyCanvas::repositionDatasetSlots() {
     backgroundSlot_->show();
     foregroundSlot_->raise();
     backgroundSlot_->raise();
+}
+
+void SegyCanvas::syncScrollBars(int plotLeft, int plotTop, int plotWidth, int plotHeight) {
+    const double traces = double(app_.foreground->traceCount);
+    const double samples = double(app_.foreground->binHeader.samplesPerTrace);
+    const double spanT = app_.view.traceEnd - app_.view.traceStart;
+    const double spanS = app_.view.sampleEnd - app_.view.sampleStart;
+    const bool showH = app_.loaded && traces > 0 && spanT < traces - 0.5 && plotWidth > 60;
+    const bool showV = app_.loaded && samples > 0 && spanS < samples - 0.5 && plotHeight > 60;
+    syncingScroll_ = true;
+    if (showH) {
+        hScroll_->setGeometry(plotLeft, height() - 13, plotWidth, 11);
+        const int maxStart = std::max(0, int(std::lround(traces - spanT)));
+        int start = int(std::lround(app_.view.traceStart));
+        if (app_.display.flipHorizontal) start = maxStart - start; // the bar follows the screen
+        hScroll_->setRange(0, maxStart);
+        hScroll_->setPageStep(std::max(1, int(std::lround(spanT))));
+        hScroll_->setSingleStep(std::max(1, int(std::lround(spanT / 10.0))));
+        hScroll_->setValue(std::clamp(start, 0, maxStart));
+        hScroll_->setEnabled(!app_.viewLocked);
+    }
+    if (showV) {
+        vScroll_->setGeometry(2, plotTop, 11, plotHeight);
+        const int maxStart = std::max(0, int(std::lround(samples - spanS)));
+        vScroll_->setRange(0, maxStart);
+        vScroll_->setPageStep(std::max(1, int(std::lround(spanS))));
+        vScroll_->setSingleStep(std::max(1, int(std::lround(spanS / 10.0))));
+        vScroll_->setValue(std::clamp(int(std::lround(app_.view.sampleStart)), 0, maxStart));
+        vScroll_->setEnabled(!app_.viewLocked);
+    }
+    if (hScroll_->isVisible() != showH) hScroll_->setVisible(showH);
+    if (vScroll_->isVisible() != showV) vScroll_->setVisible(showV);
+    syncingScroll_ = false;
+}
+
+void SegyCanvas::scrollTo(bool horizontal, int value) {
+    if (syncingScroll_ || !app_.loaded || app_.viewLocked) return;
+    if (horizontal) {
+        const double span = app_.view.traceEnd - app_.view.traceStart;
+        double start = double(value);
+        if (app_.display.flipHorizontal) start = double(hScroll_->maximum() - value);
+        app_.view.traceStart = start;
+        app_.view.traceEnd = start + span;
+    } else {
+        const double span = app_.view.sampleEnd - app_.view.sampleStart;
+        app_.view.sampleStart = double(value);
+        app_.view.sampleEnd = double(value) + span;
+    }
+    if (notifyViewChanged_) notifyViewChanged_();
+    update();
 }
 
 void SegyCanvas::resizeEvent(QResizeEvent* event) {
@@ -5796,6 +7012,38 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             }
         }
 
+        // Curtain: the Background's raster replaces the plot columns left
+        // of the curtain (same traces, same times), grid lines blended in
+        // again the way chrome.cpp does.
+        const bool curtain = curtainActive() && chrome.plotWidth > 1;
+        const int curtainCols =
+            curtain ? std::clamp(int(std::lround(app_.curtainFraction * chrome.plotWidth)), 0, chrome.plotWidth) : 0;
+        if (curtain && curtainCols > 0 && app_.display.seismicMode == segy::SeismicDisplayMode::VariableDensity) {
+            const int pw = chrome.plotWidth;
+            curtainPixels_.assign(size_t(pw) * size_t(insetHeight), 0);
+            segy::renderFrame(makeRenderContextFor(*app_.background, app_.pool), curtainView(), curtainPixels_.data(), pw,
+                              insetHeight, app_.display.gainDb, app_.display.colorScale, app_.display.manualClip,
+                              app_.display.reversePolarity, app_.display.colorScaleFlipped, &app_.display.processing);
+            const bool flip = app_.display.flipHorizontal;
+            for (int y = 0; y < insetHeight; ++y) {
+                const uint32_t* src = curtainPixels_.data() + size_t(y) * size_t(pw);
+                uint32_t* dst = app_.pixels.data() + size_t(y) * size_t(insetWidth) + size_t(chrome.plotX);
+                for (int c = 0; c < curtainCols; ++c) dst[c] = src[flip ? pw - 1 - c : c];
+            }
+            if (app_.display.showGridLines) {
+                for (const segy::TimeTick& tk : chrome.ticks) {
+                    if (tk.pixelY < 0 || tk.pixelY >= insetHeight) continue;
+                    uint32_t* row = app_.pixels.data() + size_t(tk.pixelY) * size_t(insetWidth) + size_t(chrome.plotX);
+                    for (int c = 0; c < curtainCols; ++c) {
+                        const uint32_t v = row[c];
+                        row[c] = (((((v >> 16) & 0xFF) + 0x20) / 2) << 16) | (((((v >> 8) & 0xFF) + 0x20) / 2) << 8) |
+                                 (((v & 0xFF) + 0x20) / 2);
+                    }
+                }
+            }
+            lap("curtain (background raster)");
+        }
+
         // QImage::Format_RGB32 is bit-for-bit the 0x00RRGGBB packing
         // renderFrameWithChrome() already produces, so this wraps the
         // buffer directly -- no copy, no per-platform blit call needed.
@@ -5856,13 +7104,19 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             // so the status line's render time stays meaningful in both
             // modes.
             auto wiggleStart = std::chrono::high_resolution_clock::now();
+            // One dataset's wiggles in plot columns [clipX0, clipX1): the
+            // Foreground right of the curtain, the Background left of it.
+            auto drawWiggles = [&](const segy::RenderContext& wiggleCtx, const segy::ViewRange& wiggleView, int clipX0,
+                                   int clipX1) {
+            if (clipX1 <= clipX0) return;
             segy::WiggleLayout wiggle = segy::computeWiggleLayout(
-                makeRenderContext(), app_.view, chrome.plotWidth, insetHeight,
+                wiggleCtx, wiggleView, chrome.plotWidth, insetHeight,
                 app_.display.gainDb + kWiggleGainBoostDb, app_.display.reversePolarity, &app_.display.processing);
             painter.save();
             // Wiggle is deliberately crisp/non-smoothed -- see native/README.md.
             painter.setRenderHint(QPainter::Antialiasing, false);
             painter.translate(kCanvasMargin + chrome.plotX, topInset);
+            painter.setClipRect(QRect(clipX0, 0, clipX1 - clipX0, insetHeight));
             QPen linePen(Qt::black);
             linePen.setWidth(0); // cosmetic pen: always exactly 1 device pixel, cheapest to draw
             painter.setPen(linePen);
@@ -5919,6 +7173,9 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
                 painter.drawPolyline(traceLines[k].data(), int(traceLines[k].size()));
             }
             painter.restore();
+            };
+            drawWiggles(makeRenderContext(), app_.view, curtainCols, chrome.plotWidth);
+            if (curtain) drawWiggles(makeRenderContextFor(*app_.background, app_.pool), curtainView(), 0, curtainCols);
             // Layout and drawing together: what the user waits for.
             app_.lastRenderMs =
                 std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - wiggleStart)
@@ -5929,6 +7186,33 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         // native/README.md) -- drawn before selection boxes so the box
         // the user is actively dragging/editing stays the topmost element.
         lap("time axis + wiggle");
+        if (curtain) {
+            // The curtain: a line with a grip, and which side is which.
+            const int cx = kCanvasMargin + chrome.plotX + curtainCols;
+            painter.save();
+            painter.setRenderHint(QPainter::Antialiasing, false);
+            painter.fillRect(QRect(cx - 1, topInset, 3, insetHeight), QColor(0, 0, 0, 160));
+            painter.fillRect(QRect(cx, topInset, 1, insetHeight), QColor(kAccentColor));
+            const QRect grip(cx - 4, topInset + insetHeight / 2 - 16, 9, 32);
+            painter.setPen(QColor(0, 0, 0, 200));
+            painter.setBrush(QColor(kAccentColor));
+            painter.drawRoundedRect(grip, 2, 2);
+            QFont tagFont = this->font();
+            tagFont.setPixelSize(10);
+            painter.setFont(tagFont);
+            const QFontMetrics tm(tagFont);
+            auto tag = [&](const QString& text, bool leftOfLine) {
+                const int w = tm.horizontalAdvance(text) + 8, h = tm.height() + 2;
+                const int y = topInset + insetHeight - h - 6;
+                const QRect r(leftOfLine ? cx - 4 - w : cx + 5, y, w, h);
+                painter.fillRect(r, QColor(0, 0, 0, 170));
+                painter.setPen(Qt::white);
+                painter.drawText(r, Qt::AlignCenter, text);
+            };
+            if (curtainCols > 40) tag("Background", true);
+            if (chrome.plotWidth - curtainCols > 40) tag("Foreground", false);
+            painter.restore();
+        }
         paintIdentOverlayLines(painter, chrome, topInset, insetHeight);
         lap("ident overlay lines");
 
@@ -6019,6 +7303,18 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             painter.restore();
         }
 
+        syncScrollBars(kCanvasMargin + chrome.plotX, topInset, chrome.plotWidth, insetHeight);
+        // Scale bar (View > Scale Bar): bottom right, or top right when the
+        // dataset names sit bottom right.
+        if (app_.showScaleBar && !app_.display.frequencyAxis && !app_.xf.active) {
+            const double spacing = traceSpacingOf(*app_.foreground);
+            const double tracesAcross = app_.view.traceEnd - app_.view.traceStart;
+            if (spacing > 0.0 && tracesAcross > 0.0) {
+                drawScaleBar(painter, QRect(kCanvasMargin + chrome.plotX, topInset, chrome.plotWidth, insetHeight),
+                             tracesAcross * spacing, datasetLabelPosition_ == DatasetLabelPosition::BottomRight);
+            }
+        }
+
         if (zoomBandActive_) {
             painter.save();
             painter.setPen(QPen(QColor(kAccentColor), 1.5, Qt::DashLine));
@@ -6082,15 +7378,20 @@ void SegyCanvas::setPickCallback(std::function<void(double, double, bool)> callb
 void SegyCanvas::mousePressEvent(QMouseEvent* event) {
     if (notifyActivated_) notifyActivated_();
     if (!app_.loaded) return;
+    if (event->button() == Qt::LeftButton && nearCurtain(event->pos().x())) {
+        curtainDragging_ = true;
+        setCursor(Qt::SplitHCursor);
+        return;
+    }
     if (event->button() == Qt::RightButton) {
         // The color bar's column: color scale menu only.
         if (app_.display.showColorBar && amplitudeScale_->isVisible() && event->pos().x() >= kCanvasMargin + plotAreaWidth()) {
-            if (colorScaleMenu_) colorScaleMenu_(event->globalPosition().toPoint());
+            if (colorScaleMenu_) colorScaleMenu_(eventGlobalPos(event).toPoint());
             return;
         }
         double traceCoord = 0.0, sampleCoord = 0.0;
         if (!dataCoordAt(event->pos().x(), event->pos().y(), traceCoord, sampleCoord)) {
-            showAxisRangeMenu(event->globalPosition().toPoint());
+            showAxisRangeMenu(eventGlobalPos(event).toPoint());
             return;
         }
     }
@@ -6106,7 +7407,7 @@ void SegyCanvas::mousePressEvent(QMouseEvent* event) {
         return;
     }
     if (event->button() == Qt::RightButton && (app_.tool == ToolMode::Arrow || app_.tool == ToolMode::Pan)) {
-        showAxisRangeMenu(event->globalPosition().toPoint());
+        showAxisRangeMenu(eventGlobalPos(event).toPoint());
         return;
     }
     if (app_.tool == ToolMode::Arrow && event->button() == Qt::LeftButton) {
@@ -6191,6 +7492,21 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
     hovering_ = true;
     bool needsRepaint = false;
 
+    if (curtainDragging_) {
+        if (lastPlotWidth_ > 0) {
+            const double x = double(event->pos().x() - kCanvasMargin - lastPlotX_);
+            app_.curtainFraction = std::clamp(x / double(lastPlotWidth_), 0.0, 1.0);
+            update();
+        }
+        return;
+    }
+    // The cursor shows the curtain can be dragged.
+    const bool overCurtain = !app_.dragging && !middlePanning_ && nearCurtain(event->pos().x());
+    if (overCurtain != curtainHover_) {
+        curtainHover_ = overCurtain;
+        if (overCurtain) setCursor(Qt::SplitHCursor); else unsetCursorForTool();
+    }
+
     if (zoomBandActive_) {
         zoomBandEnd_ = event->pos();
         update();
@@ -6240,6 +7556,12 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void SegyCanvas::mouseReleaseEvent(QMouseEvent* event) {
+    if (curtainDragging_ && event->button() == Qt::LeftButton) {
+        curtainDragging_ = false;
+        curtainHover_ = nearCurtain(event->pos().x());
+        if (!curtainHover_) unsetCursorForTool();
+        return;
+    }
     if (zoomBandActive_ && event->button() == Qt::LeftButton) finishZoomBand();
     if (middlePanning_ && event->button() == Qt::MiddleButton) middlePanning_ = false;
     if (app_.dragging) app_.dragging = false;
@@ -6468,12 +7790,52 @@ void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
 }
 
 void SegyCanvas::setBackgroundDataset(std::shared_ptr<Dataset> dataset) {
-    // Phase 1: purely a held reference (see native/README.md, "Dataset
-    // pool") -- nothing reads app_.background for rendering/analysis yet,
-    // so this is just the pointer swap plus telling the Background box to
-    // repaint its new name.
-    app_.background = std::move(dataset);
+    // The Background is drawn left of the curtain (see paintEvent).
+    app_.background = dataset ? std::move(dataset) : std::make_shared<Dataset>();
     notifyStateChanged();
+    update();
+}
+
+bool SegyCanvas::curtainActive() const {
+    const Dataset* bg = app_.background.get();
+    return app_.loaded && bg && bg->traceCount > 0 && bg->binHeader.samplesPerTrace > 0 &&
+           app_.background != app_.foreground && !app_.xf.active && !app_.display.frequencyAxis;
+}
+
+segy::ViewRange SegyCanvas::curtainView() const {
+    segy::ViewRange v = app_.view;
+    const double fgDt = app_.foreground->binHeader.sampleIntervalUs;
+    const double bgDt = app_.background->binHeader.sampleIntervalUs;
+    if (fgDt > 0.0 && bgDt > 0.0 && fgDt != bgDt) {
+        // Same times, in the Background's own sample numbers.
+        v.sampleStart *= fgDt / bgDt;
+        v.sampleEnd *= fgDt / bgDt;
+    }
+    return v;
+}
+
+int SegyCanvas::curtainPixelX() const {
+    return kCanvasMargin + lastPlotX_ + int(std::lround(std::clamp(app_.curtainFraction, 0.0, 1.0) * lastPlotWidth_));
+}
+
+bool SegyCanvas::nearCurtain(int x) const {
+    return curtainActive() && lastPlotWidth_ > 0 && std::abs(x - curtainPixelX()) <= 5;
+}
+
+bool SegyCanvas::swapForegroundBackground() {
+    if (!app_.loaded || !app_.background || app_.background->traceCount <= 0) return false;
+    std::shared_ptr<Dataset> oldForeground = app_.foreground;
+    std::shared_ptr<Dataset> oldBackground = app_.background;
+    const segy::ViewRange view = app_.view;
+    const bool sameSize = oldForeground->traceCount == oldBackground->traceCount &&
+                          oldForeground->binHeader.samplesPerTrace == oldBackground->binHeader.samplesPerTrace;
+    setForegroundDataset(oldBackground);
+    app_.background = oldForeground;
+    if (sameSize) app_.view = view; // a before/after comparison stays where it was
+    if (notifyViewChanged_) notifyViewChanged_();
+    notifyStateChanged();
+    update();
+    return true;
 }
 
 void SegyCanvas::startLoading(const std::filesystem::path& path, std::vector<std::string> processingHistory,
@@ -6632,9 +7994,27 @@ MainWindow::MainWindow() : QMainWindow() {
     QMenu* windowMenu = menuBar()->addMenu("&Window");
     QMenu* helpMenu = menuBar()->addMenu("&Help");
 
+    // View > Swap Foreground and Background: with the curtain, a quick
+    // before/after comparison (see SegyCanvas::swapForegroundBackground).
+    swapDatasetsAction_ = new QAction("S&wap Foreground and Background", this);
+    swapDatasetsAction_->setShortcut(Qt::Key_X);
+    swapDatasetsAction_->setToolTip("Swap Foreground and Background: compare two datasets");
+    connect(swapDatasetsAction_, &QAction::triggered, this, [this]() {
+        if (!activePanel_->canvas->swapForegroundBackground()) {
+            flashStatusMessage("No Background dataset: choose one in the Background box first");
+            return;
+        }
+        refreshAllDatasetSlotNames();
+        refreshToolChrome();
+    });
+
     QAction* openAction = fileMenu->addAction("&Open...");
     openAction->setShortcut(QKeySequence::Open);
     connect(openAction, &QAction::triggered, this, &MainWindow::openFile);
+    QAction* openAnalysisAction = fileMenu->addAction("Open with &Analysis...");
+    openAnalysisAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O));
+    openAnalysisAction->setToolTip("Open with Analysis: see the headers first, map them, read a selection");
+    connect(openAnalysisAction, &QAction::triggered, this, &MainWindow::openFileWithAnalysis);
     QAction* openAttributeAction = fileMenu->addAction("Open &Velocity or Attribute...");
     openAttributeAction->setToolTip("A velocity model or another attribute SEG-Y, for the dataset list");
     connect(openAttributeAction, &QAction::triggered, this, &MainWindow::openAttributeFile);
@@ -6764,8 +8144,6 @@ MainWindow::MainWindow() : QMainWindow() {
         QAction* managerAction = horizonsMenu->addAction("Horizon &Manager...");
         connect(managerAction, &QAction::triggered, this, &MainWindow::openHorizonManager);
         horizonsMenu->addSeparator();
-        QAction* seabedAction = horizonsMenu->addAction("Auto-pick &Seabed");
-        connect(seabedAction, &QAction::triggered, this, [this]() { autoPickSeabed(activePanel_); });
         flattenAction_ = horizonsMenu->addAction("&Flatten...");
         flattenAction_->setCheckable(true);
         flattenAction_->setToolTip("Flatten on a horizon or a header time; choose again to go back");
@@ -7211,6 +8589,9 @@ MainWindow::MainWindow() : QMainWindow() {
         {"traceInspector", "Trace Inspector", "Trace Inspector: every header value of one trace",
          {"M8 3v18", "M15 15m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0", "M17.2 17.2l3 3"},
          whenLoaded([this]() { openTraceInspector(); })},
+        {"swapDatasets", "Swap Foreground and Background",
+         "Swap Foreground and Background: compare two datasets (X)",
+         {"M7 4l-4 4l4 4", "M3 8h13", "M17 12l4 4l-4 4", "M21 16h-13"}, [this]() { swapDatasetsAction_->trigger(); }},
         {"clip", "Clip", "Clip: the amplitudes at the two ends of the colour scale",
          {"M3 6h18", "M3 18h18", "M3 12l3 -6h4l4 12h4l3 -6"}, whenLoaded([this]() { activePanel_->canvas->openClipDialog(); })},
         {"signalNoise", "Signal/Noise", "Signal/Noise: signal and noise spectra of the view",
@@ -7246,9 +8627,6 @@ MainWindow::MainWindow() : QMainWindow() {
         {"timeDepth", "Time-Depth Conversion", "Time-Depth Conversion: with a velocity dataset",
          {"M8 3v18", "M8 6h4", "M8 10h3", "M8 14h4", "M8 18h3", "M17 5v14", "M14 16l3 3l3 -3"},
          [this]() { openTimeDepthConversion(); }},
-        {"seabed", "Auto-pick Seabed", "Auto-pick Seabed: the first strong reflection on every trace",
-         {"M3 13c3 -3 6 -3 9 0s6 3 9 0", "M3 19h18", "M7 8v1", "M12 8v1", "M17 8v1"},
-         whenLoaded([this]() { autoPickSeabed(activePanel_); })},
         {"horizonManager", "Horizon Manager", "Horizon Manager: show, colour, rename and delete horizons",
          {"M4 8l8 -4l8 4l-8 4z", "M4 12l8 4l8 -4", "M4 16l8 4l8 -4"}, [this]() { openHorizonManager(); }},
     };
@@ -7427,6 +8805,42 @@ MainWindow::MainWindow() : QMainWindow() {
     viewMenu->addAction(wiggleMenuAction_);
     viewMenu->addAction(wiggleInfillAction);
     addMenuMirror(viewMenu, flipHorizontalAction_, "Flip &Horizontal");
+    viewMenu->addAction(swapDatasetsAction_);
+    viewMenu->addSeparator();
+    // Scale bar: from the trace spacing (CDP X/Y), or one the user types.
+    QAction* scaleBarAction = viewMenu->addAction("Scale &Bar");
+    scaleBarAction->setCheckable(true);
+    scaleBarAction->setChecked(true);
+    scaleBarAction->setToolTip("Scale Bar: distance along the line, from the trace spacing");
+    QAction* traceSpacingAction = viewMenu->addAction("Trace &Spacing...");
+    traceSpacingAction->setToolTip("Trace Spacing: metres between traces, for the scale bar and the f-k filter");
+    auto askTraceSpacing = [this]() -> bool {
+        AppState& app = activePanel_->app;
+        if (!app.loaded) {
+            flashStatusMessage("No data selected");
+            return false;
+        }
+        const double current = traceSpacingOf(*app.foreground);
+        bool ok = false;
+        const double typed = QInputDialog::getDouble(
+            this, "Trace Spacing",
+            current > 0.0 ? QString("Metres between traces (from the coordinates: %1 m)").arg(current, 0, 'g', 6)
+                          : QString("Metres between traces (the file has no coordinates)"),
+            current > 0.0 ? current : 12.5, 0.001, 100000.0, 3, &ok);
+        if (!ok) return false;
+        app.foreground->traceSpacingM = typed;
+        for (Panel* p : {&panelA_, &panelB_}) p->canvas->update();
+        return true;
+    };
+    connect(traceSpacingAction, &QAction::triggered, this, [askTraceSpacing]() { askTraceSpacing(); });
+    connect(scaleBarAction, &QAction::toggled, this, [this, askTraceSpacing](bool on) {
+        for (Panel* p : targetPanels()) {
+            p->app.showScaleBar = on;
+            p->canvas->update();
+        }
+        // Without coordinates there is nothing to scale by: ask once.
+        if (on && activePanel_->app.loaded && traceSpacingOf(*activePanel_->app.foreground) <= 0.0) askTraceSpacing();
+    });
     viewMenu->addSeparator();
     // Amplitude: gain, AGC, clip and polarity in one place.
     QMenu* gainMenu = viewMenu->addMenu("&Amplitude");
@@ -7513,6 +8927,10 @@ MainWindow::MainWindow() : QMainWindow() {
     addMenuMirror(analysisMenu, spectrumAction_, "&Spectrum");
     addMenuMirror(analysisMenu, histogramAction_, "&Histogram");
     addMenuMirror(analysisMenu, autocorrelationAction_, "&Autocorrelation");
+    QAction* crossCorrelationAction = analysisMenu->addAction("&Cross-correlation");
+    crossCorrelationAction->setToolTip(
+        "Cross-correlation: the Foreground with the Background (or a dataset you pick), trace by trace, over the view");
+    connect(crossCorrelationAction, &QAction::triggered, this, [this]() { startViewCrossCorrelation(); });
     addMenuMirror(analysisMenu, octaveBandAction_, "&Octave Bands");
     analysisMenu->addSeparator();
     signalNoiseAction_ = analysisMenu->addAction("Signal/&Noise");
@@ -8623,7 +10041,29 @@ void MainWindow::computeAndShowSpectrum(Panel* panel) {
         spectrumPlot_ = new SpectrumPlotWidget();
         spectrumPlot_->setParametersCallback([this]() { openSpectrumDialog(); });
     }
-    spectrumPlot_->setResult(result, src.color);
+    // One entry per source: a box keeps its colour and is replaced when
+    // recomputed; the view gets a new entry for every different range.
+    SpectrumEntry entry;
+    const QString dsName = QString::fromStdString(app.foreground->name);
+    const double sampleMs = app.foreground->binHeader.sampleIntervalUs / 1000.0;
+    const QString range = QString("%1-%2, %3-%4 ms")
+                              .arg(src.traceStart + 1)
+                              .arg(src.traceEnd)
+                              .arg(QString::number(src.sampleStart * sampleMs, 'g', 6), QString::number(src.sampleEnd * sampleMs, 'g', 6));
+    const SelectionBox* box = app.spectrum.useSelection ? activeBox(app) : nullptr;
+    const QString sep = QString::fromUtf8(" \xc2\xb7 ");
+    if (box && box->complete) {
+        entry.key = QString("box:%1:%2").arg(dsName).arg(box->colorIndex);
+        entry.name = dsName + sep + QString("Box %1").arg(box->colorIndex + 1);
+        entry.color = src.color;
+    } else {
+        entry.key = QString("view:%1:%2").arg(dsName, range);
+        entry.name = dsName + sep + range;
+        entry.color = spectrumPlot_->nextColor();
+    }
+    entry.frequencyHz = result.frequencyHz;
+    entry.db = result.amplitudeDb;
+    spectrumPlot_->addSpectrum(std::move(entry));
     spectrumPlot_->setWindowTitle(QString("Spectrum") + datasetTitleSuffix(app));
     spectrumPlot_->show();
     spectrumPlot_->raise();
@@ -9254,30 +10694,6 @@ bool askProcessingValues(QWidget* parent, const QString& title, const QString& e
 
 // Median distance (m) between consecutive traces' CDP X/Y (or source X/Y)
 // over the first 500 traces; 0 when the headers have no coordinates.
-double estimateTraceSpacing(const Dataset& ds) {
-    std::vector<double> steps;
-    const int64_t count = std::min<int64_t>(ds.traceCount, 501);
-    double px = 0.0, py = 0.0;
-    for (int64_t t = 0; t < count; ++t) {
-        const segy::TraceHeader th =
-            segy::parseTraceHeader(ds.file.data() + segy::kHeaderTotalSize + size_t(t) * ds.traceStrideBytes);
-        const double scale = th.coordinateScalar < 0 ? 1.0 / -th.coordinateScalar
-                             : th.coordinateScalar > 0 ? double(th.coordinateScalar)
-                                                       : 1.0;
-        const bool useCdp = th.cdpX != 0 || th.cdpY != 0;
-        const double x = (useCdp ? th.cdpX : th.x) * scale, y = (useCdp ? th.cdpY : th.y) * scale;
-        if (t > 0) {
-            const double d = std::hypot(x - px, y - py);
-            if (d > 0.0) steps.push_back(d);
-        }
-        px = x;
-        py = y;
-    }
-    if (steps.empty()) return 0.0;
-    std::nth_element(steps.begin(), steps.begin() + std::ptrdiff_t(steps.size() / 2), steps.end());
-    return steps[steps.size() / 2];
-}
-
 // The processing guards shared by every dialog: data loaded, not x-f.
 bool processingReady(MainWindow* window, Panel* panel, const std::function<void(const QString&)>& flash) {
     (void)window;
@@ -9388,7 +10804,7 @@ void MainWindow::openFkFilter() {
     if (!processingReady(this, panel, [this](const QString& m) { flashStatusMessage(m); })) return;
     std::shared_ptr<Dataset> ds = panel->app.foreground;
     segy::FkFilterParams p = lastFk_;
-    const double estimated = estimateTraceSpacing(*ds);
+    const double estimated = traceSpacingOf(*ds);
     if (estimated > 0.0) p.traceSpacing = estimated;
     QString name = QString::fromStdString(ds->filePath.stem().string()) + "_fk";
     int mode = p.pass ? 0 : 1;
@@ -10065,6 +11481,7 @@ void MainWindow::computeAndShowSignalNoise(Panel* sourcePanel) {
 void MainWindow::refreshRecomputeButtons() {
     refreshSignalNoiseRecompute();
     refreshFkRecompute();
+    refreshPhaseRecompute();
 }
 
 void MainWindow::ensureFkWindow() {
@@ -10172,6 +11589,7 @@ public:
 
     std::function<void(double)> onApply;
     std::function<void()> onRecompute;
+    void setRecomputeUseful(bool useful) { styleRecomputeButton(recomputeButton_, useful); }
 
     void setResult(const segy::PhaseScanResult& result, const QString& sourceText) {
         result_ = result;
@@ -10298,6 +11716,13 @@ void MainWindow::applyPhaseRotation(Panel* panel, double degrees) {
                       [degrees](std::vector<float>& trace, double) { segy::phaseRotate(trace, degrees); });
 }
 
+void MainWindow::refreshPhaseRecompute() {
+    if (!phaseWindow_) return;
+    bool useful = !phaseComputed_ || !sameSignalNoiseSource(resolveSignalNoiseSource(activePanel_), phaseLastSource_);
+    if (!activePanel_->app.loaded) useful = false;
+    phaseWindow_->setRecomputeUseful(useful);
+}
+
 void MainWindow::computeAndShowPhaseEstimate(Panel* sourcePanel) {
     AppState& app = sourcePanel->app;
     if (!app.loaded) {
@@ -10362,8 +11787,11 @@ void MainWindow::computeAndShowPhaseEstimate(Panel* sourcePanel) {
             });
             *result = segy::finishPhaseScan(total);
         },
-        [this, result, sourceText]() {
+        [this, result, sourceText, src]() {
+            phaseLastSource_ = src;
+            phaseComputed_ = true;
             phaseWindow_->setResult(*result, sourceText);
+            refreshPhaseRecompute();
             phaseWindow_->show();
             phaseWindow_->raise();
             phaseWindow_->activateWindow();
@@ -10410,6 +11838,7 @@ void MainWindow::computeAndShowFk(Panel* sourcePanel) {
         double dxMetres = 0.0;
         double proposedCdpDistance = 0.0;
         double cdpDistanceUsed = 0.0;
+        int resolvedGather = 0, resolvedDistance = 0; // what Auto chose
         QString panelText, rangeText, info, emptyReason;
     };
     auto out = std::make_shared<FkOutcome>();
@@ -10458,6 +11887,7 @@ void MainWindow::computeAndShowFk(Panel* sourcePanel) {
                 panels = segy::splitIntoGathers(mode == 1 ? ffid : cdp, t0, 8);
             }
             if (mode == 3) panels = segy::slidingPanels(t0, t1, 256);
+            out->resolvedGather = mode;
             if (panels.empty()) {
                 out->emptyReason = QString("No %1 gathers of 8 or more traces in this data -- choose another panel "
                                            "ident, or None for a stack.")
@@ -10474,6 +11904,7 @@ void MainWindow::computeAndShowFk(Panel* sourcePanel) {
 
             // Distance ident -> trace spacing: the median step within panels times the scalar.
             const int dmode = distanceMode == 0 ? (mode == 3 ? 2 : 1) : distanceMode;
+            out->resolvedDistance = dmode;
             const std::vector<int32_t>& dkey = dmode == 1 ? offset : cdp;
             // Gathers are put in order of the distance ident (prestack data
             // often stores offsets interleaved), so the space axis of the FFT
@@ -10617,6 +12048,7 @@ void MainWindow::computeAndShowFk(Panel* sourcePanel) {
             ensureFkWindow();
             fkWindow_->proposeCdpDistance(out->proposedCdpDistance);
             if (!fkWindow_->cdpDistanceTyped()) fkLastCdpDistance_ = fkWindow_->cdpDistance();
+            fkWindow_->setResolvedModes(out->resolvedGather, out->resolvedDistance);
             fkWindow_->setResult(displays, out->rangeText, out->info, out->emptyReason);
             fkWindow_->setWindowTitle(QString("f-k display") + datasetTitleSuffix(sourcePanel->app));
             fkWindow_->show();
@@ -10653,7 +12085,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override {
         if (event->button() != Qt::LeftButton || samples_.size() < 2) return;
         const QRect plot = plotRect();
-        const double frac = (event->position().y() - plot.top()) / std::max(1, plot.height());
+        const double frac = (eventPos(event).y() - plot.top()) / std::max(1, plot.height());
         const int sample = std::clamp(int(std::lround(frac * double(samples_.size() - 1))), 0, int(samples_.size()) - 1);
         marker_ = sample;
         update();
@@ -10735,7 +12167,7 @@ TraceInspectorWindow::TraceInspectorWindow(QWidget* parent) : QWidget(parent, Qt
                                    segy::HeaderStandard::SegyRev2}) {
         standardCombo_->addItem(segy::headerStandardName(s), int(s));
     }
-    standardCombo_->setToolTip("Trace header definition: Shell V2.1 (default), SEG-Y rev 1.0 or rev 2.0");
+    standardCombo_->setToolTip("Trace header definition: SEG-Y v2.1 (default), SEG-Y rev 1.0 or rev 2.0");
     top->addWidget(standardCombo_);
     top->addSpacing(16);
     top->addWidget(new QLabel("Byte order"));
@@ -11014,6 +12446,10 @@ void MainWindow::openTraceHeaderRanges() {
                                        QAbstractItemView::AnyKeyPressed);
                 table->horizontalHeader()->setStretchLastSection(true);
                 layout->addWidget(table);
+                QPushButton* copyRanges = new QPushButton("Copy Table");
+                copyRanges->setToolTip("Copy Table: as tab-separated text, for a spreadsheet");
+                connect(copyRanges, &QPushButton::clicked, headerRangesWidget_, [table]() { copyTableToClipboard(table); });
+                layout->addWidget(copyRanges, 0, Qt::AlignRight);
                 QLabel* hint = new QLabel("Edit Min/Max/Inc of an ident (double-click) to select a subset; changed "
                                           "cells turn orange. Inc 2 keeps every second value from Min.");
                 hint->setStyleSheet(themed("color: #9a9ca3; font-size: 11px;"));
@@ -12197,17 +13633,103 @@ void MainWindow::computeAndShowAutocorrelation(Panel* sourcePanel, double minLag
                    QString("Autocorrelation") + datasetTitleSuffix(app), QString());
 }
 
+void MainWindow::startViewCrossCorrelation() {
+    Panel* panel = activePanel_;
+    AppState& app = panel->app;
+    if (!app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    std::shared_ptr<Dataset> other = app.background;
+    if (!other || other->traceCount <= 0 || other == app.foreground) {
+        // No Background: pick the other dataset from the list.
+        QStringList names;
+        std::vector<std::shared_ptr<Dataset>> candidates;
+        for (const std::shared_ptr<Dataset>& d : datasetPool_) {
+            if (d == app.foreground || d->traceCount <= 0) continue;
+            names << QString::fromStdString(d->name);
+            candidates.push_back(d);
+        }
+        if (candidates.empty()) {
+            flashStatusMessage("Cross-correlation needs a second dataset: open or compute one first");
+            return;
+        }
+        bool ok = false;
+        const QString picked = QInputDialog::getItem(
+            this, "Cross-correlation", QString("Correlate %1 with").arg(QString::fromStdString(app.foreground->name)), names,
+            0, false, &ok);
+        if (!ok) return;
+        other = candidates[size_t(std::max<qsizetype>(0, names.indexOf(picked)))];
+    }
+    double minMs = 200.0, maxMs = 200.0;
+    if (crossCorrelationDialog_) {
+        minMs = crossCorrelationDialog_->minLagMs();
+        maxMs = crossCorrelationDialog_->maxLagMs();
+    }
+    computeAndShowViewCrossCorrelation(panel, other, minMs, maxMs);
+}
+
+void MainWindow::ensureCrossCorrelationDialog() {
+    if (crossCorrelationDialog_) return;
+    crossCorrelationDialog_ = new AutocorrelationDialog(this, /*crossCorrelation=*/true);
+    crossCorrelationDialog_->setApplyCallback([this](double minMs, double maxMs) {
+        if (crossPanel_) {
+            computeAndShowViewCrossCorrelation(crossPanel_, crossB_, minMs, maxMs);
+        } else {
+            computeAndShowCrossCorrelation(crossA_, crossB_, minMs, maxMs);
+        }
+    });
+}
+
+void MainWindow::computeAndShowViewCrossCorrelation(Panel* sourcePanel, std::shared_ptr<Dataset> other, double minLagMs,
+                                                    double maxLagMs) {
+    AppState& app = sourcePanel->app;
+    if (!app.loaded || !other) return;
+    if (app.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    std::shared_ptr<Dataset> a = app.foreground;
+    if (a->binHeader.sampleIntervalUs != other->binHeader.sampleIntervalUs) {
+        flashStatusMessage("Different sample intervals: cross-correlation needs the same");
+        return;
+    }
+    crossPanel_ = sourcePanel;
+    crossA_ = a;
+    crossB_ = other;
+    ensureCrossCorrelationDialog();
+    // The view, as for the autocorrelation; clipped to what both datasets have.
+    const int64_t traces = std::min(a->traceCount, other->traceCount);
+    const int samples = std::min<int>(a->binHeader.samplesPerTrace, other->binHeader.samplesPerTrace);
+    int64_t t0 = std::clamp<int64_t>(int64_t(std::floor(app.view.traceStart)), 0, traces);
+    int64_t t1 = std::clamp<int64_t>(int64_t(std::ceil(app.view.traceEnd)), t0, traces);
+    int s0 = std::clamp(int(std::floor(app.view.sampleStart)), 0, samples);
+    int s1 = std::clamp(int(std::ceil(app.view.sampleEnd)), s0, samples);
+    const double intervalUs = a->binHeader.sampleIntervalUs;
+    if (t1 - t0 <= 0 || s1 - s0 < 2 || intervalUs <= 0) {
+        flashStatusMessage("Not enough overlapping data to cross-correlate");
+        return;
+    }
+    const int visible = s1 - s0;
+    const int minLag = -std::clamp(int(std::lround(minLagMs * 1000.0 / intervalUs)), 0, visible - 1);
+    const int maxLag = std::clamp(int(std::lround(maxLagMs * 1000.0 / intervalUs)), 0, visible - 1);
+    if (maxLag - minLag < 2) {
+        flashStatusMessage("Lag window too small");
+        return;
+    }
+    const QString nameA = QString::fromStdString(a->name), nameB = QString::fromStdString(other->name);
+    runCorrelation(crossCorrelationDialog_, a, other, t0, t1, s0, s1, minLag, maxLag, app.display.colorScale,
+                   app.display.colorScaleFlipped, QString("Cross-correlation %1 %2 %3").arg(nameA, QChar(0x00D7), nameB),
+                   QString("%1 %2 %3").arg(nameA, QChar(0x00D7), nameB));
+}
+
 void MainWindow::computeAndShowCrossCorrelation(std::shared_ptr<Dataset> a, std::shared_ptr<Dataset> b,
                                                 double minLagMs, double maxLagMs) {
     if (!a || !b) return;
+    crossPanel_ = nullptr;
     crossA_ = a;
     crossB_ = b;
-    if (!crossCorrelationDialog_) {
-        crossCorrelationDialog_ = new AutocorrelationDialog(this, /*crossCorrelation=*/true);
-        crossCorrelationDialog_->setApplyCallback([this](double minMs, double maxMs) {
-            computeAndShowCrossCorrelation(crossA_, crossB_, minMs, maxMs);
-        });
-    }
+    ensureCrossCorrelationDialog();
     // Trace i of A with trace i of B over the whole common trace length.
     const int64_t traces = std::min(a->traceCount, b->traceCount);
     const int samples = std::min<int>(a->binHeader.samplesPerTrace, b->binHeader.samplesPerTrace);
@@ -12245,6 +13767,7 @@ void MainWindow::runCorrelation(AutocorrelationDialog* dialog, std::shared_ptr<D
     result->sampleIntervalUs = intervalUs;
     result->traceCount = decodeCount;
     result->description = description;
+    result->traceSpacingM = traceSpacingOf(*a);
 
     runBackgroundTask(
         QString("%1: %2 traces").arg(description.isEmpty() ? QString("Autocorrelation") : QString("Cross-correlation"))
@@ -12285,38 +13808,7 @@ void MainWindow::runCorrelation(AutocorrelationDialog* dialog, std::shared_ptr<D
             if (contributing > 0) {
                 for (int j = 0; j < width; ++j) result->average[size_t(j)] = float(sum[size_t(j)] / contributing);
             }
-            // Peak-to-peak: nearest side peak of the average >= 0.5.
-            result->peakLagSamples = segy::nearestSidePeakLag(result->average, minLag, 0.5);
-            if (!std::isnan(result->peakLagSamples)) {
-                const int idx = std::clamp(int(std::lround(result->peakLagSamples)) - minLag, 0, width - 1);
-                result->peakValue = result->average[size_t(idx)];
-            }
-            // Power spectrum of the average: lags tapered (cosine squared
-            // to each end) and placed circularly (lag k at index k mod N).
-            const size_t len = segy::nextPowerOfTwo(size_t(std::max(64, 2 * width)));
-            std::vector<std::complex<float>> buf(len, std::complex<float>(0.0f, 0.0f));
-            const double pi = std::acos(-1.0);
-            for (int j = 0; j < width; ++j) {
-                const int lag = minLag + j;
-                const double side = lag >= 0 ? double(std::max(1, maxLag)) : double(std::max(1, -minLag));
-                const double w = std::cos(0.5 * pi * std::min(1.0, std::fabs(double(lag)) / (side + 1.0)));
-                buf[size_t((lag % int(len) + int(len)) % int(len))] = float(result->average[size_t(j)] * w * w);
-            }
-            segy::fft(buf);
-            const size_t half = len / 2;
-            double peak = 0.0;
-            std::vector<double> power(half + 1);
-            for (size_t m = 0; m <= half; ++m) {
-                power[m] = std::abs(buf[m]);
-                peak = std::max(peak, power[m]);
-            }
-            const double dtSeconds = result->sampleIntervalUs * 1e-6;
-            for (size_t m = 0; m <= half; ++m) {
-                result->spectrumHz.push_back(float(double(m) / (double(len) * dtSeconds)));
-                result->spectrumDb.push_back(peak > 0.0 && power[m] > 0.0
-                                                 ? std::max(-120.0f, float(10.0 * std::log10(power[m] / peak)))
-                                                 : std::numeric_limits<float>::quiet_NaN());
-            }
+            // Peak-to-peak is found in the window (its threshold is the user's).
             auto data = std::make_shared<OctaveBandData>();
             data->traces = std::move(panel);
             data->clip = 1.0f;
@@ -12457,6 +13949,117 @@ void MainWindow::openFile() {
         // case this resets it before the new file's own render picks it up.
         if (!dialog.keepPreviousClip()) setGainDb(0.0);
         canvas_->startLoading(path);
+    });
+}
+
+void MainWindow::openFileWithAnalysis() {
+    QTimer::singleShot(0, this, [this]() {
+        SegyOpenDialog chooser(this);
+        chooser.setWindowTitle("Open with Analysis");
+        if (chooser.exec() != QDialog::Accepted) return;
+        const std::filesystem::path path = chooser.selectedPath();
+        if (path.empty()) return;
+        ImportDialog dialog(path, this);
+        if (dialog.exec() != QDialog::Accepted) return;
+        if (!chooser.keepPreviousClip()) setGainDb(0.0);
+        if (dialog.opensDirectly()) {
+            canvas_->startLoading(path);
+            return;
+        }
+        // A copy: the selected traces, headers at the standard positions,
+        // samples as float32. Only headers are read for the selection.
+        const segy::HeaderMapping mapping = dialog.mapping();
+        const segy::TraceSelection selection = dialog.selection();
+        const uint64_t dataStart = dialog.layout().dataStart;
+        const int64_t traceCount = dialog.traceCount();
+        const size_t stride = dialog.traceStride();
+        segy::BinaryHeader outHeader = dialog.binaryHeader();
+        const int16_t formatCode = outHeader.formatCode;
+        outHeader.formatCode = segy::kIeeeFloat32;
+        const int samples = outHeader.samplesPerTrace;
+        const QString stem = QString::fromStdString(path.stem().string());
+        std::vector<std::string> history;
+        history.push_back("OPEN WITH ANALYSIS: " + path.filename().string());
+        if (!selection.isAll()) {
+            std::string text = "SELECTION: TRACES " + std::to_string(selection.first + 1) + "-" +
+                               (selection.last < 0 ? std::string("END") : std::to_string(selection.last + 1));
+            if (selection.every > 1) text += " EVERY " + std::to_string(selection.every);
+            for (const segy::KeyRange& r : selection.ranges) {
+                text += " " + r.key + " " + QString::number(r.min, 'g', 10).toStdString() + "-" +
+                        QString::number(r.max, 'g', 10).toStdString();
+                if (r.step > 0.0) text += " STEP " + QString::number(r.step, 'g', 10).toStdString();
+            }
+            history.push_back(text);
+        }
+        if (!mapping.isStandard()) {
+            std::string text = "HEADER MAPPING:";
+            for (const segy::MappedField& f : mapping.fields) {
+                if (f.spec.firstByte != f.standardByte || !f.spec.bigEndian ||
+                    f.spec.type != (f.standardSize == 2 ? segy::FieldType::Int16 : segy::FieldType::Int32)) {
+                    text += " " + f.key + "=" + std::to_string(f.spec.firstByte) + segy::fieldTypeName(f.spec.type);
+                }
+            }
+            history.push_back(text);
+        }
+        const std::filesystem::path outPath = scratchSegyPath(stem + "_sel");
+        auto source = std::make_shared<segy::MappedFile>();
+        std::string error;
+        if (!source->open(path, &error)) {
+            QMessageBox::warning(this, "Open with Analysis", QString::fromStdString(error));
+            return;
+        }
+        auto picked = std::make_shared<std::vector<int64_t>>();
+        auto writeOk = std::make_shared<bool>(false);
+        auto writeError = std::make_shared<std::string>();
+        runBackgroundTask(
+            QString("Reading a selection of %1").arg(QString::fromStdString(path.filename().string())),
+            [this, source, mapping, selection, dataStart, traceCount, stride, outHeader, formatCode, samples, history,
+             outPath, stem, picked, writeOk, writeError]() {
+                backgroundTaskDone_ = 0;
+                backgroundTaskTotal_ = traceCount;
+                auto headerOf = [&](int64_t t) { return source->data() + dataStart + uint64_t(t) * stride; };
+                // Pass 1: which traces (headers only, in parallel).
+                std::vector<uint8_t> keep(size_t(traceCount), 0);
+                {
+                    segy::ThreadPool pool;
+                    pool.parallelFor(size_t(traceCount), 8192, [&](size_t b, size_t e) {
+                        for (size_t t = b; t < e; ++t) {
+                            keep[t] = segy::traceSelected(selection, int64_t(t), headerOf(int64_t(t)), mapping) ? 1 : 0;
+                        }
+                    });
+                }
+                for (int64_t t = 0; t < traceCount; ++t) {
+                    if (keep[size_t(t)]) picked->push_back(t);
+                }
+                if (picked->empty()) {
+                    *writeError = "No trace matches the selection.";
+                    return;
+                }
+                backgroundTaskTotal_ = int64_t(picked->size());
+                QStringList inputBlocks;
+                inputBlocks << QString("FILE: %1  TRACES: %2 OF %3").arg(stem).arg(picked->size()).arg(traceCount);
+                const QString textHeader = buildSegyTextHeader(inputBlocks, history, stem + "_sel", int64_t(picked->size()),
+                                                               samples, outHeader.sampleIntervalUs);
+                *writeOk = streamTraces(
+                    outPath, textHeader.toStdString(), outHeader, int64_t(picked->size()),
+                    [&](int64_t i, segy::WriteTrace& out) {
+                        const uint8_t* h = headerOf((*picked)[size_t(i)]);
+                        out.headerBytes.resize(segy::kTraceHeaderSize);
+                        segy::normalizeTraceHeader(h, out.headerBytes.data(), mapping);
+                        out.samples.resize(size_t(samples));
+                        segy::decodeSamples(h + segy::kTraceHeaderSize, out.samples.data(), size_t(samples), formatCode);
+                    },
+                    backgroundTaskDone_, writeError.get());
+            },
+            [this, writeOk, writeError, outPath, history]() {
+                if (!*writeOk) {
+                    QMessageBox::warning(this, "Open with Analysis",
+                                         writeError->empty() ? QString("Could not write the copy")
+                                                             : QString::fromStdString(*writeError));
+                    return;
+                }
+                canvas_->startLoading(outPath, history);
+            });
     });
 }
 

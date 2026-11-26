@@ -3509,6 +3509,90 @@ gain and AGC).
   f-k path matches the direct one (< 1e-4), mutes, robust clip in the
   wiggle test.
 
+### Fifth round: curtain, spectra, Open with Analysis (2026-11-26)
+
+User list of 17 items plus the easy part of the comparison with Ewoud's
+segy_reader (COPILOT 48-65).
+
+- **Background is drawn: the curtain.** With a Background dataset set
+  (`SegyCanvas::curtainActive`), it fills the plot left of a vertical
+  divider and the Foreground the rest (same traces; times matched when
+  the sample intervals differ, `curtainView`). Drag the divider (grip in
+  the middle, split cursor within 5 px); "Background"/"Foreground" tags
+  at its foot. Variable density: the Background raster replaces those
+  columns (grid lines blended again); wiggle: the wiggle painter runs per
+  dataset with a clip rectangle. Cost only while a Background is set.
+- **View > Swap Foreground and Background (X)**, also an optional button;
+  the view is kept when both have the same size (before/after blinking).
+- **Scale bar** (View > Scale Bar, on): black/white segments over >= 5 %
+  of the plot width rounded up to 1/2/5 x 10^n, km from 10 000 m; bottom
+  right, top right when the dataset names are bottom right. The trace
+  spacing (`traceSpacingOf`) is the median CDP X/Y step of the first 500
+  traces, cached per dataset; without coordinates there is no bar until
+  View > Trace Spacing gives one (also the f-k filter's default). The
+  autocorrelation's correlogram has the same bar.
+- **Scroll bars** in the surround (bottom: traces, left: time) while
+  zoomed in; the thumb is the visible window, mirrored with Flip.
+- **f-k display** names what Auto chose ("Auto (FFID)", "Auto (CDP)").
+- **Auto-pick Seabed** only in the Horizon Manager (menu item and optional
+  button removed).
+- **Dataset boxes** elide long names in the middle; the tooltip is the
+  whole name. Readout rows in the result windows elide the same way.
+- **Octave Bands and Autocorrelation** windows have minimise/maximise.
+- **Signal/Noise details** rows are text height + 4 px.
+- **Autocorrelation:** the spectrum option is gone; Peak threshold (0.30)
+  finds the peak-to-peak in the window itself (no recompute); Measure
+  delta-t is a toggle (two clicks on the average, a third starts again;
+  off, a click does nothing).
+- **Cross-correlation** in the Analysis menu: the Foreground with the
+  Background (or a dataset picked from the list) over the visible data,
+  same window as the Calculator's whole-trace version.
+- **Recompute turns orange** in every result window when its settings (or
+  for Signal/Noise, f-k and Phase Estimate the data in view) differ from
+  what is shown (`styleRecomputeButton`).
+- **Spectra:** the Spectrum window keeps a list (`SpectrumEntry`): one per
+  box (replaced when recomputed, box colour) or view range; Spectra >
+  Spectrum Manager ticks them on/off, removes, saves and loads. All share
+  one frequency axis (finest step, up to the highest frequency, curves
+  interpolated, NaN outside their range). Save as CSV (Spectrum and
+  Signal/Noise: frequency then one dB column per shown curve) and Load
+  Spectrum (any CSV with a frequency column). A PEAK section in the
+  right-hand bar gives each curve's peak frequency.
+- **Open with Analysis** (File, Ctrl+Shift+O; `ImportDialog`, core in
+  `header_fields.{h,cpp}`, tested in `testHeaderFields`):
+  - Trace Headers: byte rows x trace columns, by standard (SEG-Y v2.1 --
+    renamed from "Shell V2.1" -- rev 1, rev 2), by this file's mapping, or
+    raw 2I/4I/4F/4B; start, count, skip, < >; Copy Table.
+  - Mapping: where this file keeps FFID, channel, shotpoint, CDP, offset,
+    coordinate scalar, source/receiver/CDP X/Y, inline, crossline; byte,
+    type (2I 4I 2U 4U 4F 4B 8I 8U 8F) and byte order per field. Nothing is
+    scanned until Scan (up to 20 000 traces spread over the file: min,
+    max, steps between distinct values, notes); "out of date" once the
+    mapping changes. From Text Header reads positions in four notations
+    (table "CDP_X 181-184 4I", ":BYTES 13-16", "(197-200)", "BYTES 1-4=IL";
+    integers only, values like "FOLD: 10-13" ignored) and lists every find
+    in the notes. Templates are text files (`KEY = byte type order`).
+  - Selection: trace range and every Nth, plus up to three header ranges
+    (min, max, step); an estimate from the scanned traces.
+  - File Header: text and extended text headers, binary header labelled
+    or raw.
+  - Notes: encoding, revision, rev 2 data start and extended headers,
+    truncated or trailing bytes, an undecodable format (headers shown,
+    Open disabled with the reason).
+  - Open: the file directly when the mapping is standard, every trace is
+    read and the data starts at byte 3600; otherwise a copy in the scratch
+    folder (headers normalised to the standard positions, float
+    coordinates x100 with scalar -100, samples float32), then opened.
+    File > Open now refuses rev 2 files with extended headers and
+    undecodable formats with a message pointing here.
+- **Binary Header** window: Labelled or Raw (every 2- and 4-byte word),
+  Copy Table. **Header Ranges**: Copy Table.
+- **Qt 5 again.** The Rocky 8 build had broken on Qt 6-only calls
+  (`QMouseEvent::position/globalPosition`, `QImage::deviceIndependentSize`,
+  a `ThemedColor` brush); `eventPos`/`eventGlobalPos` pick the right call.
+  `packaging/package-linux.sh` builds the portable Linux zip in the
+  rockylinux:8 image; segytest there: 0 failures.
+
 ### Fourth round: no placeholders, faster wiggles, one Amplitude menu
 
 - **Every control does something.** Removed what was stored but never

@@ -108,6 +108,14 @@ the MSVC runtime DLLs (`vcruntime140.dll`, `vcruntime140_1.dll`,
 `native/packaging/README-windows.txt` as `README.txt`. Zip it as
 `Shockwave-TraceLab-windows-x64.zip`. Don't commit the zip.
 
+Linux (Rocky/RHEL 8 and newer): `native/packaging/package-linux.sh` in the
+`segybuild` Docker image (`native/Dockerfile`, rockylinux:8, Qt 5.15) builds,
+runs segytest and packs `Shockwave-TraceLab-linux-x64.zip`: `TraceLab`
+launcher script + `TraceLab.bin` + Qt5/ICU libs in `lib/` + Qt plugins.
+Verified on a clean rockylinux:9 container (all libraries found, a file
+loads offscreen). Keep the code Qt5-compatible: use `eventPos(e)` /
+`eventGlobalPos(e)` for mouse events, no Qt 6-only calls.
+
 ## Performance status (6 GB file, 603k traces, 16 threads)
 
 | Operation | Time |
@@ -147,7 +155,8 @@ non-modal, the hook couldn't accept it), Calculator, Time-Depth.
   `test_main.cpp:1694`, Signal/Noise "both paths covered" (accepted 45,
   low-correlation 0). It comes from commit `7e8ada2` and fails on that
   commit alone too. Probable cause: `std::normal_distribution` gives
-  different noise on MSVC. Fix: seed a fixed sequence the test controls.
+  different noise on MSVC. Fix: seed a fixed sequence the test controls. It passes on
+  Linux/GCC (Rocky build: 0 failures), which confirms the MSVC cause.
 - **Reverse Polarity sync:** ticking it in Display Parameters updates the
   display but not the optional Reverse Polarity toolbar toggle
   (`reversePolarityAction_`).
@@ -171,8 +180,10 @@ non-modal, the hook couldn't accept it), Calculator, Time-Depth.
 - Toolbar buttons can be hidden or (optional ones) added, not reordered.
 
 **Functional gaps in what exists**
-- The Background dataset slot can be chosen but is not drawn (velocity as
-  colour under wiggles is the obvious use).
+- The Background is drawn left of the curtain; velocity as colour *under*
+  wiggles (both at once) is still to come.
+- Open with Analysis writes a copy for a selection or a changed mapping
+  (I/O of the selected traces); little-endian files are not read yet.
 - Horizons live in memory only (export CSV to keep them); picks made on a
   flattened display stay on the flattened copy; no undo while picking.
 - Seabed auto-pick handles dead and muted traces, but steep seabed with a
@@ -192,11 +203,13 @@ non-modal, the hook couldn't accept it), Calculator, Time-Depth.
 
 1. **Basemap**: a small map of the line(s) from CDP X/Y, with line
    intersections — orientation and line ties.
-2. **SEG-Y import options**: override header byte positions and the sample
-   format, little-endian data, SU files, rev 2 extended text headers.
+2. **SEG-Y import options**: done -- header mapping with templates, trace
+   selection, rev 2 data start and extended text headers (File > Open with
+   Analysis). Still open: little-endian data, SU files (COPILOT 64).
 3. **Axes and output**: x-axis by shotpoint / CDP / distance, km scale bar,
    export to PNG/PDF at a fixed scale (traces/cm, cm/s).
-4. **Draw the Background dataset** (velocity colour behind wiggles).
+4. ~~Draw the Background dataset~~ (done as the curtain) -- next:
+   velocity colour behind wiggles.
 5. ~~Attributes~~ (done, Processing > Attributes; one-sided data such as
    envelope and instantaneous frequency now spans its own min..max) — next:
    sweetness, RMS amplitude in a window.

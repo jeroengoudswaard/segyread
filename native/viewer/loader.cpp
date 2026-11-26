@@ -1,4 +1,5 @@
 #include "loader.h"
+#include "header_fields.h"
 
 namespace segy {
 
@@ -15,13 +16,27 @@ LoadResult loadSegyFile(const std::filesystem::path& path, ThreadPool& pool, con
         return result;
     }
 
+    // Rev 2 layouts this direct path does not read (extended text headers,
+    // another data start) go through File > Open with Analysis instead.
+    const SegyLayout layout = analyseLayout(result.file.data(), result.file.size());
+    if (!layout.layoutSupported) {
+        result.error = "The traces cannot be read: " + layout.reason + ". File > Open with Analysis shows the headers.";
+        return result;
+    }
+    if (layout.dataStart != kHeaderTotalSize) {
+        result.error = "The traces start at byte " + std::to_string(layout.dataStart) +
+                       " (extended text headers): use File > Open with Analysis to read this file.";
+        return result;
+    }
+
     BinaryHeader bh = parseBinaryHeader(result.file.data() + kTextHeaderSize);
     if (bh.samplesPerTrace <= 0) {
         result.error = "Binary header reports zero samples per trace.";
         return result;
     }
     if (!isSampleFormatSupported(bh.formatCode)) {
-        result.error = "Unsupported sample format code: " + std::to_string(bh.formatCode);
+        result.error = "Sample format code " + std::to_string(bh.formatCode) +
+                       " cannot be decoded (or the file is little-endian). File > Open with Analysis shows its headers.";
         return result;
     }
 

@@ -47,6 +47,8 @@ struct BandpassRequest {
 #include "segy_writer.h"
 #include "threadpool.h"
 #include "wiggle.h"
+#include "header_fields.h"
+#include <array>
 
 class QEvent;
 class QMouseEvent;
@@ -82,6 +84,7 @@ class QScrollArea;
 class QHBoxLayout;
 class QVBoxLayout;
 class QToolBar;
+class QScrollBar;
 
 namespace segyqt {
 
@@ -265,6 +268,10 @@ struct Dataset {
     // Data Domain or by Time-Depth Conversion; derived datasets inherit it
     // through the "DOMAIN: ..." line of their processing history.
     bool depth = false;
+    // Metres between neighbouring traces, for the scale bar and the f-k
+    // filter: -1 = not looked up yet, 0 = unknown (no coordinates; the user
+    // can type it with View > Trace Spacing).
+    double traceSpacingM = -1.0;
     // Raw trace-header integers already read, by (first byte, size): a
     // cache for Flatten on a header time (UI thread only).
     std::map<std::pair<int, int>, std::vector<int32_t>> headerFieldCache;
@@ -317,9 +324,14 @@ struct AppState {
     // the old behavior already showed "nothing loaded" before/without
     // necessarily touching this pointer.
     std::shared_ptr<Dataset> foreground = std::make_shared<Dataset>();
-    // Phase 1: purely a held reference, shown in its own box -- nothing
-    // reads this for rendering/analysis yet (see native/README.md).
+    // Drawn left of the curtain when set (see SegyCanvas::curtainActive);
+    // an empty Dataset means "(None)".
     std::shared_ptr<Dataset> background = std::make_shared<Dataset>();
+    // Curtain comparison: the Background fills the plot left of this
+    // fraction of its width, the Foreground the rest. Dragged by the user.
+    double curtainFraction = 0.5;
+    // View > Scale Bar (on by default; needs a trace spacing).
+    bool showScaleBar = true;
 
     segy::ViewRange view;
     double lastRenderMs = 0.0;
@@ -745,26 +757,58 @@ public:
     void syncRows(const DbCurveChart& chart);
     // frequencyIndex -1 = cursor outside the chart: every value shows "--".
     void showValues(const DbCurveChart& chart, int frequencyIndex, double cursorDb);
+    // A PEAK section: the frequency of each curve's maximum (spectra).
+    void setPeakSectionVisible(bool visible);
 
 private:
     QLabel* frequencyValue_ = nullptr;
     QLabel* cursorValue_ = nullptr;
     QWidget* curveRows_ = nullptr;
     std::vector<std::pair<QWidget*, QLabel*>> rows_; // per curve: row, value label
+    QLabel* peakCaption_ = nullptr;
+    QWidget* peakRows_ = nullptr;
+    std::vector<std::pair<QWidget*, QLabel*>> peakRowsList_;
+    bool peakVisible_ = false;
+    void syncPeaks(const DbCurveChart& chart);
 };
+
+// Writes the chart's visible curves as CSV (frequency, then one dB column
+// per curve, a header row with the names). False when cancelled/failed.
+bool saveCurvesCsv(QWidget* parent, const DbCurveChart& chart, const QString& suggestedName);
 
 // Same File/Edit/View/Utilities menu bar shape as HistogramPlotWidget,
 // Utilities > Parameters... reopening SpectrumDialog instead.
+// One spectrum in the Spectrum window: computed (a box or the view) or
+// loaded from CSV. `key` identifies the source, so recomputing the same
+// box replaces its curve instead of adding another.
+struct SpectrumEntry {
+    QString key, name;
+    QColor color;
+    std::vector<float> frequencyHz, db;
+    bool visible = true;
+};
+
 class SpectrumPlotWidget : public QWidget {
 public:
     explicit SpectrumPlotWidget(QWidget* parent = nullptr);
-    void setResult(const segy::SpectrumResult& result, QColor sourceColor);
+    // Adds a spectrum, or replaces the one with the same key.
+    void addSpectrum(SpectrumEntry entry);
+    // A colour for a spectrum that has none of its own (view, loaded).
+    QColor nextColor();
     void setParametersCallback(std::function<void()> callback);
+    void openManager();
 
 private:
     DbCurveChart* chart_ = nullptr;
     CurveReadoutPanel* readout_ = nullptr;
     std::function<void()> onParameters_;
+    std::vector<SpectrumEntry> entries_;
+    QWidget* manager_ = nullptr;
+    QListWidget* managerList_ = nullptr;
+    int colorCounter_ = 0;
+    void rebuildChart();
+    void refreshManager();
+    void loadCsv();
 };
 
 // Edit > Preferences. App-wide, not per-panel/per-dataset -- see
@@ -874,6 +918,86 @@ private:
     void tryAccept();
 };
 
+// File > Open with Analysis: look at a SEG-Y file before reading it (see
+// native/README.md, "Open with Analysis"). Tabs: Trace Headers (byte rows x
+// trace columns, by standard or raw 2I/4I/4F/4B), Mapping (where this file
+// keeps the fields the app uses; scan, text-header proposal, templates),
+// Selection (trace range and every Nth, header key ranges) and File Header
+// (text, extended text, binary labelled or raw). Notes say what was found
+// or assumed. Open reads the file directly when nothing differs from the
+// standard; otherwise MainWindow writes a normalised copy and opens that.
+class ImportDialog : public QDialog {
+public:
+    ImportDialog(const std::filesystem::path& path, QWidget* parent = nullptr);
+    bool fileOk() const { return fileOk_; }
+    QString openError() const { return openError_; }
+    const segy::HeaderMapping& mapping() const { return mapping_; }
+    segy::TraceSelection selection() const;
+    const segy::SegyLayout& layout() const { return layout_; }
+    const segy::BinaryHeader& binaryHeader() const { return bin_; }
+    int64_t traceCount() const { return traceCount_; }
+    size_t traceStride() const { return stride_; }
+    // True when the file can be opened directly (standard mapping, every
+    // trace, data at byte 3600).
+    bool opensDirectly() const;
+
+private:
+    std::filesystem::path path_;
+    segy::MappedFile file_;
+    bool fileOk_ = false;
+    QString openError_;
+    segy::BinaryHeader bin_{};
+    segy::SegyLayout layout_;
+    bool samplesDecodable_ = false;
+    int64_t traceCount_ = 0;
+    size_t stride_ = 0;
+    segy::HeaderMapping mapping_;
+    std::string textHeader_;
+
+    // Trace Headers tab
+    QComboBox* modeCombo_ = nullptr;
+    QSpinBox* startSpin_ = nullptr;
+    QSpinBox* countSpin_ = nullptr;
+    QSpinBox* skipSpin_ = nullptr;
+    QTableWidget* headerTable_ = nullptr;
+    // Mapping tab
+    QTableWidget* mappingTable_ = nullptr;
+    QLabel* scanStatus_ = nullptr;
+    bool scanCurrent_ = false;
+    std::vector<int64_t> sampleTraces_;              // traces read by the last scan
+    std::vector<std::array<uint8_t, 240>> sampleHeaders_;
+    // Selection tab
+    QSpinBox* firstSpin_ = nullptr;
+    QSpinBox* lastSpin_ = nullptr;
+    QSpinBox* everySpin_ = nullptr;
+    struct RangeRow {
+        QComboBox* key = nullptr;
+        QDoubleSpinBox* min = nullptr;
+        QDoubleSpinBox* max = nullptr;
+        QDoubleSpinBox* step = nullptr;
+    };
+    std::vector<RangeRow> rangeRows_;
+    QLabel* selectionEstimate_ = nullptr;
+    // Notes and buttons
+    QListWidget* notes_ = nullptr;
+    QPushButton* openButton_ = nullptr;
+
+    const uint8_t* traceHeader(int64_t trace) const;
+    void addNote(const QString& text);
+    void refreshHeaderTable();
+    void fillMappingTable();
+    void readMappingTable();
+    void scanMapping();
+    void markScanOutOfDate();
+    void refreshEstimate();
+    void proposeFromText();
+    void loadTemplate();
+    void saveTemplate();
+};
+
+// Copies a table (with its column headers) as tab-separated text.
+void copyTableToClipboard(QTableWidget* table);
+
 class PreferencesDialog : public QDialog {
 public:
     // `toolbarItems`: every toolbar button, in toolbar order, for the
@@ -937,6 +1061,7 @@ public:
 
 private:
     QTableWidget* table_ = nullptr;
+    QTableWidget* rawTable_ = nullptr; // every 2- and 4-byte word, unnamed
 };
 
 // View > Display Parameters: display mode, wiggle fill and centre line,
@@ -1194,6 +1319,9 @@ private:
     float mainClipNeg_ = 1.0f;
     void applyScaling();
     std::function<void(int, int, int)> onApply_;
+    QPushButton* recomputeButton_ = nullptr;
+    int appliedMinHz_ = -1, appliedMaxHz_ = -1; // what the bands on screen were filtered with
+    void refreshRecompute();
 
     void emitApply();
 };
@@ -1216,11 +1344,8 @@ struct AutocorrelationResult {
     int maxLagSamples = 0;
     double sampleIntervalUs = 0.0;
     int traceCount = 0;
-    double peakLagSamples = 0.0; // NaN: no side peak >= 0.5
-    float peakValue = 0.0f;
-    std::vector<float> spectrumHz; // power spectrum of the average (dB re its peak)
-    std::vector<float> spectrumDb;
     QString description; // e.g. "A x B" for a cross-correlation
+    double traceSpacingM = 0.0; // for the correlogram's scale bar (0: none)
 };
 
 class AutocorrelationDialog : public QDialog {
@@ -1237,13 +1362,19 @@ private:
     QDoubleSpinBox* maxLagSpin_ = nullptr;
     QLabel* infoLabel_ = nullptr;
     QLabel* peakLabel_ = nullptr;
-    QCheckBox* spectrumCheck_ = nullptr;
+    QDoubleSpinBox* thresholdSpin_ = nullptr; // side-peak threshold for peak-to-peak (default 0.3)
+    QPushButton* measureButton_ = nullptr;    // two clicks on the average measure a delta-t
+    QPushButton* recomputeButton_ = nullptr;
+    std::vector<float> lastAverage_;
+    int lastMinLag_ = 0;
+    double lastIntervalUs_ = 0.0;
+    void refreshPeak();
+    void refreshRecompute();
     QAction* zoomAction_ = nullptr;
     QAction* unzoomAction_ = nullptr;
     QAction* boxAction_ = nullptr;
     QWidget* panelPlot_ = nullptr;   // OctaveBandPlotWidget (defined in viewer_qt.cpp)
     QWidget* averagePlot_ = nullptr; // AutocorrelationAverageWidget (likewise)
-    QWidget* spectrumChart_ = nullptr; // DbCurveChart
     std::vector<std::pair<double, double>> zoomHistory_; // previous (minLagMs, maxLagMs)
     bool hasLagBox_ = false;
     double lagBoxA_ = 0.0, lagBoxB_ = 0.0; // ms, signed
@@ -1396,6 +1527,9 @@ public:
     // distance until the user types one (<= 0: none found).
     void proposeCdpDistance(double metres);
     bool cdpDistanceTyped() const { return cdpDistanceTyped_; }
+    // What Auto resolved to in the last computation (1 FFID, 2 CDP, 3 None;
+    // 1 Offset, 2 CDP), shown as "Auto (FFID)" in the combos.
+    void setResolvedModes(int gatherMode, int distanceMode);
     void setRecomputeCallback(std::function<void()> callback);
     void setParamsEditedCallback(std::function<void()> callback);
     void setRecomputeUseful(bool useful);
@@ -1427,6 +1561,7 @@ private:
     double cdpDistance_ = 1.0;
     bool cdpDistanceTyped_ = false;
     bool showingCdp_ = false;
+    int resolvedGather_ = 0; // what Auto chose in the last computation
     bool gridLinesVisible_ = false;
     bool crosshairEnabled_ = true;
     std::function<void()> onRecompute_;
@@ -1493,6 +1628,12 @@ public:
     // it yet.
     void setForegroundDataset(std::shared_ptr<Dataset> dataset);
     void setBackgroundDataset(std::shared_ptr<Dataset> dataset);
+    // Foreground becomes Background and the other way round; the view is
+    // kept when both have the same size. False (nothing done) without a
+    // Background.
+    bool swapForegroundBackground();
+    // A Background is set and drawable: the curtain is shown.
+    bool curtainActive() const;
 
     // x-f display toggle: park the seismic Foreground, view, display
     // settings and selection boxes in AppState::xf and show `xfDataset`
@@ -1537,6 +1678,14 @@ private:
     bool zoomBandActive_ = false;
     QPoint zoomBandStart_, zoomBandEnd_;
     bool middlePanning_ = false;
+    bool curtainDragging_ = false;
+    bool curtainHover_ = false;
+    std::vector<uint32_t> curtainPixels_;
+    // The curtain's widget x, from the last paint's plot geometry.
+    int curtainPixelX() const;
+    bool nearCurtain(int x) const;
+    // The view in the Background's own samples (same traces and times).
+    segy::ViewRange curtainView() const;
     qint64 lastWheelMs_ = -1000000;
     std::function<void()> onPreviousZoom_;
     void finishZoomBand();
@@ -1629,6 +1778,13 @@ private:
     std::function<void()> notifyActivated_;
     std::function<void(std::shared_ptr<Dataset>)> onDatasetLoaded_;
     AmplitudeScaleWidget* amplitudeScale_ = nullptr;
+    // Scroll bars in the surround (bottom: traces, left: time), shown only
+    // while zoomed in on that axis; the thumb is the visible window.
+    QScrollBar* hScroll_ = nullptr;
+    QScrollBar* vScroll_ = nullptr;
+    bool syncingScroll_ = false;
+    void syncScrollBars(int plotLeft, int plotTop, int plotWidth, int plotHeight);
+    void scrollTo(bool horizontal, int value);
     // Lazily created from the legend's own right-click menu -- see this
     // class's constructor. Owns its lifetime like the other per-panel
     // lazy dialogs, but unlike those, it's naturally already bound to the
@@ -1817,6 +1973,8 @@ private:
     Horizon* activeHorizonFor(Panel* panel, bool create);
     void handlePick(Panel* panel, double traceCoord, double sampleCoord, bool remove);
     void autoPickSeabed(Panel* panel);
+    // View > Swap Foreground and Background (X), created before the toolbar.
+    QAction* swapDatasetsAction_ = nullptr;
     void exportHorizon(Panel* panel);
     void importHorizon(Panel* panel);
     // Flatten (Horizons > Flatten...): on a horizon or a trace-header time
@@ -1855,7 +2013,8 @@ private:
     double fkLastCdpDistance_ = 1.0;
     AutocorrelationDialog* autocorrelationDialog_ = nullptr;
     AutocorrelationDialog* crossCorrelationDialog_ = nullptr;
-    std::shared_ptr<Dataset> crossA_, crossB_; // the Calculator's last Cross-correlate inputs
+    std::shared_ptr<Dataset> crossA_, crossB_; // the last cross-correlation's inputs
+    Panel* crossPanel_ = nullptr;               // set: over that panel's view (Analysis menu); null: whole traces
     SignalNoiseWindow* signalNoiseWindow_ = nullptr;
     bool signalNoiseComputed_ = false; // false until the first compute: Recompute is then always useful
     SignalNoiseSource signalNoiseLastSource_;
@@ -2040,6 +2199,9 @@ private:
     // File > Read Attribute SEG-Y: pick a file and what it holds; loaded in
     // the background into the dataset list, not into a panel.
     void openAttributeFile();
+    // File > Open with Analysis: ImportDialog, then a direct open or a
+    // normalised copy (selection, mapping, rev 2 data start).
+    void openFileWithAnalysis();
     void zoomToBox();
     void moozBack();
     void refreshToolChrome();
@@ -2079,6 +2241,13 @@ private:
     void computeAndShowAutocorrelation(Panel* sourcePanel, double minLagMs, double maxLagMs);
     void computeAndShowCrossCorrelation(std::shared_ptr<Dataset> a, std::shared_ptr<Dataset> b, double minLagMs,
                                         double maxLagMs);
+    // Analysis > Cross-correlation: the panel's Foreground with its
+    // Background (or a dataset the user picks) over the visible data, like
+    // the autocorrelation.
+    void computeAndShowViewCrossCorrelation(Panel* sourcePanel, std::shared_ptr<Dataset> other, double minLagMs,
+                                            double maxLagMs);
+    void startViewCrossCorrelation();
+    void ensureCrossCorrelationDialog();
     // Shared by both: per-trace correlations of `a` with `b` (the same
     // dataset for an autocorrelation) over traces [t0, t1) and samples
     // [s0, s1), up to 240 evenly spaced traces, plus the average, its side
@@ -2097,6 +2266,10 @@ private:
     void refreshSignalNoiseRecompute();
     // Recompute buttons of Signal/Noise and F-K: orange when stale.
     void refreshRecomputeButtons();
+    // Phase Estimate's Recompute: orange when the view/box moved since.
+    void refreshPhaseRecompute();
+    SignalNoiseSource phaseLastSource_{};
+    bool phaseComputed_ = false;
     void ensureFkWindow();
     void computeAndShowFk(Panel* sourcePanel);
     void refreshFkRecompute();

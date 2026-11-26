@@ -23,6 +23,7 @@
 #include "threadpool.h"
 #include "synthetic_segy.h"
 #include "renderer.h"
+#include "header_fields.h"
 #include "chrome.h"
 #include "axis_ticks.h"
 #include "colormap.h"
@@ -2625,6 +2626,102 @@ void testWriteSegyFileRoundTrips() {
 
 } // namespace
 
+// Header fields at chosen positions, mapping templates, text-header
+// positions, trace selection and the rev 2 layout (header_fields.h).
+static void testHeaderFields() {
+    uint8_t h[240] = {};
+    segy::writeI32BE(h + 20, 1234);          // CDP at 21
+    segy::writeI16BE(h + 70, -100);          // scalar
+    h[100] = 0x34; h[101] = 0x12;            // 0x1234 little-endian at 101
+    const float f = 12.5f;
+    uint32_t bits; std::memcpy(&bits, &f, 4);
+    segy::writeU32BE(h + 200, bits);         // IEEE at 201
+    segy::writeU32BE(h + 204, 0x42640000u);  // IBM 100.0 at 205
+    segy::writeU16BE(h + 210, 65535);        // unsigned at 211
+    CHECK_NEAR(segy::decodeField(h, {21, segy::FieldType::Int32, true}), 1234.0, 0.0);
+    CHECK_NEAR(segy::decodeField(h, {71, segy::FieldType::Int16, true}), -100.0, 0.0);
+    CHECK_NEAR(segy::decodeField(h, {101, segy::FieldType::Int16, false}), 4660.0, 0.0);
+    CHECK_NEAR(segy::decodeField(h, {201, segy::FieldType::Ieee32, true}), 12.5, 0.0);
+    CHECK_NEAR(segy::decodeField(h, {205, segy::FieldType::Ibm32, true}), 100.0, 1e-6);
+    CHECK_NEAR(segy::decodeField(h, {211, segy::FieldType::UInt16, true}), 65535.0, 0.0);
+    CHECK_NEAR(segy::decodeField(h, {211, segy::FieldType::Int16, true}), -1.0, 0.0);
+    CHECK(std::isnan(segy::decodeField(h, {239, segy::FieldType::Int32, true})));
+
+    // Template round trip, and a moved field normalised to its standard byte.
+    segy::HeaderMapping m = segy::standardHeaderMapping();
+    CHECK(m.isStandard());
+    m.find("CDP")->spec = {201, segy::FieldType::Ieee32, true};
+    CHECK(!m.isStandard());
+    segy::HeaderMapping back;
+    std::string err;
+    CHECK(segy::headerMappingFromText(segy::headerMappingToText(m), back, &err));
+    CHECK(back.find("CDP")->spec.firstByte == 201 && back.find("CDP")->spec.type == segy::FieldType::Ieee32);
+    CHECK(!segy::headerMappingFromText("CDP = 239 4I BE\n", back, &err));
+    uint8_t out[240];
+    segy::normalizeTraceHeader(h, out, m);
+    CHECK(segy::readI32BE(out + 20) == 13); // 12.5 rounded at byte 21
+    // Float coordinates: x100 with scalar -100.
+    segy::HeaderMapping mc = segy::standardHeaderMapping();
+    mc.find("CDP_X")->spec = {201, segy::FieldType::Ieee32, true};
+    segy::normalizeTraceHeader(h, out, mc);
+    CHECK(segy::readI32BE(out + 180) == 1250 && segy::readI16BE(out + 70) == -100);
+
+    // Text header positions, four notations; values and ranges ignored.
+    std::string text(3200, ' ');
+    auto put = [&text](int line, const std::string& s) { text.replace(size_t(line) * 80, s.size(), s); };
+    put(0, "C 1 CDP_X 181-184 4I | XLINE 193-196 4I |");
+    put(1, "C 2 INLINE :BYTES 13-16 XLINE :BYTES 17-20");
+    put(2, "C 3 SRC. LINE ID(197-200); DET. LINE ID(233-236);");
+    put(3, "C 4 BYTES 1-4=IL, BYTES 73-76 = CDP X");
+    put(4, "C 5 FOLD: 10-13   IL RANGE : 6504 -25432");
+    const std::vector<segy::FoundField> found = segy::findHeaderPositions(text);
+    auto has = [&found](const char* key, int byte) {
+        for (const segy::FoundField& f : found) if (f.key == key && f.firstByte == byte) return true;
+        return false;
+    };
+    CHECK(has("CDP_X", 181));
+    CHECK(has("XLINE", 193));
+    CHECK(has("INLINE", 13));
+    CHECK(has("XLINE", 17));
+    CHECK(has("INLINE", 1));
+    CHECK(has("CDP_X", 73));
+    bool fold = false;
+    for (const segy::FoundField& ff : found) fold = fold || ff.name.find("FOLD") != std::string::npos || ff.firstByte == 6504;
+    CHECK(!fold);
+    segy::HeaderMapping applied = segy::standardHeaderMapping();
+    CHECK(segy::applyFoundFields(found, applied) > 0);
+
+    // Selection: range, every Nth, key range with a step.
+    segy::TraceSelection sel;
+    sel.first = 10; sel.last = 30; sel.every = 5;
+    CHECK(segy::traceSelected(sel, 15, h, m) && !segy::traceSelected(sel, 16, h, m) && !segy::traceSelected(sel, 35, h, m));
+    segy::TraceSelection keySel;
+    keySel.ranges.push_back({"CDP", 1000, 2000, 2});
+    const segy::HeaderMapping std = segy::standardHeaderMapping();
+    CHECK(segy::traceSelected(keySel, 0, h, std)); // 1234: in range, even step from 1000
+    keySel.ranges[0].step = 5;
+    CHECK(!segy::traceSelected(keySel, 0, h, std));
+
+    // Layout: rev 2 with two extended text headers.
+    std::vector<uint8_t> file(3600 + 2 * 3200 + 240 + 400, 0x40);
+    std::memset(file.data() + 3200, 0, 400);
+    file[3500] = 2; file[3501] = 0;
+    segy::writeI16BE(file.data() + 3504, 2);
+    segy::SegyLayout layout = segy::analyseLayout(file.data(), file.size());
+    CHECK(layout.layoutSupported && layout.dataStart == 3600 + 6400 && layout.extendedText.size() == 2);
+    // Rev 1: a first-trace offset is ignored with a note.
+    file[3500] = 1;
+    segy::writeI16BE(file.data() + 3504, 0);
+    segy::writeU32BE(file.data() + 3524, 5000);
+    layout = segy::analyseLayout(file.data(), file.size());
+    CHECK(layout.dataStart == 3600 && !layout.notes.empty());
+    // Rev 2 offset beyond the file: headers only, with a reason.
+    file[3500] = 2;
+    segy::writeU32BE(file.data() + 3524, 999999);
+    layout = segy::analyseLayout(file.data(), file.size());
+    CHECK(!layout.layoutSupported && !layout.reason.empty());
+}
+
 int main() {
     std::printf("SEG-Y native rewrite -- test harness\n");
     std::printf("AVX2 available: %s\n\n", segy::cpuSupportsAvx2() ? "yes" : "no");
@@ -2633,6 +2730,7 @@ int main() {
     testIbmFloatRoundTripViaEncoder();
     testAvx2MatchesScalar();
     testHeaderParsing();
+    testHeaderFields();
     testEbcdicDecode();
     testEbcdicDecodeDetectsAlreadyAsciiHeader();
     testDecodeSamplesAllFormats();

@@ -237,7 +237,7 @@ const char* headerStandardName(HeaderStandard standard) {
         case HeaderStandard::SegyRev2: return "SEG-Y rev 2.0";
         case HeaderStandard::ShellV21: break;
     }
-    return "Shell V2.1";
+    return "SEG-Y v2.1";
 }
 
 int64_t readHeaderInt(const uint8_t* header, int firstByte, int size, bool bigEndian) {
