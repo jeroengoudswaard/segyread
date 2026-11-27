@@ -2245,6 +2245,8 @@ private:
     // File > Open with Analysis: ImportDialog, then a direct open or a
     // normalised copy (selection, mapping, rev 2 data start).
     void openFileWithAnalysis();
+    // File > Print and Export: the active panel's view on a page.
+    void openPrintDialog();
     void zoomToBox();
     void moozBack();
     void refreshToolChrome();

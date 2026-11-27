@@ -1,4 +1,5 @@
 #include "viewer_qt.h"
+#include "print_dialog.h"
 #include "theme.h"
 
 #include "axis_ticks.h"
@@ -8190,6 +8191,10 @@ MainWindow::MainWindow() : QMainWindow() {
     QAction* saveSegyAction = fileMenu->addAction("&Save As SEG-Y...");
     saveSegyAction->setShortcut(QKeySequence::Save);
     connect(saveSegyAction, &QAction::triggered, this, &MainWindow::openSaveSegyDialog);
+    QAction* printAction = fileMenu->addAction("&Print and Export...");
+    printAction->setShortcut(QKeySequence::Print);
+    printAction->setToolTip("Print and Export: the view on an A4, Letter or A3 page, as PDF, PNG or JPG");
+    connect(printAction, &QAction::triggered, this, &MainWindow::openPrintDialog);
     QAction* datasetManagerAction = fileMenu->addAction("&Dataset Manager...");
     datasetManagerAction->setToolTip("Dataset Manager: which datasets the Foreground/Background boxes list, and removing them");
     connect(datasetManagerAction, &QAction::triggered, this, &MainWindow::openDatasetManager);
@@ -14411,6 +14416,64 @@ void MainWindow::openFileWithAnalysis() {
                 canvas_->startLoading(outPath, history);
             });
     });
+}
+
+void MainWindow::openPrintDialog() {
+    AppState& app = activePanel_->app;
+    if (!app.loaded) {
+        flashStatusMessage("No data selected");
+        return;
+    }
+    if (app.xf.active) {
+        flashStatusMessage("Not available on an x-f display");
+        return;
+    }
+    std::shared_ptr<Dataset> ds = app.foreground;
+    PrintSource src;
+    src.dataset = ds;
+    src.view = app.view;
+    src.display = app.display;
+    src.sampleMs = ds->binHeader.sampleIntervalUs / 1000.0;
+    src.verticalTitle = ds->depth ? "Depth (m)" : "Time (ms)";
+    src.traceSpacingM = app.showScaleBar ? traceSpacingOf(*ds) : 0.0;
+    // The colour bar's ends: what the panel's legend shows.
+    float pos = 1.0f, neg = 1.0f;
+    const segy::ManualClip clip = displayedClip(app);
+    segy::displayClipPosNeg(segy::autoClip(ds->pyramid), app.display.gainDb, clip, &app.display.processing, &pos, &neg);
+    src.clipLow = clip.center - neg;
+    src.clipHigh = clip.center + pos;
+    // The trace axis: the first ident row shown above the panel, else CDP.
+    IdentField field = IdentField::Cdp;
+    for (int i = 0; i < kIdentFieldCount; ++i) {
+        if (app.idents.topEnabled[i]) {
+            field = IdentField(i);
+            break;
+        }
+    }
+    src.traceAxisName = identFieldLabel(field);
+    src.traceLabel = [ds, field](int64_t trace) {
+        const uint8_t* base = ds->file.data() + segy::kHeaderTotalSize + size_t(trace) * ds->traceStrideBytes;
+        return QString::number(identFieldValue(segy::parseTraceHeader(base), field));
+    };
+    // Horizons of this dataset, at most ~4000 points each.
+    for (const Horizon& hz : ds->horizons) {
+        PrintSource::Line line;
+        line.color = hz.color;
+        const int64_t n = int64_t(hz.timeMs.size());
+        const int64_t step = std::max<int64_t>(1, n / 4000);
+        for (int64_t t = 0; t < n; t += step) line.points.emplace_back(double(t) + 0.5, double(hz.timeMs[size_t(t)]));
+        src.horizons.push_back(std::move(line));
+    }
+    for (const std::string& step : ds->processingHistory) {
+        if (step.rfind("DOMAIN: ", 0) == 0) continue;
+        src.history << QString::fromStdString(step);
+    }
+    if (app.display.processing.agcEnabled) src.history << "AGC (display)";
+    src.datasetName = QString::fromStdString(ds->name);
+    src.fileName = QString::fromStdString(ds->filePath.filename().string());
+    if (ds->file.size() >= segy::kTextHeaderSize) src.textHeader = segy::decodeEbcdicText(ds->file.data());
+    PrintDialog dialog(std::move(src), this);
+    dialog.exec();
 }
 
 void MainWindow::openAttributeFile() {

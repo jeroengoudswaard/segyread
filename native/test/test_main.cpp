@@ -24,6 +24,7 @@
 #include "synthetic_segy.h"
 #include "renderer.h"
 #include "header_fields.h"
+#include "print_layout.h"
 #include "chrome.h"
 #include "axis_ticks.h"
 #include "colormap.h"
@@ -2722,6 +2723,65 @@ static void testHeaderFields() {
     CHECK(!layout.layoutSupported && !layout.reason.empty());
 }
 
+// Print page model: template text round trip, layout inside the page and
+// fit to page, text-header title fields (print_layout.h).
+static void testPrintLayout() {
+    segy::PrintTemplate t = segy::defaultPrintTemplate();
+    t.paper = segy::PaperSize::Letter;
+    t.landscape = false;
+    t.format = "PNG";
+    t.find("title")->fontPt = 18;
+    t.find("colorbar")->visible = false;
+    t.find("axes")->color = 0x123456;
+    segy::PrintTemplate back;
+    std::string err;
+    CHECK(segy::printTemplateFromText(segy::printTemplateToText(t), back, &err));
+    CHECK(back.paper == segy::PaperSize::Letter && !back.landscape && back.format == "PNG");
+    CHECK_NEAR(back.find("title")->fontPt, 18.0, 1e-9);
+    CHECK(!back.find("colorbar")->visible && back.find("axes")->color == 0x123456u);
+    CHECK(!segy::printTemplateFromText("paper A4\n", back, &err));
+
+    double w = 0, h = 0;
+    segy::paperSizeMm(segy::PaperSize::A4, true, &w, &h);
+    CHECK_NEAR(w, 297.0, 1e-9);
+    CHECK_NEAR(h, 210.0, 1e-9);
+
+    const segy::PrintTemplate d = segy::defaultPrintTemplate();
+    const segy::PrintLayout L = segy::layoutPrintPage(d, 3);
+    auto inside = [&](const segy::RectMm& r) {
+        return !r.valid() || (r.x >= L.content.x - 1e-9 && r.y >= L.content.y - 1e-9 &&
+                              r.right() <= L.content.right() + 1e-9 && r.bottom() <= L.content.bottom() + 1e-9);
+    };
+    for (const segy::RectMm* r : {&L.title, &L.timeAxis, &L.traceAxis, &L.seismic, &L.colorbar, &L.history, &L.footer}) {
+        CHECK(inside(*r));
+    }
+    CHECK(L.seismic.valid() && L.title.bottom() <= L.traceAxis.y + 1e-9 && L.seismic.bottom() <= L.history.y + 1e-9);
+    CHECK(L.history.right() <= L.footer.x + 1e-9);
+    CHECK(L.colorbar.x >= L.seismic.right());
+    // Fit to page: hidden elements give their room to the seismic.
+    segy::PrintTemplate bare = d;
+    for (segy::PrintElement& e : bare.elements) e.visible = false;
+    const segy::PrintLayout B = segy::layoutPrintPage(bare, 3);
+    CHECK_NEAR(B.seismic.w, B.content.w, 1e-9);
+    CHECK_NEAR(B.seismic.h, B.content.h, 1e-9);
+
+    // Title fields only from labelled values.
+    std::string text(3200, ' ');
+    auto put = [&text](int line, const std::string& s) { text.replace(size_t(line) * 80, s.size(), s); };
+    put(0, "C 1 CLIENT: Shockwave Energy      JOB: 123");
+    put(1, "C 2 SURVEY = Paragon 2D");
+    put(2, "C 3 LINE: 1630   AREA: North Sea");
+    put(3, "C 4 THE LINE WAS SHOT IN 2019");
+    segy::TextHeaderFields f = segy::extractTextHeaderFields(text);
+    CHECK(f.client == "Shockwave Energy");
+    CHECK(f.survey == "Paragon 2D");
+    CHECK(f.line == "1630");
+    std::string empty(3200, ' ');
+    put(0, "C 1 CLIENT:                              JOB:                     LINE:");
+    f = segy::extractTextHeaderFields(text.substr(0, 80) + empty.substr(80));
+    CHECK(f.client.empty() && f.line.empty());
+}
+
 int main() {
     std::printf("SEG-Y native rewrite -- test harness\n");
     std::printf("AVX2 available: %s\n\n", segy::cpuSupportsAvx2() ? "yes" : "no");
@@ -2731,6 +2791,7 @@ int main() {
     testAvx2MatchesScalar();
     testHeaderParsing();
     testHeaderFields();
+    testPrintLayout();
     testEbcdicDecode();
     testEbcdicDecodeDetectsAlreadyAsciiHeader();
     testDecodeSamplesAllFormats();

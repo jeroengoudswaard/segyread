@@ -132,5 +132,5 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 
 70. **Header names on the ident rows** — left of the plot; the right panel of a split on the right. *Status: done (2026-11-27).*
 
-71. **Print and Export** — preview on A4/Letter/A3, PDF/PNG/JPG, elements on/off, colours and font sizes, title/client/survey from the text header (editable), fit to page only, templates applied every time Print opens. Batch export is a separate flow (later). *Decided 2026-11-27 with the mockup.*
+71. **Print and Export** — preview on A4/Letter/A3, PDF/PNG/JPG, elements on/off, colours and font sizes, title/client/survey from the text header (editable), fit to page only, templates applied every time Print opens. Batch export is a separate flow (later). *Decided 2026-11-27 with the mockup.* *Status: done (2026-11-27) — File > Print and Export (Ctrl+P). Next: text boxes and logo images ("+ Add"), wiggle printing, batch export.*
 

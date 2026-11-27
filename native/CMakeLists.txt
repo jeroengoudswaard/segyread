@@ -87,6 +87,7 @@ add_library(segyviewercore STATIC
     viewer/iirfilter.cpp
     viewer/trace_header_defs.cpp
     viewer/header_fields.cpp
+    viewer/print_layout.cpp
     viewer/horizons.cpp
     viewer/depth_conversion.cpp
     viewer/processing.cpp
@@ -98,6 +99,8 @@ target_link_libraries(segyviewercore PUBLIC segycore)
 set(SEGY_VIEWER_SOURCES
     viewer/qt/viewer_qt.h
     viewer/qt/viewer_qt.cpp
+    viewer/qt/print_dialog.h
+    viewer/qt/print_dialog.cpp
     viewer/qt/viewer_qt_icons.h
     viewer/qt/viewer_qt_icons.cpp
     viewer/qt/theme.cpp

@@ -3587,6 +3587,32 @@ segy_reader (COPILOT 48-65).
     undecodable formats with a message pointing here.
 - **Binary Header** window: Labelled or Raw (every 2- and 4-byte word),
   Copy Table. **Header Ranges**: Copy Table.
+- **Print and Export (File, Ctrl+P; COPILOT 71).** The active panel's
+  view on an A4, Letter or A3 page, landscape or portrait, always fitted
+  to the page, exported as PDF (vector text and lines, the seismic as an
+  image at the chosen dpi), PNG or JPG (the whole page at that dpi). The
+  page model is `print_layout.{h,cpp}` (tested in `testPrintLayout`): the
+  template (paper, margins, format, dpi, font, and per element visible,
+  size in pt, colour, frame), its text form, and the layout in mm -- title
+  block on top, history and footer boxes at the bottom, axes left and
+  above, colour bar right, the seismic gets the rest; a hidden element
+  gives its room to the seismic. `viewer/qt/print_dialog.{h,cpp}` draws a
+  page with one function (`paintPrintPage`) for the preview and the
+  export, so what you see is what is written. The seismic is rendered
+  again for the page size (`renderPrintSeismic`, at most 8000 px a side),
+  variable density with the panel's colour scale, gain, clip, AGC,
+  polarity and flip (a wiggle display prints as variable density for
+  now). The trace axis shows the first ident row's header (else CDP), the
+  colour bar the legend's range, the scale bar the trace spacing.
+  Title, client, survey and line: the dataset name and labelled text
+  header lines (`extractTextHeaderFields`: "CLIENT:", "SURVEY =", "LINE:"
+  -- never a guess), editable (an orange edge marks typed text, Reset to
+  Text Header). Click an element on the page or in the list to style it.
+  Templates are `~/.segyread_print/*.tlprint`; "Use for every print"
+  (settings key `printTemplate`) opens Print with that template for any
+  section. `PrintDialog::exportTo(path)` is the export without a file
+  dialog, ready for a batch flow later. Checked by screenshot and a
+  PDF export of PARAGON.
 - **Dataset Manager (File > Dataset Manager).** Every dataset in memory
   with traces, samples, interval, kind (file, computed, attribute) and
   where it is on screen. Show (`Dataset::listed`) decides whether the
