@@ -3587,6 +3587,22 @@ segy_reader (COPILOT 48-65).
     undecodable formats with a message pointing here.
 - **Binary Header** window: Labelled or Raw (every 2- and 4-byte word),
   Copy Table. **Header Ranges**: Copy Table.
+- **Dataset Manager (File > Dataset Manager).** Every dataset in memory
+  with traces, samples, interval, kind (file, computed, attribute) and
+  where it is on screen. Show (`Dataset::listed`) decides whether the
+  Foreground/Background picker lists it, so flipping between a few is
+  quick; unticking or Remove on a dataset that is on screen leaves that
+  panel empty (`SegyCanvas::clearForeground`) or its Background (None).
+  Remove also deletes a computed copy in the scratch folder once nothing
+  maps it any more.
+- **The zoom stays** when the Foreground changes to a dataset with the
+  same traces, samples and sample interval (picking another dataset, a
+  processing result, flatten): view, zoom history and boxes are kept;
+  anything else (or leaving x-f) goes to full view.
+- **Header names on the ident rows**: in the axis column beside each row,
+  muted grey; left of the plot, or right of it for the right panel of a
+  side-by-side split (`setIdentNamesOnRight`). The row values stay inside
+  the plot width so the name has its own space.
 - **The curtain became the Fence (2026-11-27).** Off by default: the
   toolbar Fence button (also View > Fence) turns it on for the panel;
   right-click it for Vertical Fence (Background left) or Horizontal Fence

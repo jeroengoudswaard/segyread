@@ -125,3 +125,12 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 66. **Fence instead of an always-on curtain** — a toolbar button, right-click for horizontal or vertical, the grip movable along the fence. *Status: done (2026-11-27).*
 
 67. **Reset in Open with Analysis > Selection** — right-click a value to go back to the data's own min/max/step. *Status: done (2026-11-27).*
+
+68. **Dataset Manager** — remove datasets, and choose which ones the Foreground/Background boxes list; a displayed one that is removed or unticked leaves the panel empty. *Status: done (2026-11-27).*
+
+69. **Keep the zoom** when the displayed dataset changes or is processed, if compatible; otherwise full view. *Status: done (2026-11-27).*
+
+70. **Header names on the ident rows** — left of the plot; the right panel of a split on the right. *Status: done (2026-11-27).*
+
+71. **Print and Export** — preview on A4/Letter/A3, PDF/PNG/JPG, elements on/off, colours and font sizes, title/client/survey from the text header (editable), fit to page only, templates applied every time Print opens. Batch export is a separate flow (later). *Decided 2026-11-27 with the mockup.*
+

@@ -241,6 +241,9 @@ struct Horizon {
 
 struct Dataset {
     std::string name; // display name -- filePath.stem(), shown in the Foreground/Background boxes and pool dialog
+    // File > Dataset Manager's Show tick: listed in the Foreground/Background
+    // picker. Unticking a displayed dataset empties its panel.
+    bool listed = true;
     std::filesystem::path filePath;
     segy::MappedFile file;
     segy::BinaryHeader binHeader{};
@@ -1641,6 +1644,9 @@ public:
     // it yet.
     void setForegroundDataset(std::shared_ptr<Dataset> dataset);
     void setBackgroundDataset(std::shared_ptr<Dataset> dataset);
+    // Leaves the panel empty (no Foreground): the dataset was removed or
+    // unticked in the Dataset Manager.
+    void clearForeground();
     // Foreground becomes Background and the other way round; the view is
     // kept when both have the same size. False (nothing done) without a
     // Background.
@@ -1691,6 +1697,7 @@ private:
     bool zoomBandActive_ = false;
     QPoint zoomBandStart_, zoomBandEnd_;
     bool middlePanning_ = false;
+    bool identNamesOnRight_ = false;
     bool curtainDragging_ = false;
     bool gripDragging_ = false; // the grip also moves along the fence
     int curtainHover_ = 0;      // 0 none, 1 fence, 2 grip
@@ -1754,6 +1761,12 @@ public:
     // "Foreground 1"/"Background 1" vs "...2" etc -- set once, right after
     // construction, since only MainWindow knows which panel this is.
     void setDatasetSlotLabels(const QString& foregroundLabel, const QString& backgroundLabel);
+    // Where the ident rows' header names go: left of the plot (the main or
+    // left panel), or right of it (the right panel of a side-by-side split).
+    void setIdentNamesOnRight(bool right) {
+        identNamesOnRight_ = right;
+        update();
+    }
     void setDatasetLabelPosition(DatasetLabelPosition position);
     // `isForeground` tells MainWindow which of this panel's two slots the
     // click was for (true = Foreground, false = Background); it owns the
@@ -1990,6 +2003,17 @@ private:
     Horizon* activeHorizonFor(Panel* panel, bool create);
     void handlePick(Panel* panel, double traceCoord, double sampleCoord, bool remove);
     void autoPickSeabed(Panel* panel);
+    // File > Dataset Manager: every dataset in memory, which ones the
+    // Foreground/Background picker lists, and removing them.
+    QWidget* datasetManager_ = nullptr;
+    QTableWidget* datasetManagerTable_ = nullptr;
+    void openDatasetManager();
+    void refreshDatasetManager();
+    // Drops `dataset` from the pool and every panel slot (a scratch copy no
+    // one else holds is deleted from disk).
+    void removeDataset(std::shared_ptr<Dataset> dataset);
+    // Empties every panel slot showing `dataset` (unticked or removed).
+    void releaseDatasetFromPanels(const std::shared_ptr<Dataset>& dataset);
     // View > Swap Foreground and Background (X), created before the toolbar.
     QAction* swapDatasetsAction_ = nullptr;
     // Toolbar Fence: Background and Foreground side by side in one panel.

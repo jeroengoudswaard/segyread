@@ -6856,7 +6856,28 @@ void SegyCanvas::paintIdentText(QPainter& painter, const segy::ChromeLayout& chr
 
     // A label that would touch the previous one in its row is skipped, so a
     // narrow window or long values (e.g. 163004113) never pile up.
+    // The header's name beside its row, in the axis column: left of the
+    // plot, or right of it for the right-hand panel. Muted, so the values
+    // stay what the eye reads.
+    auto drawName = [&](int y, const QString& name) {
+        const int plotLeft = kCanvasMargin + chrome.plotX, plotRight = plotLeft + chrome.plotWidth;
+        const int room = identNamesOnRight_ ? std::max(0, width() - kCanvasMargin / 2 - plotRight - 8)
+                                            : std::max(0, plotLeft - kCanvasMargin / 2 - 8);
+        if (room < 16) return;
+        QFont nameFont = font;
+        nameFont.setPixelSize(11);
+        const QFontMetrics nfm(nameFont);
+        const QString shown = nfm.elidedText(name, Qt::ElideRight, room);
+        painter.save();
+        painter.setFont(nameFont);
+        painter.setPen(tc(QColor(0x9a, 0x9c, 0xa3)));
+        const QRect box = identNamesOnRight_ ? QRect(plotRight + 8, y, room, fm.height())
+                                             : QRect(plotLeft - 8 - room, y, room, fm.height());
+        painter.drawText(box, (identNamesOnRight_ ? Qt::AlignLeft : Qt::AlignRight) | Qt::AlignVCenter, shown);
+        painter.restore();
+    };
     auto drawRow = [&](int y, IdentField field, const std::vector<int64_t>& ticks) {
+        drawName(y, identFieldLabel(field));
         int lastRight = std::numeric_limits<int>::min();
         const int plotLeft = kCanvasMargin + chrome.plotX, plotRight = plotLeft + chrome.plotWidth;
         for (int64_t idx : ticks) {
@@ -6865,7 +6886,8 @@ void SegyCanvas::paintIdentText(QPainter& painter, const segy::ChromeLayout& chr
             QString text = QString::number(identFieldValue(headerAt(idx), field));
             int tw = fm.horizontalAdvance(text);
             int left = int(std::lround(px)) - tw / 2;
-            left = std::clamp(left, plotLeft - tw / 2, std::max(plotLeft - tw / 2, plotRight - tw / 2));
+            // Inside the plot's width: the axis columns hold the header names.
+            left = std::clamp(left, plotLeft, std::max(plotLeft, plotRight - tw));
             if (left < lastRight + 10) continue;
             painter.drawText(QPoint(left, y + fm.ascent()), text);
             lastRight = left + tw;
@@ -6912,6 +6934,7 @@ void SegyCanvas::paintIdentText(QPainter& painter, const segy::ChromeLayout& chr
             painter.setPen(tc(QColor(Qt::white)));
         }
         int labelX = kCanvasMargin + chrome.plotX + 2;
+        drawName(y + kIdentPlotHeight / 2 - fm.height() / 2, identFieldLabel(field));
         painter.drawText(QPoint(labelX, y + fm.ascent()), QString::number(maxVal, 'f', 1));
         painter.drawText(QPoint(labelX, y + kIdentPlotHeight - labelH + fm.ascent()), QString::number(minVal, 'f', 1));
         y += kIdentPlotHeight + kIdentRowGap;
@@ -7848,6 +7871,7 @@ void applyDefaultSortIdents(AppState& app) {
 } // namespace
 
 void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
+    const bool endedXf = app_.xf.active;
     if (app_.xf.active) {
         // A different Foreground ends x-f: back to the seismic display
         // settings, but the parked dataset and boxes are not restored.
@@ -7857,6 +7881,14 @@ void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
         app_.xf.selectionBoxes.clear();
         app_.xf.zoomHistory.clear();
     }
+    // The zoom (and its history and boxes) stays when the new Foreground
+    // has the same traces and samples as the one it replaces -- switching
+    // datasets or processing keeps the place; anything else: full view.
+    const Dataset& previous = *app_.foreground;
+    const bool sameGeometry = !endedXf && previous.traceCount > 0 && dataset &&
+                              previous.traceCount == dataset->traceCount &&
+                              previous.binHeader.samplesPerTrace == dataset->binHeader.samplesPerTrace &&
+                              previous.binHeader.sampleIntervalUs == dataset->binHeader.sampleIntervalUs;
     // Never mutate a Dataset's fields in place -- it may be shared with
     // the pool or another panel's Background slot, so this only ever
     // reassigns the pointer (an O(1) swap, whether the dataset is brand
@@ -7866,9 +7898,32 @@ void SegyCanvas::setForegroundDataset(std::shared_ptr<Dataset> dataset) {
     app_.flatten = FlattenState{}; // a flattened display ends with any new Foreground
     app_.display.depthAxis = app_.foreground->depth;
     applyDefaultSortIdents(app_);
-    segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
-    // A newly-active dataset invalidates any boxes drawn against the
-    // previous one's trace/sample space.
+    if (!sameGeometry) {
+        segy::resetView(app_.view, app_.foreground->traceCount, app_.foreground->binHeader.samplesPerTrace);
+        // Boxes drawn against another trace/sample space no longer fit.
+        app_.selectionBoxes.clear();
+        app_.activeBoxIndex = -1;
+        app_.zoomHistory.clear();
+    }
+    app_.draggingBoxIndex = -1;
+    app_.draggingCorner = -1;
+    if (notifyViewChanged_) notifyViewChanged_();
+    notifyStateChanged();
+    updateStatusBar();
+    update();
+}
+
+void SegyCanvas::clearForeground() {
+    if (app_.xf.active) {
+        app_.display = app_.xf.display;
+        app_.xf.active = false;
+        app_.xf.seismic.reset();
+        app_.xf.selectionBoxes.clear();
+        app_.xf.zoomHistory.clear();
+    }
+    app_.foreground = std::make_shared<Dataset>();
+    app_.loaded = false;
+    app_.flatten = FlattenState{};
     app_.selectionBoxes.clear();
     app_.activeBoxIndex = -1;
     app_.draggingBoxIndex = -1;
@@ -8135,6 +8190,9 @@ MainWindow::MainWindow() : QMainWindow() {
     QAction* saveSegyAction = fileMenu->addAction("&Save As SEG-Y...");
     saveSegyAction->setShortcut(QKeySequence::Save);
     connect(saveSegyAction, &QAction::triggered, this, &MainWindow::openSaveSegyDialog);
+    QAction* datasetManagerAction = fileMenu->addAction("&Dataset Manager...");
+    datasetManagerAction->setToolTip("Dataset Manager: which datasets the Foreground/Background boxes list, and removing them");
+    connect(datasetManagerAction, &QAction::triggered, this, &MainWindow::openDatasetManager);
     fileMenu->addSeparator();
     QMenu* headersMenu = fileMenu->addMenu("&Headers"); // filled after the toolbar
     fileMenu->addSeparator();
@@ -9177,6 +9235,7 @@ MainWindow::MainWindow() : QMainWindow() {
     // native/README.md, "Dataset pool: Foreground/Background."
     panelA_.canvas->setDatasetSlotLabels("Foreground 1", "Background 1");
     panelB_.canvas->setDatasetSlotLabels("Foreground 2", "Background 2");
+    panelB_.canvas->setIdentNamesOnRight(true); // side by side is the default split
     panelA_.canvas->setDatasetSlotPickCallback([this](bool isForeground) { openDatasetPicker(&panelA_, isForeground); });
     panelB_.canvas->setDatasetSlotPickCallback([this](bool isForeground) { openDatasetPicker(&panelB_, isForeground); });
 
@@ -9585,6 +9644,8 @@ void MainWindow::setSplitOrientation(Qt::Orientation orientation) {
     // split shows a horizontal-divider icon, not the vertical-divider
     // default.
     splitViewAction_->setIcon(orientation == Qt::Horizontal ? iconLayoutColumns() : iconLayoutRows());
+    // Side by side: the right panel names its header rows on its right.
+    panelB_.canvas->setIdentNamesOnRight(orientation == Qt::Horizontal);
 }
 
 void MainWindow::promptForGainDb() {
@@ -13992,6 +14053,135 @@ void MainWindow::registerDataset(std::shared_ptr<Dataset> dataset) {
     }
     datasetPool_.push_back(std::move(dataset));
     refreshAllDatasetSlotNames();
+    refreshDatasetManager();
+}
+
+void MainWindow::releaseDatasetFromPanels(const std::shared_ptr<Dataset>& dataset) {
+    for (Panel* p : {&panelA_, &panelB_}) {
+        if (p->app.foreground == dataset ||
+            (p->app.flatten.active && p->app.flatten.original == dataset)) {
+            p->canvas->clearForeground();
+        }
+        if (p->app.background == dataset) p->canvas->setBackgroundDataset(nullptr);
+    }
+    refreshAllDatasetSlotNames();
+    refreshToolChrome();
+}
+
+void MainWindow::removeDataset(std::shared_ptr<Dataset> dataset) {
+    if (!dataset) return;
+    releaseDatasetFromPanels(dataset);
+    datasetPool_.erase(std::remove(datasetPool_.begin(), datasetPool_.end(), dataset), datasetPool_.end());
+    if (crossA_ == dataset) crossA_.reset();
+    if (crossB_ == dataset) crossB_.reset();
+    // A computed copy in the scratch folder goes too, once nothing maps it.
+    const std::filesystem::path path = dataset->filePath;
+    const std::filesystem::path scratch = std::filesystem::temp_directory_path() / "segyread_scratch";
+    const bool inScratch = path.parent_path() == scratch;
+    const bool lastOwner = dataset.use_count() == 1;
+    dataset.reset();
+    if (inScratch && lastOwner) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+    refreshDatasetManager();
+}
+
+void MainWindow::openDatasetManager() {
+    if (!datasetManager_) {
+        datasetManager_ = new QWidget(this, Qt::Window);
+        datasetManager_->setWindowTitle("Dataset Manager");
+        datasetManager_->resize(860, 420);
+        datasetManager_->setStyleSheet(themed("background-color: #1e1f22;"));
+        QVBoxLayout* layout = new QVBoxLayout(datasetManager_);
+        QLabel* hint = new QLabel("Show: listed in the Foreground and Background boxes. Untick or remove a dataset "
+                                  "that is on screen and its panel is left empty.");
+        hint->setWordWrap(true);
+        hint->setStyleSheet(themed("color: #9a9ca3;"));
+        layout->addWidget(hint);
+        datasetManagerTable_ = new QTableWidget(0, 7, datasetManager_);
+        datasetManagerTable_->setHorizontalHeaderLabels({"Show", "Dataset", "Traces", "Samples", "Interval", "Kind", "On screen"});
+        datasetManagerTable_->verticalHeader()->hide();
+        datasetManagerTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        datasetManagerTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        datasetManagerTable_->horizontalHeader()->setStretchLastSection(true);
+        datasetManagerTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        layout->addWidget(datasetManagerTable_, 1);
+        QHBoxLayout* buttons = new QHBoxLayout();
+        QPushButton* showAll = new QPushButton("Show All");
+        QPushButton* showNone = new QPushButton("Show None");
+        QPushButton* remove = new QPushButton("Remove");
+        remove->setToolTip("Remove: drop the selected datasets from memory (a computed copy is deleted)");
+        QPushButton* close = new QPushButton("Close");
+        buttons->addWidget(showAll);
+        buttons->addWidget(showNone);
+        buttons->addStretch();
+        buttons->addWidget(remove);
+        buttons->addWidget(close);
+        layout->addLayout(buttons);
+        connect(close, &QPushButton::clicked, datasetManager_, &QWidget::hide);
+        auto setAll = [this](bool on) {
+            for (const std::shared_ptr<Dataset>& d : datasetPool_) {
+                d->listed = on;
+                if (!on) releaseDatasetFromPanels(d);
+            }
+            refreshDatasetManager();
+        };
+        connect(showAll, &QPushButton::clicked, this, [setAll]() { setAll(true); });
+        connect(showNone, &QPushButton::clicked, this, [setAll]() { setAll(false); });
+        connect(remove, &QPushButton::clicked, this, [this]() {
+            std::vector<std::shared_ptr<Dataset>> doomed;
+            for (const QModelIndex& index : datasetManagerTable_->selectionModel()->selectedRows()) {
+                if (index.row() < int(datasetPool_.size())) doomed.push_back(datasetPool_[size_t(index.row())]);
+            }
+            if (doomed.empty()) {
+                flashStatusMessage("Select one or more datasets to remove");
+                return;
+            }
+            for (std::shared_ptr<Dataset>& d : doomed) removeDataset(std::move(d));
+        });
+        connect(datasetManagerTable_, &QTableWidget::itemChanged, this, [this](QTableWidgetItem* item) {
+            if (item->column() != 0 || item->row() >= int(datasetPool_.size())) return;
+            const std::shared_ptr<Dataset> d = datasetPool_[size_t(item->row())];
+            d->listed = item->checkState() == Qt::Checked;
+            if (!d->listed) releaseDatasetFromPanels(d);
+            refreshDatasetManager();
+        });
+    }
+    refreshDatasetManager();
+    datasetManager_->show();
+    datasetManager_->raise();
+    datasetManager_->activateWindow();
+}
+
+void MainWindow::refreshDatasetManager() {
+    if (!datasetManagerTable_) return;
+    QSignalBlocker block(datasetManagerTable_);
+    datasetManagerTable_->setRowCount(int(datasetPool_.size()));
+    for (int r = 0; r < int(datasetPool_.size()); ++r) {
+        const Dataset& d = *datasetPool_[size_t(r)];
+        QTableWidgetItem* show = new QTableWidgetItem();
+        show->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+        show->setCheckState(d.listed ? Qt::Checked : Qt::Unchecked);
+        datasetManagerTable_->setItem(r, 0, show);
+        QTableWidgetItem* name = new QTableWidgetItem(QString::fromStdString(d.name));
+        name->setToolTip(QString::fromStdString(d.filePath.string()));
+        datasetManagerTable_->setItem(r, 1, name);
+        datasetManagerTable_->setItem(r, 2, new QTableWidgetItem(QString::number(d.traceCount)));
+        datasetManagerTable_->setItem(r, 3, new QTableWidgetItem(QString::number(d.binHeader.samplesPerTrace)));
+        datasetManagerTable_->setItem(r, 4, new QTableWidgetItem(d.depth ? QString("%1 m").arg(d.binHeader.sampleIntervalUs / 1000.0)
+                                                                         : QString("%1 ms").arg(d.binHeader.sampleIntervalUs / 1000.0)));
+        datasetManagerTable_->setItem(r, 5, new QTableWidgetItem(!d.attribute.empty() ? QString::fromStdString(d.attribute)
+                                                                 : d.processingHistory.empty() ? QString("File")
+                                                                                               : QString("Computed")));
+        QStringList where;
+        if (panelA_.app.foreground.get() == &d) where << "Foreground 1";
+        if (panelA_.app.background.get() == &d) where << "Background 1";
+        if (panelB_.app.foreground.get() == &d) where << "Foreground 2";
+        if (panelB_.app.background.get() == &d) where << "Background 2";
+        datasetManagerTable_->setItem(r, 6, new QTableWidgetItem(where.join(", ")));
+    }
+    datasetManagerTable_->resizeColumnToContents(0);
 }
 
 bool MainWindow::isDatasetInUse(const std::shared_ptr<Dataset>& dataset) const {
@@ -14007,7 +14197,11 @@ void MainWindow::openDatasetPicker(Panel* panel, bool isForeground) {
     }
     std::shared_ptr<Dataset> current = isForeground ? panel->app.foreground : panel->app.background;
     datasetPickerDialog_->setWindowTitle(isForeground ? "Select Foreground Dataset" : "Select Background Dataset");
-    datasetPickerDialog_->setDatasets(datasetPool_, current, /*allowNone=*/!isForeground,
+    std::vector<std::shared_ptr<Dataset>> listed;
+    for (const std::shared_ptr<Dataset>& d : datasetPool_) {
+        if (d->listed) listed.push_back(d);
+    }
+    datasetPickerDialog_->setDatasets(listed, current, /*allowNone=*/!isForeground,
                                        [this](const std::shared_ptr<Dataset>& d) { return isDatasetInUse(d); });
     datasetPickerDialog_->setCallbacks(
         [this, panel, isForeground](std::shared_ptr<Dataset> picked) {
@@ -14018,9 +14212,11 @@ void MainWindow::openDatasetPicker(Panel* panel, bool isForeground) {
             }
             refreshAllDatasetSlotNames();
             refreshToolChrome();
+            refreshDatasetManager();
         },
         [this](std::shared_ptr<Dataset> removed) {
             datasetPool_.erase(std::remove(datasetPool_.begin(), datasetPool_.end(), removed), datasetPool_.end());
+            refreshDatasetManager();
         });
     datasetPickerDialog_->show();
     datasetPickerDialog_->raise();
