@@ -84,6 +84,7 @@ class QScrollArea;
 class QHBoxLayout;
 class QVBoxLayout;
 class QToolBar;
+class QAbstractSpinBox;
 class QScrollBar;
 
 namespace segyqt {
@@ -327,9 +328,15 @@ struct AppState {
     // Drawn left of the curtain when set (see SegyCanvas::curtainActive);
     // an empty Dataset means "(None)".
     std::shared_ptr<Dataset> background = std::make_shared<Dataset>();
-    // Curtain comparison: the Background fills the plot left of this
-    // fraction of its width, the Foreground the rest. Dragged by the user.
+    // The fence (toolbar Fence, off by default): the Background on one
+    // side, the Foreground on the other. Vertical: Background left of
+    // `curtainFraction` of the plot width; horizontal: Background above
+    // that fraction of its height. `gripFraction` is where the grip sits
+    // along the fence. Both dragged by the user.
+    bool fenceOn = false;
+    bool fenceHorizontal = false;
     double curtainFraction = 0.5;
+    double gripFraction = 0.5;
     // View > Scale Bar (on by default; needs a trace spacing).
     bool showScaleBar = true;
 
@@ -978,6 +985,12 @@ private:
     };
     std::vector<RangeRow> rangeRows_;
     QLabel* selectionEstimate_ = nullptr;
+    // Per mapping key from the last scan: min, max, smallest step (0 = one value).
+    std::map<std::string, std::array<double, 3>> keyStats_;
+    // Right-click > Reset on a selection field: back to the data's own value.
+    void addResetMenu(QAbstractSpinBox* spin, std::function<void()> reset);
+    void resetAllSelection();
+    bool statsFor(const QString& key, std::array<double, 3>& out);
     // Notes and buttons
     QListWidget* notes_ = nullptr;
     QPushButton* openButton_ = nullptr;
@@ -1679,11 +1692,15 @@ private:
     QPoint zoomBandStart_, zoomBandEnd_;
     bool middlePanning_ = false;
     bool curtainDragging_ = false;
-    bool curtainHover_ = false;
+    bool gripDragging_ = false; // the grip also moves along the fence
+    int curtainHover_ = 0;      // 0 none, 1 fence, 2 grip
     std::vector<uint32_t> curtainPixels_;
-    // The curtain's widget x, from the last paint's plot geometry.
-    int curtainPixelX() const;
-    bool nearCurtain(int x) const;
+    int lastPlotTop_ = 0, lastPlotHeight_ = 0;
+    // What the mouse is over: 0 nothing, 1 the fence, 2 its grip (widget
+    // coordinates, last paint's plot geometry).
+    int fenceHitTest(const QPoint& pos) const;
+    void dragFence(const QPoint& pos);
+    Qt::CursorShape fenceCursor(int hit) const;
     // The view in the Background's own samples (same traces and times).
     segy::ViewRange curtainView() const;
     qint64 lastWheelMs_ = -1000000;
@@ -1975,6 +1992,8 @@ private:
     void autoPickSeabed(Panel* panel);
     // View > Swap Foreground and Background (X), created before the toolbar.
     QAction* swapDatasetsAction_ = nullptr;
+    // Toolbar Fence: Background and Foreground side by side in one panel.
+    QAction* fenceAction_ = nullptr;
     void exportHorizon(Panel* panel);
     void importHorizon(Panel* panel);
     // Flatten (Horizons > Flatten...): on a horizon or a trace-header time

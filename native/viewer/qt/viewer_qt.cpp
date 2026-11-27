@@ -5315,6 +5315,23 @@ ImportDialog::ImportDialog(const std::filesystem::path& path, QWidget* parent) :
     for (QSpinBox* s : {firstSpin_, lastSpin_, everySpin_}) {
         connect(s, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int) { refreshEstimate(); });
     }
+    addResetMenu(firstSpin_, [this]() { firstSpin_->setValue(1); });
+    addResetMenu(lastSpin_, [this]() { lastSpin_->setValue(lastSpin_->maximum()); });
+    addResetMenu(everySpin_, [this]() { everySpin_->setValue(1); });
+    for (const RangeRow& row : rangeRows_) {
+        // Min, max and step back to what the data holds for that header
+        // (scanned first when needed).
+        auto field = [this, row](int which) {
+            return [this, row, which]() {
+                std::array<double, 3> st;
+                if (!statsFor(row.key->currentData().toString(), st)) return;
+                (which == 0 ? row.min : which == 1 ? row.max : row.step)->setValue(st[size_t(which)]);
+            };
+        };
+        addResetMenu(row.min, field(0));
+        addResetMenu(row.max, field(1));
+        addResetMenu(row.step, field(2));
+    }
 
     // --- File Header ---
     QWidget* fileTab = new QWidget();
@@ -5507,6 +5524,7 @@ void ImportDialog::scanMapping() {
         sampleTraces_.push_back(t);
         sampleHeaders_.push_back(copy);
     }
+    keyStats_.clear();
     for (int r = 0; r < int(mapping_.fields.size()); ++r) {
         const segy::FieldSpec& spec = mapping_.fields[size_t(r)].spec;
         std::vector<double> values;
@@ -5529,6 +5547,7 @@ void ImportDialog::scanMapping() {
                 const double rv = std::round(v * 1e6) / 1e6;
                 if (distinct.empty() || rv != distinct.back()) distinct.push_back(rv);
             }
+            double smallestStep = 0.0;
             if (distinct.size() == 1) {
                 note = "single value";
             } else {
@@ -5541,7 +5560,9 @@ void ImportDialog::scanMapping() {
                 stepText = lo == hi ? QString::number(lo, 'g', 8)
                                     : QString("%1 to %2").arg(QString::number(lo, 'g', 8), QString::number(hi, 'g', 8));
                 note = QString("%1 distinct").arg(distinct.size());
+                smallestStep = lo;
             }
+            keyStats_[mapping_.fields[size_t(r)].key] = {values.front(), values.back(), smallestStep};
             if (notFinite > 0) note += QString(", %1 not finite").arg(notFinite);
         }
         mappingTable_->item(r, 4)->setText(minText);
@@ -5556,6 +5577,50 @@ void ImportDialog::scanMapping() {
                                   : QString("Scanned all %1 traces.").arg(traceCount_));
     scanStatus_->setStyleSheet(themed("color: #9a9ca3;"));
     refreshEstimate();
+}
+
+bool ImportDialog::statsFor(const QString& key, std::array<double, 3>& out) {
+    if (key.isEmpty()) return false;
+    if (!scanCurrent_ || keyStats_.find(key.toStdString()) == keyStats_.end()) scanMapping();
+    auto it = keyStats_.find(key.toStdString());
+    if (it == keyStats_.end()) return false;
+    out = it->second;
+    return true;
+}
+
+void ImportDialog::addResetMenu(QAbstractSpinBox* spin, std::function<void()> reset) {
+    // The spin box's own text field gets the right-click, so both ask.
+    auto show = [this, spin, reset](const QPoint& globalPos) {
+        QMenu menu(this);
+        QAction* one = menu.addAction("Reset");
+        one->setToolTip("Reset: the data's own value (first, last, every trace; the header's min, max or step)");
+        QAction* all = menu.addAction("Reset All");
+        menu.setToolTipsVisible(true);
+        QAction* chosen = menu.exec(globalPos);
+        if (chosen == one) reset();
+        else if (chosen == all) resetAllSelection();
+    };
+    spin->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(spin, &QWidget::customContextMenuRequested, this,
+            [spin, show](const QPoint& pos) { show(spin->mapToGlobal(pos)); });
+    if (QLineEdit* edit = spin->findChild<QLineEdit*>()) {
+        edit->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(edit, &QWidget::customContextMenuRequested, this,
+                [edit, show](const QPoint& pos) { show(edit->mapToGlobal(pos)); });
+    }
+}
+
+void ImportDialog::resetAllSelection() {
+    firstSpin_->setValue(1);
+    lastSpin_->setValue(lastSpin_->maximum());
+    everySpin_->setValue(1);
+    for (const RangeRow& row : rangeRows_) {
+        std::array<double, 3> st;
+        if (!statsFor(row.key->currentData().toString(), st)) continue;
+        row.min->setValue(st[0]);
+        row.max->setValue(st[1]);
+        row.step->setValue(st[2]);
+    }
 }
 
 segy::TraceSelection ImportDialog::selection() const {
@@ -6989,6 +7054,8 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         bool plotGeometryChanged = lastPlotX_ != chrome.plotX || lastPlotWidth_ != chrome.plotWidth;
         lastPlotX_ = chrome.plotX;
         lastPlotWidth_ = chrome.plotWidth;
+        lastPlotTop_ = topInset;
+        lastPlotHeight_ = insetHeight;
         // The time scale/color bar toggling (not just a resize) can move
         // the plot's left edge -- keep the dataset boxes flush with it
         // either way. Calling this mid-paintEvent is safe: it only moves
@@ -7015,26 +7082,31 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         // Curtain: the Background's raster replaces the plot columns left
         // of the curtain (same traces, same times), grid lines blended in
         // again the way chrome.cpp does.
-        const bool curtain = curtainActive() && chrome.plotWidth > 1;
-        const int curtainCols =
-            curtain ? std::clamp(int(std::lround(app_.curtainFraction * chrome.plotWidth)), 0, chrome.plotWidth) : 0;
-        if (curtain && curtainCols > 0 && app_.display.seismicMode == segy::SeismicDisplayMode::VariableDensity) {
+        const bool curtain = curtainActive() && chrome.plotWidth > 1 && insetHeight > 1;
+        const bool fenceH = app_.fenceHorizontal;
+        // Background region: columns [0, cut) (vertical fence) or rows
+        // [0, cut) (horizontal fence) of the plot.
+        const int fenceSpan = fenceH ? insetHeight : chrome.plotWidth;
+        const int curtainCut = curtain ? std::clamp(int(std::lround(app_.curtainFraction * fenceSpan)), 0, fenceSpan) : 0;
+        const int bgCols = fenceH ? chrome.plotWidth : curtainCut;
+        const int bgRows = fenceH ? curtainCut : insetHeight;
+        if (curtain && curtainCut > 0 && app_.display.seismicMode == segy::SeismicDisplayMode::VariableDensity) {
             const int pw = chrome.plotWidth;
             curtainPixels_.assign(size_t(pw) * size_t(insetHeight), 0);
             segy::renderFrame(makeRenderContextFor(*app_.background, app_.pool), curtainView(), curtainPixels_.data(), pw,
                               insetHeight, app_.display.gainDb, app_.display.colorScale, app_.display.manualClip,
                               app_.display.reversePolarity, app_.display.colorScaleFlipped, &app_.display.processing);
             const bool flip = app_.display.flipHorizontal;
-            for (int y = 0; y < insetHeight; ++y) {
+            for (int y = 0; y < bgRows; ++y) {
                 const uint32_t* src = curtainPixels_.data() + size_t(y) * size_t(pw);
                 uint32_t* dst = app_.pixels.data() + size_t(y) * size_t(insetWidth) + size_t(chrome.plotX);
-                for (int c = 0; c < curtainCols; ++c) dst[c] = src[flip ? pw - 1 - c : c];
+                for (int c = 0; c < bgCols; ++c) dst[c] = src[flip ? pw - 1 - c : c];
             }
             if (app_.display.showGridLines) {
                 for (const segy::TimeTick& tk : chrome.ticks) {
-                    if (tk.pixelY < 0 || tk.pixelY >= insetHeight) continue;
+                    if (tk.pixelY < 0 || tk.pixelY >= bgRows) continue;
                     uint32_t* row = app_.pixels.data() + size_t(tk.pixelY) * size_t(insetWidth) + size_t(chrome.plotX);
-                    for (int c = 0; c < curtainCols; ++c) {
+                    for (int c = 0; c < bgCols; ++c) {
                         const uint32_t v = row[c];
                         row[c] = (((((v >> 16) & 0xFF) + 0x20) / 2) << 16) | (((((v >> 8) & 0xFF) + 0x20) / 2) << 8) |
                                  (((v & 0xFF) + 0x20) / 2);
@@ -7104,11 +7176,11 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             // so the status line's render time stays meaningful in both
             // modes.
             auto wiggleStart = std::chrono::high_resolution_clock::now();
-            // One dataset's wiggles in plot columns [clipX0, clipX1): the
-            // Foreground right of the curtain, the Background left of it.
-            auto drawWiggles = [&](const segy::RenderContext& wiggleCtx, const segy::ViewRange& wiggleView, int clipX0,
-                                   int clipX1) {
-            if (clipX1 <= clipX0) return;
+            // One dataset's wiggles inside `clip` (plot coordinates): the
+            // Foreground on its side of the fence, the Background on the other.
+            auto drawWiggles = [&](const segy::RenderContext& wiggleCtx, const segy::ViewRange& wiggleView,
+                                   const QRect& clip) {
+            if (clip.width() <= 0 || clip.height() <= 0) return;
             segy::WiggleLayout wiggle = segy::computeWiggleLayout(
                 wiggleCtx, wiggleView, chrome.plotWidth, insetHeight,
                 app_.display.gainDb + kWiggleGainBoostDb, app_.display.reversePolarity, &app_.display.processing);
@@ -7116,7 +7188,7 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             // Wiggle is deliberately crisp/non-smoothed -- see native/README.md.
             painter.setRenderHint(QPainter::Antialiasing, false);
             painter.translate(kCanvasMargin + chrome.plotX, topInset);
-            painter.setClipRect(QRect(clipX0, 0, clipX1 - clipX0, insetHeight));
+            painter.setClipRect(clip);
             QPen linePen(Qt::black);
             linePen.setWidth(0); // cosmetic pen: always exactly 1 device pixel, cheapest to draw
             painter.setPen(linePen);
@@ -7174,8 +7246,12 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
             }
             painter.restore();
             };
-            drawWiggles(makeRenderContext(), app_.view, curtainCols, chrome.plotWidth);
-            if (curtain) drawWiggles(makeRenderContextFor(*app_.background, app_.pool), curtainView(), 0, curtainCols);
+            const QRect bgClip(0, 0, bgCols, bgRows);
+            const QRect fgClip = !curtain ? QRect(0, 0, chrome.plotWidth, insetHeight)
+                                 : fenceH ? QRect(0, curtainCut, chrome.plotWidth, insetHeight - curtainCut)
+                                          : QRect(curtainCut, 0, chrome.plotWidth - curtainCut, insetHeight);
+            drawWiggles(makeRenderContext(), app_.view, fgClip);
+            if (curtain) drawWiggles(makeRenderContextFor(*app_.background, app_.pool), curtainView(), bgClip);
             // Layout and drawing together: what the user waits for.
             app_.lastRenderMs =
                 std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - wiggleStart)
@@ -7187,30 +7263,43 @@ void SegyCanvas::paintEvent(QPaintEvent*) {
         // the user is actively dragging/editing stays the topmost element.
         lap("time axis + wiggle");
         if (curtain) {
-            // The curtain: a line with a grip, and which side is which.
-            const int cx = kCanvasMargin + chrome.plotX + curtainCols;
+            // The fence: a line with a grip, and which side is which.
+            const int left = kCanvasMargin + chrome.plotX;
             painter.save();
             painter.setRenderHint(QPainter::Antialiasing, false);
-            painter.fillRect(QRect(cx - 1, topInset, 3, insetHeight), QColor(0, 0, 0, 160));
-            painter.fillRect(QRect(cx, topInset, 1, insetHeight), QColor(kAccentColor));
-            const QRect grip(cx - 4, topInset + insetHeight / 2 - 16, 9, 32);
-            painter.setPen(QColor(0, 0, 0, 200));
-            painter.setBrush(QColor(kAccentColor));
-            painter.drawRoundedRect(grip, 2, 2);
             QFont tagFont = this->font();
             tagFont.setPixelSize(10);
             painter.setFont(tagFont);
             const QFontMetrics tm(tagFont);
-            auto tag = [&](const QString& text, bool leftOfLine) {
+            auto tag = [&](const QString& text, const QPoint& anchor, Qt::Alignment side) {
                 const int w = tm.horizontalAdvance(text) + 8, h = tm.height() + 2;
-                const int y = topInset + insetHeight - h - 6;
-                const QRect r(leftOfLine ? cx - 4 - w : cx + 5, y, w, h);
+                const int x = side & Qt::AlignLeft ? anchor.x() - w : anchor.x();
+                const int y = side & Qt::AlignTop ? anchor.y() - h : anchor.y();
+                const QRect r(x, y, w, h);
                 painter.fillRect(r, QColor(0, 0, 0, 170));
                 painter.setPen(Qt::white);
                 painter.drawText(r, Qt::AlignCenter, text);
             };
-            if (curtainCols > 40) tag("Background", true);
-            if (chrome.plotWidth - curtainCols > 40) tag("Foreground", false);
+            painter.setPen(QColor(0, 0, 0, 200));
+            painter.setBrush(QColor(kAccentColor));
+            if (!fenceH) {
+                const int cx = left + curtainCut;
+                const int gy = topInset + int(std::lround(std::clamp(app_.gripFraction, 0.0, 1.0) * insetHeight));
+                painter.fillRect(QRect(cx - 1, topInset, 3, insetHeight), QColor(0, 0, 0, 160));
+                painter.fillRect(QRect(cx, topInset, 1, insetHeight), QColor(kAccentColor));
+                painter.drawRoundedRect(QRect(cx - 4, std::clamp(gy - 16, topInset, topInset + insetHeight - 32), 9, 32), 2, 2);
+                const int ty = topInset + insetHeight - tm.height() - 8;
+                if (curtainCut > 70) tag("Background", QPoint(cx - 6, ty), Qt::AlignLeft);
+                if (chrome.plotWidth - curtainCut > 70) tag("Foreground", QPoint(cx + 7, ty), Qt::AlignRight);
+            } else {
+                const int cy = topInset + curtainCut;
+                const int gx = left + int(std::lround(std::clamp(app_.gripFraction, 0.0, 1.0) * chrome.plotWidth));
+                painter.fillRect(QRect(left, cy - 1, chrome.plotWidth, 3), QColor(0, 0, 0, 160));
+                painter.fillRect(QRect(left, cy, chrome.plotWidth, 1), QColor(kAccentColor));
+                painter.drawRoundedRect(QRect(std::clamp(gx - 16, left, left + chrome.plotWidth - 32), cy - 4, 32, 9), 2, 2);
+                if (curtainCut > 30) tag("Background", QPoint(left + 6, cy - 6), Qt::AlignTop);
+                if (insetHeight - curtainCut > 30) tag("Foreground", QPoint(left + 6, cy + 7), Qt::AlignBottom);
+            }
             painter.restore();
         }
         paintIdentOverlayLines(painter, chrome, topInset, insetHeight);
@@ -7378,10 +7467,14 @@ void SegyCanvas::setPickCallback(std::function<void(double, double, bool)> callb
 void SegyCanvas::mousePressEvent(QMouseEvent* event) {
     if (notifyActivated_) notifyActivated_();
     if (!app_.loaded) return;
-    if (event->button() == Qt::LeftButton && nearCurtain(event->pos().x())) {
-        curtainDragging_ = true;
-        setCursor(Qt::SplitHCursor);
-        return;
+    if (event->button() == Qt::LeftButton) {
+        const int hit = fenceHitTest(event->pos());
+        if (hit > 0) {
+            curtainDragging_ = true;
+            gripDragging_ = hit == 2;
+            setCursor(fenceCursor(hit));
+            return;
+        }
     }
     if (event->button() == Qt::RightButton) {
         // The color bar's column: color scale menu only.
@@ -7493,18 +7586,14 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
     bool needsRepaint = false;
 
     if (curtainDragging_) {
-        if (lastPlotWidth_ > 0) {
-            const double x = double(event->pos().x() - kCanvasMargin - lastPlotX_);
-            app_.curtainFraction = std::clamp(x / double(lastPlotWidth_), 0.0, 1.0);
-            update();
-        }
+        dragFence(event->pos());
         return;
     }
-    // The cursor shows the curtain can be dragged.
-    const bool overCurtain = !app_.dragging && !middlePanning_ && nearCurtain(event->pos().x());
-    if (overCurtain != curtainHover_) {
-        curtainHover_ = overCurtain;
-        if (overCurtain) setCursor(Qt::SplitHCursor); else unsetCursorForTool();
+    // The cursor shows the fence (or its grip) can be dragged.
+    const int overFence = app_.dragging || middlePanning_ ? 0 : fenceHitTest(event->pos());
+    if (overFence != curtainHover_) {
+        curtainHover_ = overFence;
+        if (overFence > 0) setCursor(fenceCursor(overFence)); else unsetCursorForTool();
     }
 
     if (zoomBandActive_) {
@@ -7558,8 +7647,9 @@ void SegyCanvas::mouseMoveEvent(QMouseEvent* event) {
 void SegyCanvas::mouseReleaseEvent(QMouseEvent* event) {
     if (curtainDragging_ && event->button() == Qt::LeftButton) {
         curtainDragging_ = false;
-        curtainHover_ = nearCurtain(event->pos().x());
-        if (!curtainHover_) unsetCursorForTool();
+        gripDragging_ = false;
+        curtainHover_ = fenceHitTest(event->pos());
+        if (curtainHover_ > 0) setCursor(fenceCursor(curtainHover_)); else unsetCursorForTool();
         return;
     }
     if (zoomBandActive_ && event->button() == Qt::LeftButton) finishZoomBand();
@@ -7798,7 +7888,7 @@ void SegyCanvas::setBackgroundDataset(std::shared_ptr<Dataset> dataset) {
 
 bool SegyCanvas::curtainActive() const {
     const Dataset* bg = app_.background.get();
-    return app_.loaded && bg && bg->traceCount > 0 && bg->binHeader.samplesPerTrace > 0 &&
+    return app_.fenceOn && app_.loaded && bg && bg->traceCount > 0 && bg->binHeader.samplesPerTrace > 0 &&
            app_.background != app_.foreground && !app_.xf.active && !app_.display.frequencyAxis;
 }
 
@@ -7814,12 +7904,36 @@ segy::ViewRange SegyCanvas::curtainView() const {
     return v;
 }
 
-int SegyCanvas::curtainPixelX() const {
-    return kCanvasMargin + lastPlotX_ + int(std::lround(std::clamp(app_.curtainFraction, 0.0, 1.0) * lastPlotWidth_));
+int SegyCanvas::fenceHitTest(const QPoint& pos) const {
+    if (!curtainActive() || lastPlotWidth_ <= 0 || lastPlotHeight_ <= 0) return 0;
+    const int left = kCanvasMargin + lastPlotX_, top = lastPlotTop_;
+    const double f = std::clamp(app_.curtainFraction, 0.0, 1.0), g = std::clamp(app_.gripFraction, 0.0, 1.0);
+    if (!app_.fenceHorizontal) {
+        const int cx = left + int(std::lround(f * lastPlotWidth_));
+        const int gy = top + int(std::lround(g * lastPlotHeight_));
+        if (pos.y() < top || pos.y() > top + lastPlotHeight_ || std::abs(pos.x() - cx) > 5) return 0;
+        return std::abs(pos.y() - gy) <= 17 ? 2 : 1;
+    }
+    const int cy = top + int(std::lround(f * lastPlotHeight_));
+    const int gx = left + int(std::lround(g * lastPlotWidth_));
+    if (pos.x() < left || pos.x() > left + lastPlotWidth_ || std::abs(pos.y() - cy) > 5) return 0;
+    return std::abs(pos.x() - gx) <= 17 ? 2 : 1;
 }
 
-bool SegyCanvas::nearCurtain(int x) const {
-    return curtainActive() && lastPlotWidth_ > 0 && std::abs(x - curtainPixelX()) <= 5;
+// The fence follows the mouse across it; dragging the grip also slides the
+// grip along the fence.
+void SegyCanvas::dragFence(const QPoint& pos) {
+    if (lastPlotWidth_ <= 0 || lastPlotHeight_ <= 0) return;
+    const double fx = std::clamp(double(pos.x() - kCanvasMargin - lastPlotX_) / double(lastPlotWidth_), 0.0, 1.0);
+    const double fy = std::clamp(double(pos.y() - lastPlotTop_) / double(lastPlotHeight_), 0.0, 1.0);
+    app_.curtainFraction = app_.fenceHorizontal ? fy : fx;
+    if (gripDragging_) app_.gripFraction = app_.fenceHorizontal ? fx : fy;
+    update();
+}
+
+Qt::CursorShape SegyCanvas::fenceCursor(int hit) const {
+    if (hit == 2) return Qt::SizeAllCursor;
+    return app_.fenceHorizontal ? Qt::SplitVCursor : Qt::SplitHCursor;
 }
 
 bool SegyCanvas::swapForegroundBackground() {
@@ -8532,6 +8646,43 @@ MainWindow::MainWindow() : QMainWindow() {
         });
     }
 
+    // Fence: Background and Foreground in one panel, either side of a
+    // draggable fence (off by default). Right-click: vertical or horizontal.
+    fenceAction_ = toolbar->addAction(iconFromPaths({"M12 3v18", "M7 8l-4 4l4 4", "M17 8l4 4l-4 4", "M10.5 10h3v4h-3z"}),
+                                      "Fence");
+    fenceAction_->setCheckable(true);
+    fenceAction_->setToolTip("Fence: the Background on one side, the Foreground on the other; drag the fence or its "
+                             "grip (right-click: vertical or horizontal)");
+    connect(fenceAction_, &QAction::triggered, this, [this](bool on) {
+        for (Panel* p : targetPanels()) {
+            p->app.fenceOn = on;
+            p->canvas->update();
+        }
+        if (on && (!activePanel_->app.background || activePanel_->app.background->traceCount <= 0)) {
+            flashStatusMessage("Fence: choose a Background dataset in the Background box");
+        }
+    });
+    if (QWidget* fenceButton = toolbar_->widgetForAction(fenceAction_)) {
+        fenceButton->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(fenceButton, &QWidget::customContextMenuRequested, this, [this, fenceButton](const QPoint& pos) {
+            QMenu menu(this);
+            QAction* vertical = menu.addAction("Vertical Fence");
+            QAction* horizontal = menu.addAction("Horizontal Fence");
+            vertical->setCheckable(true);
+            horizontal->setCheckable(true);
+            vertical->setChecked(!activePanel_->app.fenceHorizontal);
+            horizontal->setChecked(activePanel_->app.fenceHorizontal);
+            QAction* chosen = menu.exec(fenceButton->mapToGlobal(pos));
+            if (!chosen) return;
+            for (Panel* p : targetPanels()) {
+                p->app.fenceHorizontal = chosen == horizontal;
+                p->app.fenceOn = true;
+                p->canvas->update();
+            }
+            fenceAction_->setChecked(true);
+        });
+    }
+
     lockAction_ = toolbar->addAction(iconLock(false), "Lock Panels");
     lockAction_->setCheckable(true);
     lockAction_->setToolTip("Lock Panels: toolbar and menu actions apply to both panels");
@@ -8744,6 +8895,7 @@ MainWindow::MainWindow() : QMainWindow() {
         {"autocorrelation", "Autocorrelation", 4, {autocorrelationAction_}},
         {"xf", "x-f Display", 4, {xfAction_}},
         {"splitView", "Split View", 4, {splitViewAction_}},
+        {"fence", "Fence", 4, {fenceAction_}},
         {"lock", "Lock Panels", 4, {lockAction_}},
         {"lockView", "Lock View", 4, {lockViewAction_}},
     };
@@ -8805,6 +8957,7 @@ MainWindow::MainWindow() : QMainWindow() {
     viewMenu->addAction(wiggleMenuAction_);
     viewMenu->addAction(wiggleInfillAction);
     addMenuMirror(viewMenu, flipHorizontalAction_, "Flip &Horizontal");
+    addMenuMirror(viewMenu, fenceAction_, "F&ence");
     viewMenu->addAction(swapDatasetsAction_);
     viewMenu->addSeparator();
     // Scale bar: from the trace spacing (CDP X/Y), or one the user types.
@@ -9503,6 +9656,7 @@ void MainWindow::setActivePanel(Panel* panel) {
         (app_->foreground->depth ? domainDepthAction_ : domainTimeAction_)->setChecked(true);
     }
     lockViewAction_->setChecked(app_->viewLocked);
+    fenceAction_->setChecked(app_->fenceOn);
     // Analyses that assume a time series mean nothing on an x-f display
     // (its samples are frequency bins in dB). Histogram stays: a
     // distribution of dB values is still meaningful.
@@ -14164,6 +14318,7 @@ QString darkStyleSheet() {
         QComboBox QAbstractItemView { background: #201f23; color: #d4d4d8; selection-background-color: #4a3626; selection-color: #e8905a; }
         QTableWidget { background: #17181a; color: #d4d4d8; border: 1px solid #3c3f41; gridline-color: #3c3f41; }
         QTableWidget::item { padding: 4px 6px; }
+        QHeaderView { background: #2b2d30; }
         QHeaderView::section { background: #2b2d30; color: #9a9ca3; border: none; border-bottom: 1px solid #3c3f41; border-right: 1px solid #3c3f41; padding: 4px 6px; }
         QTableWidget::item:selected, QListWidget::item:selected, QTableView::item:selected { background: #4a3626; color: #f0f2f5; }
         QTableCornerButton::section { background: #2b2d30; border: none; }

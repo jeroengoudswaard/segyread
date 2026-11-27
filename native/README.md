@@ -3587,6 +3587,18 @@ segy_reader (COPILOT 48-65).
     undecodable formats with a message pointing here.
 - **Binary Header** window: Labelled or Raw (every 2- and 4-byte word),
   Copy Table. **Header Ranges**: Copy Table.
+- **The curtain became the Fence (2026-11-27).** Off by default: the
+  toolbar Fence button (also View > Fence) turns it on for the panel;
+  right-click it for Vertical Fence (Background left) or Horizontal Fence
+  (Background above). Drag the fence across; drag its grip to move the
+  fence and slide the grip along it (`fenceHitTest`/`dragFence`, size-all
+  cursor on the grip, split cursor on the line). `AppState::fenceOn`,
+  `fenceHorizontal`, `gripFraction`.
+- **Open with Analysis, Selection:** right-click a field > Reset (or Reset
+  All): first/last/every back to the whole file, a header range back to
+  the scanned min, max and smallest step (scanned first when needed).
+- Table headers have a dark background past the last column (the empty
+  header area was white).
 - **Qt 5 again.** The Rocky 8 build had broken on Qt 6-only calls
   (`QMouseEvent::position/globalPosition`, `QImage::deviceIndependentSize`,
   a `ThemedColor` brush); `eventPos`/`eventGlobalPos` pick the right call.

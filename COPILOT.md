@@ -121,3 +121,7 @@ A living list of ideas and requirements to guide future work on TraceLab. **Perf
 64. **Ewoud, medium (later)** — little-endian files with "retry with the other byte order"; colour maps from `.cmap` files (Petrel seismic, Earth model, Turbo...); x-axis by a header (CDP, shotpoint); PNG export at a fixed size; Basemap from a point scan of source/receiver/midpoint X/Y coloured by a header; overlay curve from a header expression (whitelist parser, no eval; could feed header math).
 
 65. **Ewoud, optional** — 3D bin grid from the text header (corners, bin size, azimuth, derived 4th corner) and fold maps per cell. Outside the 2D scope for now; the user likes them, so kept as options.
+
+66. **Fence instead of an always-on curtain** — a toolbar button, right-click for horizontal or vertical, the grip movable along the fence. *Status: done (2026-11-27).*
+
+67. **Reset in Open with Analysis > Selection** — right-click a value to go back to the data's own min/max/step. *Status: done (2026-11-27).*
